@@ -1,4 +1,8 @@
 import pandas as pd
+try:
+    import jpholiday
+except ImportError:  # ローカル確認時のフォールバック。クラウドではrequirementsから導入。
+    jpholiday = None
 
 REQUIRED_HISTORY_COLUMNS = {
     "成果発生日時",
@@ -9,29 +13,49 @@ REQUIRED_HISTORY_COLUMNS = {
 }
 
 
+def is_business_day(ts: pd.Timestamp) -> bool:
+    date_value = pd.Timestamp(ts).date()
+    is_holiday = jpholiday.is_holiday(date_value) if jpholiday is not None else False
+    return date_value.weekday() < 5 and not is_holiday
+
+
+def add_business_edge_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """日本の土日祝を除き、月初・月末4営業日を判定する。"""
+    df = df.copy()
+    dates = pd.to_datetime(df["date"])
+    unique_months = dates.dt.to_period("M").dropna().unique()
+
+    start_dates: set[pd.Timestamp] = set()
+    end_dates: set[pd.Timestamp] = set()
+
+    for period in unique_months:
+        month_dates = pd.date_range(period.start_time, period.end_time, freq="D")
+        business_days = [d.normalize() for d in month_dates if is_business_day(d)]
+        start_dates.update(business_days[:4])
+        end_dates.update(business_days[-4:])
+
+    normalized = dates.dt.normalize()
+    df["is_month_start"] = normalized.isin(start_dates).astype(int)
+    df["is_month_end"] = normalized.isin(end_dates).astype(int)
+    return df
+
+
 def add_flags(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["date"] = pd.to_datetime(df["成果発生日時"], errors="coerce")
-    df["day"] = df["date"].dt.day
     df["month"] = df["date"].dt.month
     df["weekday"] = df["date"].dt.day_name()
-
-    # 現状は暦日ベース。厳密な「営業日」にする場合は休日マスタが必要。
-    df["is_month_start"] = df["day"].isin([1, 2, 3, 4]).astype(int)
-    df["is_month_end"] = df["day"].isin([28, 29, 30, 31]).astype(int)
-    df["magitoku_flag"] = 0
-    df["line_oa_flag"] = 0
+    df = add_business_edge_flags(df)
     return df
 
 
 def _read_csv_with_fallback(file) -> pd.DataFrame:
-    errors = []
     for encoding in ("utf-8-sig", "cp932", "utf-8"):
         try:
             file.seek(0)
             return pd.read_csv(file, encoding=encoding)
-        except UnicodeDecodeError as exc:
-            errors.append(f"{encoding}: {exc}")
+        except UnicodeDecodeError:
+            continue
     raise ValueError("CSVの文字コードを判定できませんでした。UTF-8またはShift-JISで保存してください。")
 
 
@@ -61,8 +85,6 @@ def load_data(file) -> pd.DataFrame:
             weekday=("weekday", "first"),
             is_month_start=("is_month_start", "max"),
             is_month_end=("is_month_end", "max"),
-            magitoku_flag=("magitoku_flag", "max"),
-            line_oa_flag=("line_oa_flag", "max"),
         )
         .reset_index()
     )
