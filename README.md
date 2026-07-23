@@ -1,45 +1,39 @@
-# AF 件数予測＆プランニングツール
+import pandas as pd
+from config.constants import BUDGET_STEP, UP_RATE, DOWN_RATE
 
-Streamlitで実績CSVとCPNマスタを読み込み、媒体別の件数予測、松竹梅プラン、最適プランを作成します。
+def simulate_plan(df):
 
-## 起動方法
+    results = []
 
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+    for _, row in df.iterrows():
 
-## 入力ファイル
+        base_cv = row["forecast_cv"]
+        base_cost = row["cost"]
 
-### 実績CSV（必須列）
-- 成果発生日時
-- パートナーサイト名
-- 件数
-- 報酬額
-- 商品ID
+        for label, delta in {
+            "梅": -BUDGET_STEP,
+            "竹": 0,
+            "松": BUDGET_STEP,
+        }.items():
 
-### CPNマスタ（必須列）
-- 日付
-- CPN名
+            if delta >= 0:
+                multiplier = UP_RATE ** (delta / BUDGET_STEP)
+            else:
+                multiplier = DOWN_RATE ** abs(delta / BUDGET_STEP)
 
-### CPNマスタ（任意列）
-- LINE OA配信：`1`、`○`、`実施` 等
-- マジ得後：`1`、`○`、`実施` 等
+            new_cv = base_cv * multiplier
+            new_cost = base_cost + delta
 
-## 主なロジック
+            cpa = new_cost / new_cv if new_cv != 0 else 0
 
-- 未来展開は、直近定常実績に存在した「媒体×商品ID」の組み合わせだけを使用
-- ベースCV・コストは、予測開始日前の直近28定常日から媒体×商品ID別に算出
-- CPN実績係数は、昨年同一CPNの直前定常CV/日とCPN中CV/日の比率を媒体別に算出
-- CPN種類の固定倍率は使用しない。前年同一CPNの実績係数へ一本化
-- 曜日係数は、通常CPNの通常平日平均を1.0として媒体別に都度算出
-- 月初・月末4営業日係数も、通常平日平均との実績比で媒体別に都度算出
-- 需要期係数は、通常CPNの月別平均と通常平日平均の実績比で媒体別に都度算出
-- LINE OA係数は、過去のLINE媒体におけるOA配信日と非配信日の実績比から都度算出
-- マジ得後係数のみ、指定条件どおり0.9を使用
-- ハピタス、モッピー、LINEの単価は、固定倍率を使わず、中小媒体の過去実績上限より1円高い水準を最低ラインにする
-- 還元額は今回の予測ロジックには含めない
+            # ✅ ←ここが超重要！！
+            results.append({
+                "date": row["date"],   # 追加
+                "media": row["media"],
+                "plan": label,
+                "cv": new_cv,
+                "cost": new_cost,
+                "cpa": cpa
+            })
 
-## GitHubへの登録
-
-実績CSV・CPNマスタはリポジトリに含めず、画面から都度アップロードします。`.gitignore` でCSV・Excelを除外しています。
+    return pd.DataFrame(results)
