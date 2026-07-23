@@ -1,9 +1,13 @@
-# 固定係数（あとで自由にいじる）
-
-MAGITOKU_AFTER = 0.9
-
-CPA_CONSTRAINT_MEDIA = ["ハピタス", "モッピー", "LINE"]
+# 固定値は、業務上明示されたものだけに限定する。
+MAGITOKU_AFTER_FACTOR = 0.90
 
 BUDGET_STEP = 1000
 UP_RATE = 1.15
 DOWN_RATE = 0.85
+
+# 係数算出時の参照期間
+RECENT_NORMAL_DAYS = 28
+TRANSITION_NORMAL_DAYS = 28
+
+# 大規模媒体判定
+PREMIUM_MEDIA_KEYWORDS = ("ハピタス", "モッピー", "LINE")
