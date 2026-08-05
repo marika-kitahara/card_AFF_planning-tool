@@ -33,19 +33,21 @@ def calculate_transition_cpn_factor(
     selected_cpn: str,
     reference_date: pd.Timestamp,
 ) -> pd.DataFrame:
-    """前年同月の同一CPN実績から、媒体×商品ID別の日平均CVを算出する。
+    """前年同月の同一CPN実績を予測ベースとして返す。
 
-    定常実績との比率は作らず、前年同月CPNの平均件数をそのまま
-    予測ベースとして返す。
+    前年CPN直前の定常実績と倍率も画面上の参考値として算出するが、
+    予測計算には掛け合わせない。
     """
     columns = [
-        "media", "商品ID", "base_cv", "cost", "cpn_daily_cv",
+        "media", "商品ID", "base_cv", "cost",
+        "normal_daily_cv", "cpn_daily_cv", "cpn_factor",
         "reference_cpn_start", "reference_cpn_end",
     ]
+
     work = history_df.copy()
     work["date"] = pd.to_datetime(work["date"], errors="coerce").dt.normalize()
-
     target = pd.Timestamp(reference_date).normalize() - pd.DateOffset(years=1)
+
     same_month = work[
         work["CPN名"].eq(selected_cpn)
         & work["date"].dt.year.eq(target.year)
@@ -54,8 +56,8 @@ def calculate_transition_cpn_factor(
     if same_month.empty:
         return pd.DataFrame(columns=columns)
 
-    # 同月内に同名CPNが複数回ある場合は、連続日ごとの期間を作り、
-    # 今回の開始日を1年前に戻した日付に最も近い期間を採用する。
+    # 同月内に同名CPNが複数回ある場合は連続日ごとに期間を分け、
+    # 今回開始日の1年前に最も近い期間を採用する。
     cpn_dates = same_month["date"].drop_duplicates().sort_values()
     block_id = cpn_dates.diff().dt.days.fillna(1).gt(1).cumsum()
     periods = cpn_dates.groupby(block_id).agg(["min", "max"]).reset_index(drop=True)
@@ -74,11 +76,27 @@ def calculate_transition_cpn_factor(
         .agg(base_cv=("cv", "mean"), cost=("cost", "mean"))
     )
 
-    media_daily = (
+    # 媒体別CPN平均（日平均）
+    cpn_avg = (
         cpn_hist.groupby(["date", "media"], as_index=False)["cv"].sum()
         .groupby("media")["cv"].mean()
     )
-    result["cpn_daily_cv"] = result["media"].map(media_daily)
+
+    # 直前定常は表示用の参考値のみ。予測には使用しない。
+    normal_start = cpn_start - pd.Timedelta(days=TRANSITION_NORMAL_DAYS)
+    normal_hist = work[
+        work["date"].between(normal_start, cpn_start, inclusive="left")
+        & work["CPN名"].eq("通常")
+    ]
+    normal_avg = (
+        normal_hist.groupby(["date", "media"], as_index=False)["cv"].sum()
+        .groupby("media")["cv"].mean()
+        if not normal_hist.empty else pd.Series(dtype=float)
+    )
+
+    result["normal_daily_cv"] = result["media"].map(normal_avg)
+    result["cpn_daily_cv"] = result["media"].map(cpn_avg)
+    result["cpn_factor"] = _safe_ratio(result["cpn_daily_cv"], result["normal_daily_cv"])
     result["reference_cpn_start"] = cpn_start
     result["reference_cpn_end"] = cpn_end
     return result[columns]
