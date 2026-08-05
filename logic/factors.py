@@ -33,7 +33,7 @@ def calculate_transition_cpn_factor(
     selected_cpn: str,
     reference_date: pd.Timestamp,
 ) -> pd.DataFrame:
-    """前年同一CPNの直前定常→CPN切替率を媒体別に算出する。"""
+    """前年同月の同一CPNについて、直前定常→CPN切替率を媒体別に算出する。"""
     cpn_dates = (
         history_df.loc[history_df["CPN名"] == selected_cpn, "date"]
         .drop_duplicates()
@@ -49,9 +49,30 @@ def calculate_transition_cpn_factor(
     gaps = cpn_dates.diff().dt.days.fillna(1).gt(1)
     block_id = gaps.cumsum()
     periods = cpn_dates.groupby(block_id).agg(["min", "max"]).reset_index(drop=True)
-    target = pd.Timestamp(reference_date) - pd.DateOffset(years=1)
-    periods["distance"] = (periods["min"] - target).abs()
-    chosen = periods.sort_values("distance").iloc[0]
+    # 参照対象は「予測開始日の前年・同月」に実施された同一CPNに限定する。
+    # 365日前や単純な最短距離では、開催日が前後した際に別月のCPNを
+    # 誤って拾う可能性があるため、年月で明示的に絞り込む。
+    reference_date = pd.Timestamp(reference_date)
+    target_year = reference_date.year - 1
+    target_month = reference_date.month
+
+    # 月をまたぐCPNも拾えるよう、開始月だけでなく期間が対象月と重なるかで判定する。
+    target_month_start = pd.Timestamp(target_year, target_month, 1)
+    target_month_end = target_month_start + pd.offsets.MonthEnd(1)
+    same_month_periods = periods[
+        periods["min"].le(target_month_end)
+        & periods["max"].ge(target_month_start)
+    ].copy()
+
+    if same_month_periods.empty:
+        return pd.DataFrame(columns=columns)
+
+    # 同月に同一CPNが複数回ある場合は、予測開始日と同じ「日」に最も近い
+    # 開始日の期間を採用する。同距離なら開始日の早い期間を優先する。
+    target_day = min(reference_date.day, target_month_end.day)
+    target_date = pd.Timestamp(target_year, target_month, target_day)
+    same_month_periods["distance"] = (same_month_periods["min"] - target_date).abs()
+    chosen = same_month_periods.sort_values(["distance", "min"]).iloc[0]
     cpn_start = pd.Timestamp(chosen["min"])
     cpn_end = pd.Timestamp(chosen["max"])
 
