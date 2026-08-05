@@ -137,7 +137,7 @@ if uploaded_file and uploaded_master:
         from config.constants import RECENT_NORMAL_DAYS
 
         history_df = load_data(uploaded_file)
-        history_df["date"] = pd.to_datetime(history_df["date"])
+        history_df["date"] = pd.to_datetime(history_df["date"]).dt.normalize()
 
         cpn_master = pd.read_excel(uploaded_master, engine="openpyxl")
         required_master_columns = {"日付", "CPN名"}
@@ -146,7 +146,7 @@ if uploaded_file and uploaded_master:
             raise ValueError(f"CPNマスタに必要な列がありません: {', '.join(sorted(missing_master))}")
 
         cpn_master = cpn_master.copy()
-        cpn_master["日付"] = pd.to_datetime(cpn_master["日付"], errors="coerce")
+        cpn_master["日付"] = pd.to_datetime(cpn_master["日付"], errors="coerce").dt.normalize()
         cpn_master["CPN名"] = cpn_master["CPN名"].astype("string").str.strip()
         cpn_master = cpn_master.dropna(subset=["日付", "CPN名"])
         cpn_master = cpn_master.drop_duplicates(subset=["日付"], keep="last")
