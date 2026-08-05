@@ -215,13 +215,13 @@ if uploaded_file and uploaded_master:
         st.error("対象媒体の定常実績がありません。")
         st.stop()
 
-    # 昨年同一CPNの「直前定常→CPN」切替係数
+    # 前年同月の同一CPNにおける「直前定常→CPN」切替係数
     cpn_factor_table = calculate_transition_cpn_factor(history_df, selected_cpn, reference_date)
     cpn_factor_map = cpn_factor_table.set_index("media")["cpn_factor"] if not cpn_factor_table.empty else pd.Series(dtype=float)
 
     st.subheader("📈 CPN実績係数")
     if cpn_factor_table.empty:
-        st.warning("昨年同一CPN、またはその直前の定常実績が不足しているため、CPN実績係数は1.0で処理します。")
+        st.warning("前年同月の同一CPN、またはその直前の定常実績が不足しているため、CPN実績係数は1.0で処理します。")
     else:
         display_factor = cpn_factor_table.copy()
         display_factor["normal_daily_cv"] = display_factor["normal_daily_cv"].round(2)
@@ -230,7 +230,7 @@ if uploaded_file and uploaded_master:
         display_factor = display_factor.rename(columns={
             "media": "媒体",
             "normal_daily_cv": "前年CPN直前の定常CV/日",
-            "cpn_daily_cv": "前年同一CPNのCV/日",
+            "cpn_daily_cv": "前年同月・同一CPNのCV/日",
             "cpn_factor": "CPN実績係数",
             "reference_cpn_start": "参照CPN開始",
             "reference_cpn_end": "参照CPN終了",
