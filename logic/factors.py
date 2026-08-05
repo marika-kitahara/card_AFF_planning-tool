@@ -33,73 +33,52 @@ def calculate_transition_cpn_factor(
     selected_cpn: str,
     reference_date: pd.Timestamp,
 ) -> pd.DataFrame:
-    """前年同月の同一CPNについて、直前定常→CPN切替率を媒体別に算出する。"""
-    history_df = history_df.copy()
-    history_df["date"] = pd.to_datetime(history_df["date"]).dt.normalize()
+    """前年同月の同一CPN実績から、媒体×商品ID別の日平均CVを算出する。
 
-    cpn_dates = (
-        history_df.loc[history_df["CPN名"] == selected_cpn, "date"]
-        .drop_duplicates()
-        .sort_values()
-    )
+    定常実績との比率は作らず、前年同月CPNの平均件数をそのまま
+    予測ベースとして返す。
+    """
     columns = [
-        "media", "normal_daily_cv", "cpn_daily_cv", "cpn_factor",
+        "media", "商品ID", "base_cv", "cost", "cpn_daily_cv",
         "reference_cpn_start", "reference_cpn_end",
     ]
-    if cpn_dates.empty:
-        return pd.DataFrame(columns=columns)
+    work = history_df.copy()
+    work["date"] = pd.to_datetime(work["date"], errors="coerce").dt.normalize()
 
-    gaps = cpn_dates.diff().dt.days.fillna(1).gt(1)
-    block_id = gaps.cumsum()
-    periods = cpn_dates.groupby(block_id).agg(["min", "max"]).reset_index(drop=True)
-    # 参照対象は「予測開始日の前年・同月」に実施された同一CPNに限定する。
-    # 365日前や単純な最短距離では、開催日が前後した際に別月のCPNを
-    # 誤って拾う可能性があるため、年月で明示的に絞り込む。
-    reference_date = pd.Timestamp(reference_date)
-    target_year = reference_date.year - 1
-    target_month = reference_date.month
-
-    # 月をまたぐCPNも拾えるよう、開始月だけでなく期間が対象月と重なるかで判定する。
-    target_month_start = pd.Timestamp(target_year, target_month, 1)
-    target_month_end = target_month_start + pd.offsets.MonthEnd(1)
-    same_month_periods = periods[
-        periods["min"].le(target_month_end)
-        & periods["max"].ge(target_month_start)
+    target = pd.Timestamp(reference_date).normalize() - pd.DateOffset(years=1)
+    same_month = work[
+        work["CPN名"].eq(selected_cpn)
+        & work["date"].dt.year.eq(target.year)
+        & work["date"].dt.month.eq(target.month)
     ].copy()
-
-    if same_month_periods.empty:
+    if same_month.empty:
         return pd.DataFrame(columns=columns)
 
-    # 同月に同一CPNが複数回ある場合は、予測開始日と同じ「日」に最も近い
-    # 開始日の期間を採用する。同距離なら開始日の早い期間を優先する。
-    target_day = min(reference_date.day, target_month_end.day)
-    target_date = pd.Timestamp(target_year, target_month, target_day)
-    same_month_periods["distance"] = (same_month_periods["min"] - target_date).abs()
-    chosen = same_month_periods.sort_values(["distance", "min"]).iloc[0]
+    # 同月内に同名CPNが複数回ある場合は、連続日ごとの期間を作り、
+    # 今回の開始日を1年前に戻した日付に最も近い期間を採用する。
+    cpn_dates = same_month["date"].drop_duplicates().sort_values()
+    block_id = cpn_dates.diff().dt.days.fillna(1).gt(1).cumsum()
+    periods = cpn_dates.groupby(block_id).agg(["min", "max"]).reset_index(drop=True)
+    periods["distance"] = (periods["min"] - target).abs()
+    chosen = periods.sort_values(["distance", "min"]).iloc[0]
     cpn_start = pd.Timestamp(chosen["min"])
     cpn_end = pd.Timestamp(chosen["max"])
 
-    cpn_hist = history_df[
-        history_df["date"].between(cpn_start, cpn_end)
-        & history_df["CPN名"].eq(selected_cpn)
-    ]
-    normal_start = cpn_start - pd.Timedelta(days=TRANSITION_NORMAL_DAYS)
-    normal_hist = history_df[
-        history_df["date"].between(normal_start, cpn_start, inclusive="left")
-        & history_df["CPN名"].eq("通常")
-    ]
+    cpn_hist = same_month[same_month["date"].between(cpn_start, cpn_end)].copy()
+    daily_pair = (
+        cpn_hist.groupby(["date", "media", "商品ID"], as_index=False)
+        .agg(cv=("cv", "sum"), cost=("cost", "sum"))
+    )
+    result = (
+        daily_pair.groupby(["media", "商品ID"], as_index=False)
+        .agg(base_cv=("cv", "mean"), cost=("cost", "mean"))
+    )
 
-    def daily_average(df: pd.DataFrame) -> pd.Series:
-        daily = _daily_media(df)
-        return daily.groupby("media")["cv"].mean() if not daily.empty else pd.Series(dtype=float)
-
-    normal_avg = daily_average(normal_hist)
-    cpn_avg = daily_average(cpn_hist)
-    media = sorted(set(normal_avg.index) | set(cpn_avg.index))
-    result = pd.DataFrame({"media": media})
-    result["normal_daily_cv"] = result["media"].map(normal_avg)
-    result["cpn_daily_cv"] = result["media"].map(cpn_avg)
-    result["cpn_factor"] = _safe_ratio(result["cpn_daily_cv"], result["normal_daily_cv"])
+    media_daily = (
+        cpn_hist.groupby(["date", "media"], as_index=False)["cv"].sum()
+        .groupby("media")["cv"].mean()
+    )
+    result["cpn_daily_cv"] = result["media"].map(media_daily)
     result["reference_cpn_start"] = cpn_start
     result["reference_cpn_end"] = cpn_end
     return result[columns]
