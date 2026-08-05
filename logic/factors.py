@@ -34,6 +34,9 @@ def calculate_transition_cpn_factor(
     reference_date: pd.Timestamp,
 ) -> pd.DataFrame:
     """前年同月の同一CPNについて、直前定常→CPN切替率を媒体別に算出する。"""
+    history_df = history_df.copy()
+    history_df["date"] = pd.to_datetime(history_df["date"]).dt.normalize()
+
     cpn_dates = (
         history_df.loc[history_df["CPN名"] == selected_cpn, "date"]
         .drop_duplicates()
