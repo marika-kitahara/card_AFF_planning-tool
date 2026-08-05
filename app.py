@@ -137,7 +137,7 @@ if uploaded_file and uploaded_master:
         from config.constants import RECENT_NORMAL_DAYS
 
         history_df = load_data(uploaded_file)
-        history_df["date"] = pd.to_datetime(history_df["date"]).dt.normalize()
+        history_df["date"] = pd.to_datetime(history_df["date"], errors="coerce").dt.normalize()
 
         cpn_master = pd.read_excel(uploaded_master, engine="openpyxl")
         required_master_columns = {"日付", "CPN名"}
@@ -193,49 +193,51 @@ if uploaded_file and uploaded_master:
 
     reference_date = pd.Timestamp(start_date)
 
-    # 直近の定常日を最大28日分取得（欠損日を含めた単純28暦日ではない）
-    recent_normal_dates = (
-        history_df.loc[
-            (history_df["CPN名"] == "通常") & (history_df["date"] < reference_date),
-            "date",
-        ]
-        .drop_duplicates()
-        .sort_values()
-        .tail(RECENT_NORMAL_DAYS)
-    )
-    recent_normal = history_df[history_df["date"].isin(recent_normal_dates)].copy()
-    if recent_normal.empty:
-        st.error("予測開始日より前の直近定常データがありません。CPNマスタの『通常』登録を確認してください。")
-        st.stop()
+    # CPNは、前年同月の同一CPN平均件数をそのまま予測ベースにする。
+    # 「通常」を選んだ場合のみ、従来どおり直近定常実績をベースにする。
+    cpn_base_table = calculate_transition_cpn_factor(history_df, selected_cpn, reference_date)
 
-    # 実績に存在した媒体×商品IDだけを採用
-    base_pair = _daily_pair_average(recent_normal)
-    base_pair = base_pair[base_pair["media"].isin(selected_media)]
-    if base_pair.empty:
-        st.error("対象媒体の定常実績がありません。")
-        st.stop()
-
-    # 前年同月の同一CPNにおける「直前定常→CPN」切替係数
-    cpn_factor_table = calculate_transition_cpn_factor(history_df, selected_cpn, reference_date)
-    cpn_factor_map = cpn_factor_table.set_index("media")["cpn_factor"] if not cpn_factor_table.empty else pd.Series(dtype=float)
-
-    st.subheader("📈 CPN実績係数")
-    if cpn_factor_table.empty:
-        st.warning("前年同月の同一CPN、またはその直前の定常実績が不足しているため、CPN実績係数は1.0で処理します。")
+    if selected_cpn == "通常":
+        recent_normal_dates = (
+            history_df.loc[
+                (history_df["CPN名"] == "通常") & (history_df["date"] < reference_date),
+                "date",
+            ]
+            .drop_duplicates()
+            .sort_values()
+            .tail(RECENT_NORMAL_DAYS)
+        )
+        recent_normal = history_df[history_df["date"].isin(recent_normal_dates)].copy()
+        base_pair = _daily_pair_average(recent_normal)
+        base_pair = base_pair[base_pair["media"].isin(selected_media)]
+        if base_pair.empty:
+            st.error("対象媒体の直近定常実績がありません。")
+            st.stop()
     else:
-        display_factor = cpn_factor_table.copy()
-        display_factor["normal_daily_cv"] = display_factor["normal_daily_cv"].round(2)
-        display_factor["cpn_daily_cv"] = display_factor["cpn_daily_cv"].round(2)
-        display_factor["cpn_factor"] = display_factor["cpn_factor"].round(3)
-        display_factor = display_factor.rename(columns={
+        base_pair = cpn_base_table[["media", "商品ID", "base_cv", "cost"]].copy()
+        base_pair = base_pair[base_pair["media"].isin(selected_media)]
+        if base_pair.empty:
+            st.error("前年同月に同一キャンペーンの実績がありません。CPN名と前年同月のマスタ登録を確認してください。")
+            st.stop()
+
+    st.subheader("📈 前年同月・同一CPN平均件数")
+    if selected_cpn == "通常":
+        st.info("通常は、予測開始日前の直近定常実績を使用します。")
+    else:
+        display_cpn = (
+            cpn_base_table.groupby(
+                ["media", "reference_cpn_start", "reference_cpn_end"],
+                as_index=False,
+            )["cpn_daily_cv"].first()
+        )
+        display_cpn["cpn_daily_cv"] = display_cpn["cpn_daily_cv"].round(2)
+        display_cpn = display_cpn.rename(columns={
             "media": "媒体",
-            "normal_daily_cv": "前年CPN直前の定常CV/日",
-            "cpn_daily_cv": "前年同月・同一CPNのCV/日",
-            "cpn_factor": "CPN実績係数",
+            "cpn_daily_cv": "前年同月・同一CPNの平均CV/日",
             "reference_cpn_start": "参照CPN開始",
             "reference_cpn_end": "参照CPN終了",
         })
-        st.dataframe(display_factor, use_container_width=True, hide_index=True)
+        st.dataframe(display_cpn, use_container_width=True, hide_index=True)
 
     factor_tables = calculate_dynamic_factor_tables(history_df)
     st.subheader("📐 実績から算出した変動係数")
@@ -265,7 +267,8 @@ if uploaded_file and uploaded_master:
     future_df["line_oa_flag"] = future_df["line_oa_flag"].fillna(0).astype(int)
     future_df["magitoku_after_flag"] = future_df["magitoku_after_flag"].fillna(0).astype(int)
 
-    future_df["cpn_factor"] = future_df["media"].map(cpn_factor_map).fillna(1.0)
+    # CPN平均件数をbase_cvとして直接使うため、定常比のCPN係数は掛けない。
+    future_df["cpn_factor"] = 1.0
 
     # 曜日・月初月末・月別需要期・LINE OAは、アップロード実績から毎回算出。
     forecast_df = forecast_cv(future_df, factor_tables)
