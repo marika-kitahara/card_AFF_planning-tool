@@ -134,7 +134,6 @@ if uploaded_file and uploaded_master:
             calculate_transition_cpn_factor,
             enforce_premium_media_cost,
         )
-        from config.constants import RECENT_NORMAL_DAYS
 
         history_df = load_data(uploaded_file)
         history_df["date"] = pd.to_datetime(history_df["date"], errors="coerce").dt.normalize()
@@ -191,53 +190,74 @@ if uploaded_file and uploaded_master:
         st.error("予測期間の開始日は終了日以前にしてください。")
         st.stop()
 
-    reference_date = pd.Timestamp(start_date)
-
-    # CPNは、前年同月の同一CPN平均件数をそのまま予測ベースにする。
-    # 「通常」を選んだ場合のみ、従来どおり直近定常実績をベースにする。
-    cpn_base_table = calculate_transition_cpn_factor(history_df, selected_cpn, reference_date)
+    reference_date = pd.Timestamp(start_date).normalize()
 
     if selected_cpn == "通常":
-        recent_normal_dates = (
-            history_df.loc[
-                (history_df["CPN名"] == "通常") & (history_df["date"] < reference_date),
-                "date",
-            ]
-            .drop_duplicates()
-            .sort_values()
-            .tail(RECENT_NORMAL_DAYS)
-        )
-        recent_normal = history_df[history_df["date"].isin(recent_normal_dates)].copy()
-        base_pair = _daily_pair_average(recent_normal)
+        # 定常は予測期間をそのまま365日前へずらした期間の実績を使用する。
+        normal_reference_start = pd.Timestamp(start_date).normalize() - pd.Timedelta(days=365)
+        normal_reference_end = pd.Timestamp(end_date).normalize() - pd.Timedelta(days=365)
+        normal_reference = history_df[
+            history_df["date"].between(normal_reference_start, normal_reference_end)
+            & history_df["CPN名"].eq("通常")
+        ].copy()
+
+        base_pair = _daily_pair_average(normal_reference)
         base_pair = base_pair[base_pair["media"].isin(selected_media)]
         if base_pair.empty:
-            st.error("対象媒体の直近定常実績がありません。")
+            st.error(
+                "365日前の同期間に定常実績がありません。"
+                "実績CSVとCPNマスタの『通常』登録を確認してください。"
+            )
             st.stop()
+
+        st.subheader("📈 前年同期間の定常実績")
+        normal_display = (
+            normal_reference.groupby(["date", "media"], as_index=False)["cv"].sum()
+            .groupby("media", as_index=False)["cv"].mean()
+            .rename(columns={"media": "媒体", "cv": "前年同期間の定常CV/日"})
+        )
+        normal_display["前年同期間の定常CV/日"] = normal_display["前年同期間の定常CV/日"].round(2)
+        st.caption(
+            f"参照期間: {normal_reference_start.date()} ～ {normal_reference_end.date()}（予測期間の365日前）"
+        )
+        st.dataframe(normal_display, use_container_width=True, hide_index=True)
+
     else:
+        # キャンペーンは前年同月・同一CPNの平均件数を予測ベースとして直接使用する。
+        cpn_base_table = calculate_transition_cpn_factor(history_df, selected_cpn, reference_date)
         base_pair = cpn_base_table[["media", "商品ID", "base_cv", "cost"]].copy()
         base_pair = base_pair[base_pair["media"].isin(selected_media)]
         if base_pair.empty:
-            st.error("前年同月に同一キャンペーンの実績がありません。CPN名と前年同月のマスタ登録を確認してください。")
+            st.error(
+                "前年同月に同一キャンペーンの実績がありません。"
+                "CPN名と前年同月のマスタ登録を確認してください。"
+            )
             st.stop()
 
-    st.subheader("📈 前年同月・同一CPN平均件数")
-    if selected_cpn == "通常":
-        st.info("通常は、予測開始日前の直近定常実績を使用します。")
-    else:
-        display_cpn = (
+        st.subheader("📈 CPN実績")
+        display_factor = (
             cpn_base_table.groupby(
                 ["media", "reference_cpn_start", "reference_cpn_end"],
                 as_index=False,
-            )["cpn_daily_cv"].first()
+            )
+            .agg(
+                normal_daily_cv=("normal_daily_cv", "first"),
+                cpn_daily_cv=("cpn_daily_cv", "first"),
+                cpn_factor=("cpn_factor", "first"),
+            )
         )
-        display_cpn["cpn_daily_cv"] = display_cpn["cpn_daily_cv"].round(2)
-        display_cpn = display_cpn.rename(columns={
+        display_factor["normal_daily_cv"] = display_factor["normal_daily_cv"].round(2)
+        display_factor["cpn_daily_cv"] = display_factor["cpn_daily_cv"].round(2)
+        display_factor["cpn_factor"] = display_factor["cpn_factor"].round(3)
+        display_factor = display_factor.rename(columns={
             "media": "媒体",
-            "cpn_daily_cv": "前年同月・同一CPNの平均CV/日",
+            "normal_daily_cv": "前年CPN直前の定常CV/日（参考）",
+            "cpn_daily_cv": "前年同月・同一CPNのCV/日",
+            "cpn_factor": "参考CPN倍率（予測には未使用）",
             "reference_cpn_start": "参照CPN開始",
             "reference_cpn_end": "参照CPN終了",
         })
-        st.dataframe(display_cpn, use_container_width=True, hide_index=True)
+        st.dataframe(display_factor, use_container_width=True, hide_index=True)
 
     factor_tables = calculate_dynamic_factor_tables(history_df)
     st.subheader("📐 実績から算出した変動係数")
