@@ -33,17 +33,15 @@ def calculate_transition_cpn_factor(
     selected_cpn: str,
     reference_date: pd.Timestamp,
 ) -> pd.DataFrame:
-    """前年同月の同一CPN実績を予測ベースとして返す。
+    """前年同月の同一CPN実績を媒体×商品ID別の予測ベースとして返す。
 
-    前年CPN直前の定常実績と倍率も画面上の参考値として算出するが、
-    予測計算には掛け合わせない。
+    前年CPN直前の定常実績と倍率は表示用の参考値であり、予測には使用しない。
     """
     columns = [
         "media", "商品ID", "base_cv", "cost",
         "normal_daily_cv", "cpn_daily_cv", "cpn_factor",
         "reference_cpn_start", "reference_cpn_end",
     ]
-
     work = history_df.copy()
     work["date"] = pd.to_datetime(work["date"], errors="coerce").dt.normalize()
     target = pd.Timestamp(reference_date).normalize() - pd.DateOffset(years=1)
@@ -56,8 +54,6 @@ def calculate_transition_cpn_factor(
     if same_month.empty:
         return pd.DataFrame(columns=columns)
 
-    # 同月内に同名CPNが複数回ある場合は連続日ごとに期間を分け、
-    # 今回開始日の1年前に最も近い期間を採用する。
     cpn_dates = same_month["date"].drop_duplicates().sort_values()
     block_id = cpn_dates.diff().dt.days.fillna(1).gt(1).cumsum()
     periods = cpn_dates.groupby(block_id).agg(["min", "max"]).reset_index(drop=True)
@@ -76,17 +72,16 @@ def calculate_transition_cpn_factor(
         .agg(base_cv=("cv", "mean"), cost=("cost", "mean"))
     )
 
-    # 媒体別CPN平均（日平均）
     cpn_avg = (
         cpn_hist.groupby(["date", "media"], as_index=False)["cv"].sum()
         .groupby("media")["cv"].mean()
     )
 
-    # 直前定常は表示用の参考値のみ。予測には使用しない。
+    normal_labels = {"通常", "定常"}
     normal_start = cpn_start - pd.Timedelta(days=TRANSITION_NORMAL_DAYS)
     normal_hist = work[
         work["date"].between(normal_start, cpn_start, inclusive="left")
-        & work["CPN名"].eq("通常")
+        & work["CPN名"].isin(normal_labels)
     ]
     normal_avg = (
         normal_hist.groupby(["date", "media"], as_index=False)["cv"].sum()
@@ -107,7 +102,7 @@ def calculate_dynamic_factor_tables(history_df: pd.DataFrame) -> dict[str, pd.Da
     通常CPN実績から各係数を媒体別に算出する。
     基準は月初・月末を除く通常平日の媒体別1日平均CV=1.0。
     """
-    normal = history_df[history_df["CPN名"].eq("通常")].copy()
+    normal = history_df[history_df["CPN名"].isin(["通常", "定常"])].copy()
     daily = _daily_media(normal)
     if daily.empty:
         empty = pd.DataFrame()
