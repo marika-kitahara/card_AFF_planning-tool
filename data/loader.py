@@ -1,8 +1,10 @@
 import pandas as pd
+
 try:
     import jpholiday
-except ImportError:  # ローカル確認時のフォールバック。クラウドではrequirementsから導入。
+except ImportError:
     jpholiday = None
+
 
 REQUIRED_HISTORY_COLUMNS = {
     "成果発生日時",
@@ -25,8 +27,8 @@ def add_business_edge_flags(df: pd.DataFrame) -> pd.DataFrame:
     dates = pd.to_datetime(df["date"])
     unique_months = dates.dt.to_period("M").dropna().unique()
 
-    start_dates: set[pd.Timestamp] = set()
-    end_dates: set[pd.Timestamp] = set()
+    start_dates = set()
+    end_dates = set()
 
     for period in unique_months:
         month_dates = pd.date_range(period.start_time, period.end_time, freq="D")
@@ -56,7 +58,10 @@ def _read_csv_with_fallback(file) -> pd.DataFrame:
             return pd.read_csv(file, encoding=encoding)
         except UnicodeDecodeError:
             continue
-    raise ValueError("CSVの文字コードを判定できませんでした。UTF-8またはShift-JISで保存してください。")
+    raise ValueError(
+        "CSVの文字コードを判定できませんでした。"
+        "UTF-8またはShift-JISで保存してください。"
+    )
 
 
 def _normalize_id_value(value) -> str:
@@ -71,37 +76,177 @@ def _normalize_id_value(value) -> str:
     return text
 
 
+def _normalize_flag_text(value) -> str:
+    if pd.isna(value):
+        return ""
+    return str(value).strip().lower()
+
+
+def _find_approval_column(df: pd.DataFrame):
+    """
+    実績CSVから承認判定列を自動検出する。
+
+    優先:
+      承認フラグ / 承認状況 / 承認ステータス / 承認 / 成果承認フラグ
+
+    上記が無い場合は、列名に「承認」を含み、
+    値に Y/N・1/0・承認/否認 等が含まれる列を探す。
+    """
+    exact_candidates = [
+        "承認フラグ",
+        "成果承認フラグ",
+        "承認状況",
+        "承認ステータス",
+        "承認",
+    ]
+
+    for col in exact_candidates:
+        if col in df.columns:
+            return col
+
+    positive = {
+        "y", "yes", "1", "1.0", "true",
+        "○", "〇", "承認", "approved", "確定", "有効",
+    }
+    negative = {
+        "n", "no", "0", "0.0", "false",
+        "×", "x", "否認", "非承認", "却下", "rejected", "無効",
+    }
+
+    for col in df.columns:
+        if "承認" not in str(col):
+            continue
+
+        sample = (
+            df[col]
+            .dropna()
+            .head(500)
+            .map(_normalize_flag_text)
+        )
+        values = set(sample.unique())
+
+        if values & positive or values & negative:
+            return col
+
+    return None
+
+
+def _approval_mask(series: pd.Series) -> pd.Series:
+    """承認列を True / False / NA に変換する。"""
+    positive = {
+        "y", "yes", "1", "1.0", "true",
+        "○", "〇", "承認", "approved", "確定", "有効",
+    }
+    negative = {
+        "n", "no", "0", "0.0", "false",
+        "×", "x", "否認", "非承認", "却下", "rejected", "無効",
+    }
+
+    normalized = series.map(_normalize_flag_text)
+
+    result = pd.Series(pd.NA, index=series.index, dtype="boolean")
+    result.loc[normalized.isin(positive)] = True
+    result.loc[normalized.isin(negative)] = False
+    return result
+
+
 def load_data(file) -> pd.DataFrame:
     df = _read_csv_with_fallback(file)
 
     missing = REQUIRED_HISTORY_COLUMNS - set(df.columns)
     if missing:
-        raise ValueError(f"実績CSVに必要な列がありません: {', '.join(sorted(missing))}")
+        raise ValueError(
+            f"実績CSVに必要な列がありません: {', '.join(sorted(missing))}"
+        )
 
     df = df.copy()
-    if df.shape[1] < 6:
-        raise ValueError("実績CSVにF列がありません。SIDは実績データのF列から取得します。")
 
-    # SIDは列名ではなく、ユーザー仕様どおり「実績データのF列」を正として保持する。
+    if df.shape[1] < 6:
+        raise ValueError(
+            "実績CSVにF列がありません。"
+            "SIDは実績データのF列から取得します。"
+        )
+
+    # SIDはユーザー仕様どおり「実績データのF列」を正とする。
     df["SID"] = df.iloc[:, 5].map(_normalize_id_value)
-    df["media"] = df["パートナーサイト名"].astype(str).str.strip()
-    df["cv"] = pd.to_numeric(df["件数"], errors="coerce")
-    df["cost"] = pd.to_numeric(df["報酬額"], errors="coerce")
+
+    df["media"] = (
+        df["パートナーサイト名"]
+        .astype(str)
+        .str.strip()
+    )
+    df["cv"] = pd.to_numeric(
+        df["件数"],
+        errors="coerce",
+    )
+    df["cost"] = pd.to_numeric(
+        df["報酬額"],
+        errors="coerce",
+    )
     df["商品ID"] = df["商品ID"].map(_normalize_id_value)
+
+    # ---------------------------------------------------------
+    # 承認実績を保持
+    # approved_cv = 承認された発生件数
+    # approval_base_cv = 承認判定が存在する発生件数
+    # ---------------------------------------------------------
+    approval_col = _find_approval_column(df)
+
+    if approval_col is not None:
+        approval_flag = _approval_mask(df[approval_col])
+
+        # 承認/否認が判定できる行だけを承認率の分母にする。
+        known = approval_flag.notna()
+
+        df["approved_cv"] = 0.0
+        df.loc[known & approval_flag.fillna(False), "approved_cv"] = (
+            df.loc[known & approval_flag.fillna(False), "cv"]
+        )
+
+        df["approval_base_cv"] = 0.0
+        df.loc[known, "approval_base_cv"] = df.loc[known, "cv"]
+
+        df["approval_source_column"] = approval_col
+
+    else:
+        # 承認列が見つからない場合は、後段で明示的に検知できるようNaN。
+        df["approved_cv"] = pd.NA
+        df["approval_base_cv"] = pd.NA
+        df["approval_source_column"] = ""
+
     df = add_flags(df)
 
-    df = df.dropna(subset=["date", "cv", "cost"])
-    if df.empty:
-        raise ValueError("有効な実績データがありません。日付・件数・報酬額を確認してください。")
+    df = df.dropna(
+        subset=["date", "cv", "cost"]
+    )
 
-    return (
-        df.groupby(["date", "media", "SID", "商品ID"], dropna=False)
+    if df.empty:
+        raise ValueError(
+            "有効な実績データがありません。"
+            "日付・件数・報酬額を確認してください。"
+        )
+
+    grouped = (
+        df.groupby(
+            ["date", "media", "SID", "商品ID"],
+            dropna=False,
+        )
         .agg(
             cv=("cv", "sum"),
             cost=("cost", "sum"),
+            approved_cv=("approved_cv", "sum"),
+            approval_base_cv=("approval_base_cv", "sum"),
+            approval_source_column=("approval_source_column", "first"),
             weekday=("weekday", "first"),
             is_month_start=("is_month_start", "max"),
             is_month_end=("is_month_end", "max"),
         )
         .reset_index()
     )
+
+    # 承認列未検出時、groupby(sum)で0扱いにならないよう戻す。
+    if approval_col is None:
+        grouped["approved_cv"] = pd.NA
+        grouped["approval_base_cv"] = pd.NA
+
+    return grouped
