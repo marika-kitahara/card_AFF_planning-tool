@@ -106,15 +106,6 @@ def create_report_table(df):
 # -----------------------
 def to_excel_multi(sim_df, opt_df):
 
-    # =========================================================
-    # 既存移管合算シート：不要列 E:W を最終出力時に削除
-    # 元レイアウトへの書き込み完了後に削除することで、
-    # 既存の列番号ベースの出力ロジックへの影響を避ける。
-    # =========================================================
-    # main_ws は上で実際の対象月シートへリネーム済みなので、
-    # 固定の「10月」名ではなく、現在参照している main_ws をそのまま使う。
-    main_ws.delete_cols(5, 19)  # E:W（19列）
-
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -1345,6 +1336,13 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
     _set_percent(sws, 36, 7, total_rate)
     _set_value(sws, 36, 8, sum_cost)
     _set_value(sws, 36, 9, total_cpa)
+
+    # =========================================================
+    # 既存移管合算シート：不要列 E:W を最終出力時に削除
+    # =========================================================
+    # すべての値を書き込み終えた後に削除するため、
+    # 既存の列番号ベースの出力処理には影響しない。
+    main_ws.delete_cols(5, 19)  # E:W（19列）
 
     output = BytesIO()
     wb_out.save(output)
