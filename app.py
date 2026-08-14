@@ -389,10 +389,321 @@ def _future_period_name(date_value, future_cpn_map, selected_cpn):
     return "マジ得" if cpn_name == "マジ得" else "定常"
 
 
-def create_submission_excel(opt_summary, history_df, cpn_master, start_date, end_date, selected_cpn, opt_mode):
+
+def _build_manual_settings_defaults(
+    opt_summary: pd.DataFrame,
+    history_df: pd.DataFrame,
+    selected_cpn: str,
+) -> pd.DataFrame:
+    """
+    最適プラン / 提案用Excelの計算値を、手動設定テーブルの初期値へ変換する。
+
+    編集可能:
+      今回プラン採用グロス単価
+      今回プラン採用承認率
+      今回採用件数
+      費用
+
+    自動計算:
+      承認件数 = 今回採用件数 × 今回プラン採用承認率
+      発行CPA   = 費用 ÷ 承認件数
+    """
+    plan = opt_summary.copy()
+    plan["media"] = plan["media"].astype(str)
+    plan["cv"] = pd.to_numeric(plan["cv"], errors="coerce").fillna(0)
+    plan["cost"] = pd.to_numeric(plan["cost"], errors="coerce").fillna(0)
+
+    totals = (
+        plan.groupby("media", as_index=False)
+        .agg(
+            plan_cv=("cv", "sum"),
+            plan_cost=("cost", "sum"),
+        )
+    )
+    totals["opt_unit"] = (
+        totals["plan_cost"]
+        / totals["plan_cv"].replace(0, pd.NA)
+    ).fillna(0)
+
+    period = _calculate_period_media_metrics(history_df)
+
+    # SID
+    sid_map = {}
+    if "SID" in history_df.columns:
+        sid_source = history_df[["media", "SID"]].copy()
+        sid_source["media"] = sid_source["media"].astype(str)
+        sid_source["SID"] = (
+            sid_source["SID"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+        sid_source = sid_source[sid_source["SID"] != ""]
+        sid_map = (
+            sid_source.groupby("media")["SID"]
+            .agg(lambda x: " / ".join(dict.fromkeys(x.tolist())))
+            .to_dict()
+        )
+
+    rows = []
+    for r in totals.itertuples():
+        media = str(r.media)
+        opt_unit = float(r.opt_unit or 0)
+
+        if selected_cpn == "マジ得":
+            rate = period["magi_rate"].get(
+                media,
+                period["magi_rate_all"],
+            )
+            gross_unit = period["magi_unit"].get(
+                media,
+                period["magi_unit_all"],
+            )
+            if gross_unit <= 0:
+                gross_unit = opt_unit
+        else:
+            rate = period["normal_rate"].get(
+                media,
+                period["normal_rate_all"],
+            )
+            gross_unit = opt_unit
+
+        adopted_count = float(r.plan_cv or 0)
+        approved_count = adopted_count * float(rate or 0)
+        cost = approved_count * float(gross_unit or 0)
+        issue_cpa = cost / approved_count if approved_count else 0
+
+        rows.append(
+            {
+                "SID": sid_map.get(media, ""),
+                "媒体名": media,
+                "今回プラン採用グロス単価": round(gross_unit),
+                "今回プラン採用承認率": float(rate or 0),
+                "今回採用件数": round(adopted_count),
+                "費用": round(cost),
+                "承認件数": round(approved_count, 1),
+                "発行CPA": round(issue_cpa),
+            }
+        )
+
+    result = pd.DataFrame(rows)
+
+    if not result.empty:
+        result = result.sort_values(
+            ["今回採用件数", "費用", "媒体名"],
+            ascending=[False, False, True],
+        ).reset_index(drop=True)
+
+    return result
+
+
+def _normalize_manual_settings(df: pd.DataFrame) -> pd.DataFrame:
+    """手動設定の入力値を安全に数値化し、派生値を再計算する。"""
+    out = df.copy()
+
+    required_cols = [
+        "SID",
+        "媒体名",
+        "今回プラン採用グロス単価",
+        "今回プラン採用承認率",
+        "今回採用件数",
+        "費用",
+    ]
+    for col in required_cols:
+        if col not in out.columns:
+            out[col] = "" if col in {"SID", "媒体名"} else 0
+
+    for col in [
+        "今回プラン採用グロス単価",
+        "今回プラン採用承認率",
+        "今回採用件数",
+        "費用",
+    ]:
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
+
+    out["今回プラン採用グロス単価"] = (
+        out["今回プラン採用グロス単価"].clip(lower=0)
+    )
+    out["今回プラン採用承認率"] = (
+        out["今回プラン採用承認率"].clip(lower=0, upper=1)
+    )
+    out["今回採用件数"] = out["今回採用件数"].clip(lower=0)
+    out["費用"] = out["費用"].clip(lower=0)
+
+    out["承認件数"] = (
+        out["今回採用件数"]
+        * out["今回プラン採用承認率"]
+    )
+
+    out["発行CPA"] = (
+        out["費用"]
+        / out["承認件数"].replace(0, pd.NA)
+    ).fillna(0)
+
+    out["今回採用件数"] = out["今回採用件数"].round(0)
+    out["費用"] = out["費用"].round(0)
+    out["承認件数"] = out["承認件数"].round(1)
+    out["発行CPA"] = out["発行CPA"].round(0)
+
+    return out[
+        [
+            "SID",
+            "媒体名",
+            "今回プラン採用グロス単価",
+            "今回プラン採用承認率",
+            "今回採用件数",
+            "費用",
+            "承認件数",
+            "発行CPA",
+        ]
+    ]
+
+
+def _manual_settings_signature(df: pd.DataFrame):
+    """session_state更新判定用。"""
+    cols = [
+        "媒体名",
+        "今回プラン採用グロス単価",
+        "今回プラン採用承認率",
+        "今回採用件数",
+        "費用",
+    ]
+    if df is None or df.empty:
+        return ()
+    work = df[cols].copy()
+    return tuple(
+        tuple(row)
+        for row in work.astype(object).itertuples(index=False, name=None)
+    )
+
+
+def _manual_settings_body(
+    opt_summary,
+    history_df,
+    selected_cpn,
+    calc_key,
+):
+    """最適プラン直下の手動設定エディタ。"""
+    settings_key = f"manual_settings_{hash(str(calc_key))}"
+
+    if st.session_state.get("_manual_calc_key") != calc_key:
+        st.session_state["_manual_calc_key"] = calc_key
+        st.session_state["_manual_settings"] = _build_manual_settings_defaults(
+            opt_summary=opt_summary,
+            history_df=history_df,
+            selected_cpn=selected_cpn,
+        )
+        st.session_state["_manual_editor_version"] = (
+            st.session_state.get("_manual_editor_version", 0) + 1
+        )
+
+    current = _normalize_manual_settings(
+        st.session_state.get(
+            "_manual_settings",
+            _build_manual_settings_defaults(
+                opt_summary=opt_summary,
+                history_df=history_df,
+                selected_cpn=selected_cpn,
+            ),
+        )
+    )
+
+    editor_version = st.session_state.get("_manual_editor_version", 0)
+
+    edited = st.data_editor(
+        current,
+        key=f"{settings_key}_{editor_version}",
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        disabled=[
+            "SID",
+            "媒体名",
+            "承認件数",
+            "発行CPA",
+        ],
+        column_config={
+            "SID": st.column_config.TextColumn(
+                "SID",
+                width="small",
+            ),
+            "媒体名": st.column_config.TextColumn(
+                "媒体名",
+                width="large",
+            ),
+            "今回プラン採用グロス単価": st.column_config.NumberColumn(
+                "今回プラン採用グロス単価",
+                min_value=0,
+                step=100,
+                format="¥%d",
+            ),
+            "今回プラン採用承認率": st.column_config.NumberColumn(
+                "今回プラン採用承認率",
+                min_value=0.0,
+                max_value=1.0,
+                step=0.001,
+                format="%.1f%%",
+            ),
+            "今回採用件数": st.column_config.NumberColumn(
+                "今回採用件数",
+                min_value=0,
+                step=1,
+                format="%d",
+            ),
+            "費用": st.column_config.NumberColumn(
+                "費用",
+                min_value=0,
+                step=1000,
+                format="¥%d",
+            ),
+            "承認件数": st.column_config.NumberColumn(
+                "承認件数",
+                format="%.1f",
+            ),
+            "発行CPA": st.column_config.NumberColumn(
+                "発行CPA",
+                format="¥%d",
+            ),
+        },
+    )
+
+    normalized = _normalize_manual_settings(edited)
+
+    if _manual_settings_signature(normalized) != _manual_settings_signature(current):
+        st.session_state["_manual_settings"] = normalized
+        st.session_state["_manual_editor_version"] = editor_version + 1
+        if hasattr(st, "rerun"):
+            try:
+                st.rerun(scope="fragment")
+            except TypeError:
+                st.rerun()
+        return
+
+    st.session_state["_manual_settings"] = normalized
+
+    total_count = normalized["今回採用件数"].sum()
+    total_issue = normalized["承認件数"].sum()
+    total_cost = normalized["費用"].sum()
+    overall_rate = total_issue / total_count if total_count else 0
+    overall_cpa = total_cost / total_issue if total_issue else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("今回採用件数 合計", f"{total_count:,.0f}")
+    c2.metric("承認件数 合計", f"{total_issue:,.1f}")
+    c3.metric("全体承認率", f"{overall_rate:.1%}")
+    c4.metric("全体発行CPA", f"¥{overall_cpa:,.0f}")
+
+
+if hasattr(st, "fragment"):
+    render_manual_settings = st.fragment(_manual_settings_body)
+else:
+    render_manual_settings = _manual_settings_body
+
+
+def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings, start_date, end_date, selected_cpn, opt_mode):
     """
     添付された提出用Excelそのものをテンプレートとして使い、
-    最適プランの結果だけを全7シートへ反映する。
+    最適プランを初期値とした手動設定の結果を提出用Excelへ反映する。
 
     - SID: 実績データF列を loader.py で保持した history_df["SID"]
     - 件数: 最適プランCV
@@ -426,13 +737,31 @@ def create_submission_excel(opt_summary, history_df, cpn_master, start_date, end
         .fillna(0)
     )
 
-    # 媒体は予測件数の多い順。
-    media_totals = (
+    base_media_totals = (
         daily.groupby("media", as_index=False)
-        .agg(total_cv=("cv", "sum"), total_cost=("cost", "sum"))
-        .sort_values(["total_cv", "total_cost", "media"], ascending=[False, False, True])
+        .agg(
+            total_cv=("cv", "sum"),
+            total_cost=("cost", "sum"),
+        )
     )
-    media_list = media_totals["media"].astype(str).tolist()
+    base_media_totals["media"] = base_media_totals["media"].astype(str)
+
+    # ---------------------------------------------------------
+    # 手動設定を最終提出値として採用。
+    # 日次件数は、元の最適プラン日次構成比を維持して再配分する。
+    # ---------------------------------------------------------
+    manual = _normalize_manual_settings(manual_settings)
+    manual["媒体名"] = manual["媒体名"].astype(str)
+
+    base_media_set = set(base_media_totals["media"].tolist())
+    manual = manual[manual["媒体名"].isin(base_media_set)].copy()
+
+    manual = manual.sort_values(
+        ["今回採用件数", "費用", "媒体名"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
+
+    media_list = manual["媒体名"].tolist()
 
     MAX_TEMPLATE_MEDIA = 150
     if len(media_list) > MAX_TEMPLATE_MEDIA:
@@ -441,23 +770,75 @@ def create_submission_excel(opt_summary, history_df, cpn_master, start_date, end
             f"現在は{len(media_list)}媒体です。"
         )
 
-    cv_map = {(r.date, str(r.media)): float(r.cv) for r in daily.itertuples()}
-    raw_cost_map = {(r.date, str(r.media)): float(r.cost) for r in daily.itertuples()}
-    cpa_map = {(r.date, str(r.media)): float(r.cpa) for r in daily.itertuples()}
+    manual_count_map = dict(
+        zip(
+            manual["媒体名"],
+            manual["今回採用件数"].astype(float),
+        )
+    )
+    manual_rate_map = dict(
+        zip(
+            manual["媒体名"],
+            manual["今回プラン採用承認率"].astype(float),
+        )
+    )
+    manual_cost_total_map = dict(
+        zip(
+            manual["媒体名"],
+            manual["費用"].astype(float),
+        )
+    )
+    manual_gross_unit_map = dict(
+        zip(
+            manual["媒体名"],
+            manual["今回プラン採用グロス単価"].astype(float),
+        )
+    )
 
-    total_cv_by_date = daily.groupby("date")["cv"].sum().to_dict()
+    original_total_cv_map = dict(
+        zip(
+            base_media_totals["media"],
+            base_media_totals["total_cv"].astype(float),
+        )
+    )
 
-    # 媒体別の最適プラン単価① = 最適プラン合計cost / 合計CV
-    opt_unit_map = {}
-    for r in media_totals.itertuples():
-        opt_unit_map[str(r.media)] = (
-            float(r.total_cost / r.total_cv)
-            if r.total_cv else 0.0
+    # 元日次Forecastを今回採用件数へ比例配分。
+    cv_map = {}
+    for row in daily.itertuples():
+        dt = pd.Timestamp(row.date).normalize()
+        media = str(row.media)
+        original_total = original_total_cv_map.get(media, 0.0)
+        adopted_total = manual_count_map.get(media, 0.0)
+
+        scale = (
+            adopted_total / original_total
+            if original_total > 0
+            else 0.0
+        )
+        cv_map[(dt, media)] = float(row.cv) * scale
+
+    # 端数差が出ても媒体Totalが手動入力値と一致するよう、最後の日へ差分を寄せる。
+    dates_by_media = {}
+    for dt, media in cv_map.keys():
+        dates_by_media.setdefault(media, []).append(dt)
+
+    for media in media_list:
+        media_dates = sorted(dates_by_media.get(media, []))
+        if not media_dates:
+            continue
+
+        current_total = sum(
+            cv_map.get((dt, media), 0.0)
+            for dt in media_dates
+        )
+        diff = manual_count_map.get(media, 0.0) - current_total
+        cv_map[(media_dates[-1], media)] = (
+            cv_map.get((media_dates[-1], media), 0.0)
+            + diff
         )
 
-    # 過去実績から定常・マジ得別の承認率 / マジ得単価を算出。
+    # 過去実績の定常・マジ得指標は、提出用Excelの参考列用に残す。
     period_metrics = _calculate_period_media_metrics(history_df)
-
     normal_rate_map = period_metrics["normal_rate"]
     magi_rate_map = period_metrics["magi_rate"]
     normal_rate_all = period_metrics["normal_rate_all"]
@@ -469,61 +850,120 @@ def create_submission_excel(opt_summary, history_df, cpn_master, start_date, end
     future_cpn_map = {}
     if cpn_master is not None and not cpn_master.empty:
         fm = cpn_master[["日付", "CPN名"]].copy()
-        fm["日付"] = pd.to_datetime(fm["日付"], errors="coerce").dt.normalize()
+        fm["日付"] = pd.to_datetime(
+            fm["日付"],
+            errors="coerce",
+        ).dt.normalize()
         fm = fm.dropna(subset=["日付"])
         future_cpn_map = dict(zip(fm["日付"], fm["CPN名"]))
 
-    # 全日次指標を一本化。
+    # 発行数 = 手動設定後Forecast × 手動承認率
     issue_map = {}
+    for (dt, media), cv in cv_map.items():
+        rate = manual_rate_map.get(media, 0.0)
+        issue_map[(dt, media)] = cv * rate
+
+    # 費用はユーザー入力総額を正として、日次承認件数の構成比で配分。
     expected_cost_map = {}
-    period_unit_map = {}
+    for media in media_list:
+        media_dates = sorted(dates_by_media.get(media, []))
+        total_cost = manual_cost_total_map.get(media, 0.0)
+        total_issue = sum(
+            issue_map.get((dt, media), 0.0)
+            for dt in media_dates
+        )
+
+        if total_issue > 0:
+            for dt in media_dates:
+                share = issue_map.get((dt, media), 0.0) / total_issue
+                expected_cost_map[(dt, media)] = total_cost * share
+        else:
+            total_cv = sum(
+                cv_map.get((dt, media), 0.0)
+                for dt in media_dates
+            )
+            for dt in media_dates:
+                share = (
+                    cv_map.get((dt, media), 0.0) / total_cv
+                    if total_cv > 0
+                    else 0.0
+                )
+                expected_cost_map[(dt, media)] = total_cost * share
+
+        # 費用Totalの丸め差は最後の日へ寄せる。
+        if media_dates:
+            assigned = sum(
+                expected_cost_map.get((dt, media), 0.0)
+                for dt in media_dates
+            )
+            diff = total_cost - assigned
+            last_dt = media_dates[-1]
+            expected_cost_map[(last_dt, media)] = (
+                expected_cost_map.get((last_dt, media), 0.0)
+                + diff
+            )
+
+    # Promotion Detail等は今回採用グロス単価を表示。
+    period_unit_map = {
+        (dt, media): manual_gross_unit_map.get(media, 0.0)
+        for (dt, media) in cv_map.keys()
+    }
+
+    total_cv_by_date = {}
     total_issue_by_date = {}
     total_cost_by_date = {}
 
+    for (dt, media), cv in cv_map.items():
+        total_cv_by_date[dt] = total_cv_by_date.get(dt, 0.0) + cv
+        total_issue_by_date[dt] = (
+            total_issue_by_date.get(dt, 0.0)
+            + issue_map.get((dt, media), 0.0)
+        )
+        total_cost_by_date[dt] = (
+            total_cost_by_date.get(dt, 0.0)
+            + expected_cost_map.get((dt, media), 0.0)
+        )
+
+    # 参考列用：今回採用件数を未来CPN区分に応じて分割。
     normal_forecast_by_media = {m: 0.0 for m in media_list}
     magi_forecast_by_media = {m: 0.0 for m in media_list}
 
-    for row in daily.itertuples():
-        dt = pd.Timestamp(row.date).normalize()
-        media = str(row.media)
-        cv = float(row.cv)
-
-        normal_rate = normal_rate_map.get(media, normal_rate_all)
-        magi_rate = magi_rate_map.get(media, magi_rate_all)
-
-        opt_unit = opt_unit_map.get(media, 0.0)
-        magi_unit = magi_unit_map.get(media, magi_unit_all)
-        if magi_unit <= 0:
-            magi_unit = opt_unit
-
-        period = _future_period_name(dt, future_cpn_map, selected_cpn)
-
+    for (dt, media), cv in cv_map.items():
+        period = _future_period_name(
+            dt,
+            future_cpn_map,
+            selected_cpn,
+        )
         if period == "マジ得":
-            rate = magi_rate
-            unit_price = magi_unit
             magi_forecast_by_media[media] += cv
         else:
-            rate = normal_rate
-            unit_price = opt_unit
             normal_forecast_by_media[media] += cv
 
-        issue = cv * rate
-        expected_cost = issue * unit_price
-
-        issue_map[(dt, media)] = issue
-        expected_cost_map[(dt, media)] = expected_cost
-        period_unit_map[(dt, media)] = unit_price
-
-        total_issue_by_date[dt] = total_issue_by_date.get(dt, 0.0) + issue
-        total_cost_by_date[dt] = total_cost_by_date.get(dt, 0.0) + expected_cost
-
     normal_issue_by_media = {
-        m: normal_forecast_by_media[m] * normal_rate_map.get(m, normal_rate_all)
+        m: (
+            normal_forecast_by_media[m]
+            * manual_rate_map.get(m, 0.0)
+        )
         for m in media_list
     }
     magi_issue_by_media = {
-        m: magi_forecast_by_media[m] * magi_rate_map.get(m, magi_rate_all)
+        m: (
+            magi_forecast_by_media[m]
+            * manual_rate_map.get(m, 0.0)
+        )
         for m in media_list
+    }
+
+    # 後段互換用。
+    opt_unit_map = manual_gross_unit_map
+    cpa_map = {
+        key: (
+            expected_cost_map.get(key, 0.0)
+            / issue_map.get(key, 0.0)
+            if issue_map.get(key, 0.0) > 0
+            else 0.0
+        )
+        for key in cv_map.keys()
     }
 
     # SIDは実績CSVのF列を正とする。
@@ -682,11 +1122,7 @@ def create_submission_excel(opt_summary, history_df, cpn_master, start_date, end
         _set_value(main_ws, r0, 8, 0)
         _set_value(main_ws, r0, 10, 0)
         normal_rate = normal_rate_map.get(media, normal_rate_all)
-        selected_rate = (
-            magi_rate_map.get(media, magi_rate_all)
-            if selected_cpn == "マジ得"
-            else normal_rate
-        )
+        selected_rate = manual_rate_map.get(media, 0.0)
         _set_percent(main_ws, r0, 11, normal_rate)
         _set_percent(main_ws, r0, 12, selected_rate)
         _set_value(main_ws, r0, 17, total_cost)
@@ -770,20 +1206,24 @@ def create_submission_excel(opt_summary, history_df, cpn_master, start_date, end
             r = metric_data_start + idx
 
             normal_rate = normal_rate_map.get(media, normal_rate_all)
-            magi_rate = magi_rate_map.get(media, magi_rate_all)
+            manual_rate = manual_rate_map.get(media, 0.0)
 
-            opt_unit = opt_unit_map.get(media, 0.0)
+            opt_unit = manual_gross_unit_map.get(media, 0.0)
             magi_unit = magi_unit_map.get(media, magi_unit_all)
             if magi_unit <= 0:
                 magi_unit = opt_unit
 
             _set_value(ws, r, 1, sid_map.get(media, ""))
             _set_value(ws, r, 2, media)
+
+            # Cは今回の手動採用グロス単価。
             _set_value(ws, r, 3, round(opt_unit))
             _set_value(ws, r, 4, round(magi_unit))
+
+            # Eは過去定常の参考値、Gは今回採用承認率を反映。
             _set_percent(ws, r, 5, normal_rate)
             _set_value(ws, r, 6, round(normal_issue_by_media.get(media, 0)))
-            _set_percent(ws, r, 7, magi_rate)
+            _set_percent(ws, r, 7, manual_rate)
             _set_value(ws, r, 8, round(magi_issue_by_media.get(media, 0)))
 
             row_total = 0.0
@@ -884,6 +1324,7 @@ def _submission_download_body(
     opt_summary,
     history_df,
     cpn_master,
+    manual_settings,
     start_date,
     end_date,
     selected_cpn,
@@ -900,6 +1341,7 @@ def _submission_download_body(
             opt_summary=opt_summary,
             history_df=history_df,
             cpn_master=cpn_master,
+            manual_settings=manual_settings,
             start_date=start_date,
             end_date=end_date,
             selected_cpn=selected_cpn,
@@ -1655,6 +2097,20 @@ if uploaded_file and uploaded_master:
         use_container_width=True,
     )
 
+    st.subheader("✍️ 手動設定")
+    st.caption(
+        "初期値は上の最適プランと過去実績から自動設定。"
+        "グロス単価・承認率・採用件数・費用を直接編集できます。"
+        "承認件数と発行CPAは入力内容から自動計算します。"
+    )
+
+    render_manual_settings(
+        opt_summary=opt_summary,
+        history_df=history_df,
+        selected_cpn=selected_cpn,
+        calc_key=calc_key,
+    )
+
     target_cv = st.sidebar.number_input(
         "目標",
         min_value=0,
@@ -1676,10 +2132,22 @@ if uploaded_file and uploaded_master:
     # ボタンを押しても予測・松竹梅・最適化は再実行しない。
     # Excel自体もクリックされるまで生成しない。
     # ---------------------------------------------------------
+    manual_settings_for_export = _normalize_manual_settings(
+        st.session_state.get(
+            "_manual_settings",
+            _build_manual_settings_defaults(
+                opt_summary=opt_summary,
+                history_df=history_df,
+                selected_cpn=selected_cpn,
+            ),
+        )
+    )
+
     render_submission_download(
         opt_summary=opt_summary,
         history_df=history_df,
         cpn_master=cpn_master,
+        manual_settings=manual_settings_for_export,
         start_date=start_date,
         end_date=end_date,
         selected_cpn=selected_cpn,
