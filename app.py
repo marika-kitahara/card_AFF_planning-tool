@@ -35,59 +35,70 @@ def format_date(df, col="date"):
 # ✅ 帳票形式
 # -----------------------
 def create_report_table(df):
+    """
+    松竹梅・最適プラン表示用の高速版。
+    媒体×プランごとのループとDataFrame大量生成をやめ、
+    melt + pivot_table で一括変換する。
+    """
+    if df.empty:
+        return pd.DataFrame()
 
-    pivot = df.pivot_table(
-        index=["media", "plan"],
-        columns="date",
-        values=["cv", "cost", "cpa"],
-        aggfunc="sum"
+    work = df[["date", "media", "plan", "cv", "cost", "cpa"]].copy()
+
+    long_df = work.melt(
+        id_vars=["media", "plan", "date"],
+        value_vars=["cv", "cost", "cpa"],
+        var_name="metric",
+        value_name="value",
     )
 
-    pivot = pivot.sort_index(axis=1)
+    metric_map = {
+        "cv": "CV",
+        "cost": "COST",
+        "cpa": "CPA",
+    }
+    metric_order = {
+        "CV": 0,
+        "COST": 1,
+        "CPA": 2,
+    }
 
-    rows = []
+    long_df["metric"] = long_df["metric"].map(metric_map)
+    long_df["_metric_order"] = long_df["metric"].map(metric_order)
 
-    for (media, plan) in pivot.index:
+    result = (
+        long_df.pivot_table(
+            index=["media", "plan", "metric", "_metric_order"],
+            columns="date",
+            values="value",
+            aggfunc="sum",
+        )
+        .reset_index()
+        .sort_values(
+            ["media", "plan", "_metric_order"],
+            kind="stable",
+        )
+        .drop(columns="_metric_order")
+        .reset_index(drop=True)
+    )
 
-        sub = pivot.loc[(media, plan)]
-
-        cv = sub["cv"]
-        cost = sub["cost"]
-        cpa = sub["cpa"]
-
-        cv_df = pd.DataFrame([cv])
-        cost_df = pd.DataFrame([cost])
-        cpa_df = pd.DataFrame([cpa])
-
-        cv_df["media"] = media
-        cv_df["plan"] = plan
-        cv_df["metric"] = "CV"
-
-        cost_df["media"] = media
-        cost_df["plan"] = plan
-        cost_df["metric"] = "COST"
-
-        cpa_df["media"] = media
-        cpa_df["plan"] = plan
-        cpa_df["metric"] = "CPA"
-
-        rows.extend([cv_df, cost_df, cpa_df])
-
-    result = pd.concat(rows)
-
-    cols = ["media", "plan", "metric"] + [
-        c for c in result.columns if c not in ["media", "plan", "metric"]
+    date_cols = [
+        c for c in result.columns
+        if c not in ["media", "plan", "metric"]
     ]
+    result = result[["media", "plan", "metric"] + date_cols]
 
-    result = result[cols]
-
-    result["media"] = result["media"].mask(result["media"].duplicated())
-    result["plan"] = result["plan"].mask(
-        (result["plan"].shift() == result["plan"]) &
-        (result["media"].shift() == result["media"])
+    result["media"] = result["media"].mask(
+        result["media"].duplicated()
     )
 
-    return result.reset_index(drop=True)
+    # planは3行（CV/COST/CPA）の先頭だけ表示
+    result["plan"] = result["plan"].mask(
+        result["plan"].eq(result["plan"].shift())
+        & result["media"].isna()
+    )
+
+    return result
 
 
 # -----------------------
@@ -1046,9 +1057,35 @@ if uploaded_file and uploaded_master:
             hide_index=True,
         )
 
-    factor_tables = calculate_dynamic_factor_tables(
-        history_df
+    st.sidebar.header("🎯 最適化ロジック")
+
+    opt_mode = st.sidebar.radio(
+        "最適基準",
+        ["CPA最小", "CV最大"],
+        index=0,
     )
+
+    # ---------------------------------------------------------
+    # 変動係数は同じ入力条件なら再計算しない。
+    # Excel生成ボタン等によるStreamlit再実行でも再利用する。
+    # ---------------------------------------------------------
+    factor_cache_key = (
+        tuple(selected_media),
+        len(history_df),
+        str(history_df["date"].min()),
+        str(history_df["date"].max()),
+        float(pd.to_numeric(history_df["cv"], errors="coerce").fillna(0).sum()),
+        float(pd.to_numeric(history_df["cost"], errors="coerce").fillna(0).sum()),
+    )
+
+    if st.session_state.get("_factor_cache_key") == factor_cache_key:
+        factor_tables = st.session_state["_factor_tables"]
+    else:
+        factor_tables = calculate_dynamic_factor_tables(
+            history_df
+        )
+        st.session_state["_factor_cache_key"] = factor_cache_key
+        st.session_state["_factor_tables"] = factor_tables
 
     st.subheader("📐 実績から算出した変動係数")
 
@@ -1090,69 +1127,181 @@ if uploaded_file and uploaded_master:
                 hide_index=True,
             )
 
-    future_dates = pd.date_range(
-        start=start_date,
-        end=end_date,
+    # ---------------------------------------------------------
+    # 予測 → 松竹梅 → 最適化 は一度計算したら session_state に保持。
+    # Streamlitのボタン押下ではスクリプト全体が再実行されるが、
+    # 入力条件が同じならここでは再計算しない。
+    # ---------------------------------------------------------
+    if is_normal_selected:
+        reference_key = (
+            str(normal_reference_start),
+            str(normal_reference_end),
+        )
+    else:
+        reference_key = tuple(selected_period_labels)
+
+    calc_key = (
+        tuple(selected_media),
+        selected_cpn,
+        str(start_date),
+        str(end_date),
+        reference_key,
+        opt_mode,
+        len(base_pair),
+        round(float(pd.to_numeric(base_pair["base_cv"], errors="coerce").fillna(0).sum()), 6),
+        round(float(pd.to_numeric(base_pair["cost"], errors="coerce").fillna(0).sum()), 2),
     )
 
-    future_df = pd.DataFrame(
-        {"date": future_dates}
-    ).merge(
-        base_pair,
-        how="cross",
-    )
+    cached_calc = st.session_state.get("_planning_calc")
 
-    future_df["weekday"] = (
-        future_df["date"].dt.day_name()
-    )
+    if (
+        cached_calc is not None
+        and st.session_state.get("_planning_calc_key") == calc_key
+    ):
+        forecast_df = cached_calc["forecast_df"]
+        sim_df = cached_calc["sim_df"]
+        sim_summary = cached_calc["sim_summary"]
+        opt_df = cached_calc["opt_df"]
+        opt_summary = cached_calc["opt_summary"]
 
-    future_df = add_business_edge_flags(
-        future_df
-    )
+    else:
+        future_dates = pd.date_range(
+            start=start_date,
+            end=end_date,
+        )
 
-    future_df = future_df.merge(
-        cpn_master[
-            [
-                "日付",
-                "CPN名",
-                "line_oa_flag",
-                "magitoku_after_flag",
-            ]
-        ],
-        left_on="date",
-        right_on="日付",
-        how="left",
-    )
+        future_df = pd.DataFrame(
+            {"date": future_dates}
+        ).merge(
+            base_pair,
+            how="cross",
+        )
 
-    future_df["CPN名"] = (
-        future_df["CPN名"]
-        .fillna(selected_cpn)
-    )
+        future_df["weekday"] = (
+            future_df["date"].dt.day_name()
+        )
 
-    future_df["line_oa_flag"] = (
-        future_df["line_oa_flag"]
-        .fillna(0)
-        .astype(int)
-    )
+        future_df = add_business_edge_flags(
+            future_df
+        )
 
-    future_df["magitoku_after_flag"] = (
-        future_df["magitoku_after_flag"]
-        .fillna(0)
-        .astype(int)
-    )
+        future_df = future_df.merge(
+            cpn_master[
+                [
+                    "日付",
+                    "CPN名",
+                    "line_oa_flag",
+                    "magitoku_after_flag",
+                ]
+            ],
+            left_on="date",
+            right_on="日付",
+            how="left",
+        )
 
-    # キャンペーン平均をbase_cvとして直接使用するため、CPN倍率は掛けない。
-    future_df["cpn_factor"] = 1.0
+        future_df["CPN名"] = (
+            future_df["CPN名"]
+            .fillna(selected_cpn)
+        )
 
-    # 曜日・月初月末・月別需要期・LINE OAは、アップロード実績から毎回算出。
-    forecast_df = forecast_cv(
-        future_df,
-        factor_tables,
-    )
+        future_df["line_oa_flag"] = (
+            future_df["line_oa_flag"]
+            .fillna(0)
+            .astype(int)
+        )
 
-    forecast_df = enforce_premium_media_cost(
-        forecast_df
-    )
+        future_df["magitoku_after_flag"] = (
+            future_df["magitoku_after_flag"]
+            .fillna(0)
+            .astype(int)
+        )
+
+        # キャンペーン平均をbase_cvとして直接使用するため、CPN倍率は掛けない。
+        future_df["cpn_factor"] = 1.0
+
+        forecast_df = forecast_cv(
+            future_df,
+            factor_tables,
+        )
+
+        forecast_df = enforce_premium_media_cost(
+            forecast_df
+        )
+
+        # simulate_plan用に日付表示形式を変換
+        forecast_df = forecast_df.copy()
+        forecast_df["date"] = format_date(
+            forecast_df
+        )
+
+        sim_df = simulate_plan(
+            forecast_df
+        )
+
+        sim_summary = (
+            sim_df.groupby(
+                ["date", "media", "plan"],
+                as_index=False,
+            )
+            .agg(
+                cv=("cv", "sum"),
+                cost=("cost", "sum"),
+            )
+        )
+
+        sim_summary["cpa"] = (
+            (sim_summary["cost"] / sim_summary["cv"])
+            .replace(
+                [float("inf"), float("-inf")],
+                0,
+            )
+            .fillna(0)
+        )
+
+        sim_summary["date"] = format_date(
+            sim_summary
+        )
+
+        opt_df = optimize_budget(
+            sim_df,
+            opt_mode,
+        )
+
+        opt_summary = (
+            opt_df.groupby(
+                ["date", "media", "plan"],
+                as_index=False,
+            )
+            .agg(
+                cv=("cv", "sum"),
+                cost=("cost", "sum"),
+            )
+        )
+
+        opt_summary["cpa"] = (
+            (opt_summary["cost"] / opt_summary["cv"])
+            .replace(
+                [float("inf"), float("-inf")],
+                0,
+            )
+            .fillna(0)
+        )
+
+        opt_summary["date"] = format_date(
+            opt_summary
+        )
+
+        st.session_state["_planning_calc_key"] = calc_key
+        st.session_state["_planning_calc"] = {
+            "forecast_df": forecast_df,
+            "sim_df": sim_df,
+            "sim_summary": sim_summary,
+            "opt_df": opt_df,
+            "opt_summary": opt_summary,
+        }
+
+        # 条件が変わって再計算した場合、古い提出Excelは破棄
+        st.session_state.pop("submission_excel", None)
 
     # 係数確認用の明細
     with st.expander("予測係数の確認"):
@@ -1171,85 +1320,21 @@ if uploaded_file and uploaded_master:
             "cost",
         ]
 
+        available_factor_cols = [
+            c for c in factor_cols
+            if c in forecast_df.columns
+        ]
+
         st.dataframe(
-            forecast_df[factor_cols],
+            forecast_df[available_factor_cols],
             use_container_width=True,
             hide_index=True,
         )
-
-    forecast_df["date"] = format_date(
-        forecast_df
-    )
-
-    sim_df = simulate_plan(
-        forecast_df
-    )
-
-    sim_summary = (
-        sim_df.groupby(
-            ["date", "media", "plan"],
-            as_index=False,
-        )
-        .agg(
-            cv=("cv", "sum"),
-            cost=("cost", "sum"),
-        )
-    )
-
-    sim_summary["cpa"] = (
-        (sim_summary["cost"] / sim_summary["cv"])
-        .replace(
-            [float("inf"), float("-inf")],
-            0,
-        )
-        .fillna(0)
-    )
-
-    sim_summary["date"] = format_date(
-        sim_summary
-    )
 
     st.subheader("📊 松竹梅")
     st.dataframe(
         create_report_table(sim_summary),
         use_container_width=True,
-    )
-
-    st.sidebar.header("🎯 最適化ロジック")
-
-    opt_mode = st.sidebar.radio(
-        "最適基準",
-        ["CPA最小", "CV最大"],
-        index=0,
-    )
-
-    opt_df = optimize_budget(
-        sim_df,
-        opt_mode,
-    )
-
-    opt_summary = (
-        opt_df.groupby(
-            ["date", "media", "plan"],
-            as_index=False,
-        )
-        .agg(
-            cv=("cv", "sum"),
-            cost=("cost", "sum"),
-        )
-    )
-
-    opt_summary["cpa"] = (
-        (opt_summary["cost"] / opt_summary["cv"])
-        .replace(
-            [float("inf"), float("-inf")],
-            0,
-        )
-        .fillna(0)
-    )
-
-    opt_summary["date"] = format_date(
-        opt_summary
     )
 
     st.subheader("🚀 最適プラン")
