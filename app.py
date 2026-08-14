@@ -121,6 +121,8 @@ def to_excel_multi(sim_df, opt_df):
 def _template_path() -> Path:
     base = Path(__file__).resolve().parent
     candidates = [
+        base / "assets" / "submission_template_fast.xlsx",
+        base / "submission_template_fast.xlsx",
         base / "assets" / "submission_template.xlsx",
         base / "submission_template.xlsx",
     ]
@@ -135,24 +137,6 @@ def _template_path() -> Path:
 def _safe_number(value, default=0.0):
     value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     return default if pd.isna(value) else float(value)
-
-
-def _copy_style(src, dst):
-    """テンプレの見た目をそのまま複製するための最小スタイルコピー。"""
-    if src.has_style:
-        dst._style = copy(src._style)
-    if src.number_format:
-        dst.number_format = src.number_format
-    if src.alignment:
-        dst.alignment = copy(src.alignment)
-    if src.font:
-        dst.font = copy(src.font)
-    if src.fill:
-        dst.fill = copy(src.fill)
-    if src.border:
-        dst.border = copy(src.border)
-    if src.protection:
-        dst.protection = copy(src.protection)
 
 
 def _set_date_slots(ws, row, first_col, slot_count, dates, total_col=None):
@@ -176,23 +160,6 @@ def _set_date_slots(ws, row, first_col, slot_count, dates, total_col=None):
             cell.value = "Total"
 
 
-def _clear_values(ws, min_row, max_row, min_col, max_col):
-    """
-    書式・罫線・セル結合・行高・列幅を維持したまま値だけ消す。
-    openpyxl の MergedCell は value を変更できないためスキップする。
-    """
-    for row in ws.iter_rows(
-        min_row=min_row,
-        max_row=max_row,
-        min_col=min_col,
-        max_col=max_col,
-    ):
-        for cell in row:
-            if isinstance(cell, MergedCell):
-                continue
-            cell.value = None
-
-
 def _set_value(ws, row, col, value):
     """
     結合セル対策付きの値セット。
@@ -202,6 +169,16 @@ def _set_value(ws, row, col, value):
     if isinstance(cell, MergedCell):
         return
     cell.value = value
+
+
+def _set_percent(ws, row, col, value):
+    """0.583 をExcel上で58.3%表示にする。"""
+    cell = ws.cell(row, col)
+    if isinstance(cell, MergedCell):
+        return
+    cell.value = value
+    cell.number_format = "0.0%"
+
 
 
 
@@ -339,6 +316,14 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
     )
     media_list = list(dict.fromkeys(daily["media"].tolist()))
 
+    # 高速テンプレートは150媒体分の空枠を事前確保している。
+    MAX_TEMPLATE_MEDIA = 150
+    if len(media_list) > MAX_TEMPLATE_MEDIA:
+        raise ValueError(
+            f"提出用Excelは最大{MAX_TEMPLATE_MEDIA}媒体まで対応しています。"
+            f"現在は{len(media_list)}媒体です。"
+        )
+
     cv_map = {(r.date, r.media): float(r.cv) for r in daily.itertuples()}
     cost_map = {(r.date, r.media): float(r.cost) for r in daily.itertuples()}
     cpa_map = {(r.date, r.media): float(r.cpa) for r in daily.itertuples()}
@@ -384,13 +369,8 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
     template = _template_path()
     wb_out = load_workbook(template)
 
-    # Excelを開いたときに数式があれば再計算させる。
-    try:
-        wb_out.calculation.fullCalcOnLoad = True
-        wb_out.calculation.forceFullCalc = True
-        wb_out.calculation.calcMode = "auto"
-    except Exception:
-        pass
+    # 高速テンプレートは数式依存を最小化しているため、
+    # 保存時の強制フル再計算指定は行わない。
 
     main_old_name = "10月（既存移管合算）"
     main_ws = (
@@ -498,58 +478,13 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
         _set_value(main_ws, start_row + 1, total_col, 0)
         _set_value(main_ws, start_row + 2, total_col, -total_val)
 
-    # 明細エリアはテンプレの先頭4行ブロックの見た目を全媒体にコピーして再構築。
+    # 明細エリア
+    # 高速テンプレート側に150媒体×4行の空枠・書式を事前作成済み。
+    # ここでは行追加・全セルクリア・スタイルコピーを一切行わず、値だけ書く。
     detail_start = 21
-    detail_end = main_ws.max_row
-    style_source_rows = [21, 22, 23, 24]
-
-    style_snapshots = []
-    for src_r in style_source_rows:
-        row_styles = []
-        for c in range(1, total_col + 1):
-            src = main_ws.cell(src_r, c)
-            row_styles.append(
-                (
-                    copy(src._style),
-                    copy(src.alignment),
-                    copy(src.font),
-                    copy(src.fill),
-                    copy(src.border),
-                    src.number_format,
-                )
-            )
-        style_snapshots.append(row_styles)
-
-    # 既存値だけ消し、列幅・罫線等のテンプレ設定は保持。
-    _clear_values(main_ws, detail_start, detail_end, 1, total_col)
-
-    # 必要な明細行を最初にまとめて確保する。
-    # insert_rows() を媒体ごとに繰り返すと、openpyxl が既存セルを毎回移動するため非常に重くなる。
-    required_main_end = detail_start + max(len(media_list) - 1, 0) * 4 + 3
-    if media_list and required_main_end > main_ws.max_row:
-        main_ws.insert_rows(
-            main_ws.max_row + 1,
-            amount=required_main_end - main_ws.max_row,
-        )
 
     for idx, media in enumerate(media_list, start=0):
         r0 = detail_start + idx * 4
-
-        # 4行すべてにテンプレの同じ行パターンを適用
-        for off in range(4):
-            target_r = r0 + off
-            for c in range(1, total_col + 1):
-                cell = main_ws.cell(target_r, c)
-                if isinstance(cell, MergedCell):
-                    continue
-
-                stl, algn, font, fill, border, numfmt = style_snapshots[off][c - 1]
-                cell._style = copy(stl)
-                cell.alignment = copy(algn)
-                cell.font = copy(font)
-                cell.fill = copy(fill)
-                cell.border = copy(border)
-                cell.number_format = numfmt
 
         sid = sid_map.get(media, "")
         media_type = media_type_map.get(media, "ポイントサイト")
@@ -572,8 +507,8 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
             media,
             overall_approval_fallback,
         )
-        _set_value(main_ws, r0, 11, approval_rate)
-        _set_value(main_ws, r0, 12, approval_rate)
+        _set_percent(main_ws, r0, 11, approval_rate)
+        _set_percent(main_ws, r0, 12, approval_rate)
         _set_value(main_ws, r0, 17, total_cost)
         _set_value(main_ws, r0, 19, media_type)
 
@@ -621,14 +556,6 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
         dates,
         count_total_col,
     )
-    _clear_values(count_ws, 8, count_ws.max_row, 1, count_total_col)
-
-    required_count_end = 8 + max(len(media_list) - 1, 0)
-    if media_list and required_count_end > count_ws.max_row:
-        count_ws.insert_rows(
-            count_ws.max_row + 1,
-            amount=required_count_end - count_ws.max_row,
-        )
 
     for idx, media in enumerate(media_list):
         r = 8 + idx
@@ -640,8 +567,8 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
             media,
             overall_approval_fallback,
         )
-        _set_value(count_ws, r, 11, approval_rate)
-        _set_value(count_ws, r, 13, approval_rate)
+        _set_percent(count_ws, r, 11, approval_rate)
+        _set_percent(count_ws, r, 13, approval_rate)
 
         total_cv = 0
         for i in range(date_slots):
@@ -670,14 +597,6 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
         dates,
         issue_total_col,
     )
-    _clear_values(issue_ws, 6, issue_ws.max_row, 1, issue_total_col)
-
-    required_issue_end = 6 + max(len(media_list) - 1, 0)
-    if media_list and required_issue_end > issue_ws.max_row:
-        issue_ws.insert_rows(
-            issue_ws.max_row + 1,
-            amount=required_issue_end - issue_ws.max_row,
-        )
 
     for idx, media in enumerate(media_list):
         r = 6 + idx
@@ -688,8 +607,8 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
             media,
             overall_approval_fallback,
         )
-        _set_value(issue_ws, r, 3, approval_rate)
-        _set_value(issue_ws, r, 4, approval_rate)
+        _set_percent(issue_ws, r, 3, approval_rate)
+        _set_percent(issue_ws, r, 4, approval_rate)
 
         total_issue = 0
         for i in range(date_slots):
@@ -721,14 +640,6 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
         dates,
         cost_total_col,
     )
-    _clear_values(cost_ws, 7, cost_ws.max_row, 1, cost_total_col)
-
-    required_cost_end = 7 + max(len(media_list) - 1, 0)
-    if media_list and required_cost_end > cost_ws.max_row:
-        cost_ws.insert_rows(
-            cost_ws.max_row + 1,
-            amount=required_cost_end - cost_ws.max_row,
-        )
 
     for idx, media in enumerate(media_list):
         r = 7 + idx
@@ -739,10 +650,10 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
             media,
             overall_approval_fallback,
         )
-        _set_value(cost_ws, r, 11, approval_rate)
-        _set_value(cost_ws, r, 12, approval_rate)
-        _set_value(cost_ws, r, 13, approval_rate)
-        _set_value(cost_ws, r, 14, approval_rate)
+        _set_percent(cost_ws, r, 11, approval_rate)
+        _set_percent(cost_ws, r, 12, approval_rate)
+        _set_percent(cost_ws, r, 13, approval_rate)
+        _set_percent(cost_ws, r, 14, approval_rate)
 
         total_cost = 0
         for i in range(date_slots):
@@ -797,7 +708,7 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
                 _set_value(sws, r, 2, forecast)
                 _set_value(sws, r, 3, forecast)
                 _set_value(sws, r, 5, issue)
-                _set_value(sws, r, 7, approval_rate)
+                _set_percent(sws, r, 7, approval_rate)
                 _set_value(sws, r, 8, cost)
                 _set_value(sws, r, 9, issue_cpa)
             else:
