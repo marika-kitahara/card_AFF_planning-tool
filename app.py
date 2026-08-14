@@ -295,20 +295,9 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
     new_main_name = f"{pd.Timestamp(start_date).month}月（既存移管合算）"
     main_ws.title = new_main_name
 
-    # シート名変更に伴い、テンプレ内の旧シート名参照も追従させる。
-    old_ref = f"'{main_old_name}'!"
-    new_ref = f"'{new_main_name}'!"
-    for _ws in wb_out.worksheets:
-        for _row in _ws.iter_rows():
-            for _cell in _row:
-                if isinstance(_cell, MergedCell):
-                    continue
-                if (
-                    isinstance(_cell.value, str)
-                    and _cell.value.startswith("=")
-                    and old_ref in _cell.value
-                ):
-                    _cell.value = _cell.value.replace(old_ref, new_ref)
+    # 最小テンプレートは他シートから旧シート名を参照する数式を持たないため、
+    # 全ワークシート・全セルの走査は行わない。
+    # これにより提出用Excel生成時の処理時間を大幅に削減する。
 
     first_date_col = 25  # Y
     total_col = 58       # BF
@@ -1258,15 +1247,6 @@ if uploaded_file and uploaded_master:
     gap = target_cv - forecast_df["forecast_cv"].sum()
     st.write(f"差分: {gap:.0f}")
 
-    submission_excel = create_submission_excel(
-        opt_summary=opt_summary,
-        history_df=history_df,
-        start_date=start_date,
-        end_date=end_date,
-        selected_cpn=selected_cpn,
-        opt_mode=opt_mode,
-    )
-
     submission_filename = (
         f"【提出用】楽天カード"
         f"{pd.Timestamp(start_date).year}年"
@@ -1274,12 +1254,46 @@ if uploaded_file and uploaded_master:
         f"プランニング.xlsx"
     )
 
-    st.download_button(
-        "📥 最適プランを提出用ExcelでDL",
-        data=submission_excel,
-        file_name=submission_filename,
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
+    # ---------------------------------------------------------
+    # 提出用Excelは画面表示のたびに自動生成しない。
+    # Streamlitはウィジェット操作のたびに上から再実行されるため、
+    # create_submission_excel() を常時実行するとDLボタン表示まで重くなる。
+    # 「生成」ボタンを押した時だけ作成し、session_stateに保持する。
+    # ---------------------------------------------------------
+    submission_key = (
+        f"{start_date}_{end_date}_{selected_cpn}_{opt_mode}_"
+        f"{','.join(map(str, selected_media))}"
     )
+
+    # 条件が変わったら古い成果物を破棄
+    if st.session_state.get("submission_key") != submission_key:
+        st.session_state.pop("submission_excel", None)
+        st.session_state["submission_key"] = submission_key
+
+    if st.button(
+        "📄 提出用Excelを生成",
+        type="primary",
+        use_container_width=True,
+    ):
+        with st.spinner("提出用Excelを作成しています..."):
+            st.session_state["submission_excel"] = create_submission_excel(
+                opt_summary=opt_summary,
+                history_df=history_df,
+                start_date=start_date,
+                end_date=end_date,
+                selected_cpn=selected_cpn,
+                opt_mode=opt_mode,
+            )
+
+    if "submission_excel" in st.session_state:
+        st.success("提出用Excelの作成が完了しました。")
+        st.download_button(
+            "📥 最適プランを提出用ExcelでDL",
+            data=st.session_state["submission_excel"],
+            file_name=submission_filename,
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            use_container_width=True,
+        )
