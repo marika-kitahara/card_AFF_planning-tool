@@ -207,9 +207,9 @@ def _set_value(ws, row, col, value):
 
 def _calculate_media_approval_rates(history_df: pd.DataFrame) -> dict:
     """
-    過去実績から媒体別の承認率を算出する。
+    過去実績の『成果承認フラグ = Y』を発行数として、媒体別承認率を算出する。
 
-    承認率 = 承認件数合計 / 承認判定対象の発生件数合計
+    承認率 = 成果承認フラグYの件数合計 / 全発生件数合計
 
     媒体に承認実績がない場合は全媒体の加重承認率をフォールバックに使う。
     全体でも承認実績がない場合はエラーにする。
@@ -1075,7 +1075,7 @@ if uploaded_file and uploaded_master:
         with st.expander("✅ 過去実績から算出した承認率"):
             st.caption(
                 f"全体加重承認率: {_overall_approval:.1%} / "
-                "媒体別は承認件数 ÷ 承認判定対象の発生件数で算出"
+                "媒体別は『成果承認フラグ=Yの件数 ÷ 全件数』で算出"
             )
             st.dataframe(
                 approval_preview,
