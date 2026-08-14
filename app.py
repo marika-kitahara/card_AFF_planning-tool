@@ -3,6 +3,10 @@ import pandas as pd
 import datetime
 from io import BytesIO
 
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
 from data.loader import load_data
 from logic.forecast import forecast_cv
 from logic.simulation import simulate_plan
@@ -90,6 +94,277 @@ def to_excel_multi(sim_df, opt_df):
         create_report_table(sim_df).to_excel(writer, sheet_name="松竹梅", index=False)
         create_report_table(opt_df).to_excel(writer, sheet_name="最適", index=False)
 
+    return output.getvalue()
+
+
+# -----------------------
+# ✅ 提出用Excel（最適プランのみ）
+# -----------------------
+def create_submission_excel(opt_summary, history_df, start_date, end_date, selected_cpn, opt_mode):
+    """添付の提出用プランニング表を意識した帳票を、最適プランだけで生成する。"""
+    output = BytesIO()
+
+    plan = opt_summary.copy()
+    plan["date"] = pd.to_datetime(plan["date"], errors="coerce")
+    plan = plan.dropna(subset=["date", "media"])
+    plan["cv"] = pd.to_numeric(plan["cv"], errors="coerce").fillna(0)
+    plan["cost"] = pd.to_numeric(plan["cost"], errors="coerce").fillna(0)
+    plan["cpa"] = (plan["cost"] / plan["cv"]).replace([float("inf"), float("-inf")], 0).fillna(0)
+
+    dates = list(pd.date_range(start=pd.Timestamp(start_date), end=pd.Timestamp(end_date), freq="D"))
+    media_list = list(dict.fromkeys(plan["media"].astype(str).tolist()))
+
+    # 商品IDは提出表のSID欄へ表示。1媒体に複数ある場合は「 / 」で併記。
+    sid_map = {}
+    if "商品ID" in history_df.columns:
+        sid_source = history_df[["media", "商品ID"]].dropna().copy()
+        sid_source["media"] = sid_source["media"].astype(str)
+        sid_source["商品ID"] = sid_source["商品ID"].astype(str)
+        sid_map = (
+            sid_source.groupby("media")["商品ID"]
+            .agg(lambda x: " / ".join(dict.fromkeys(x.tolist())))
+            .to_dict()
+        )
+
+    daily = (
+        plan.groupby(["date", "media"], as_index=False)
+        .agg(cv=("cv", "sum"), cost=("cost", "sum"))
+    )
+    daily["cpa"] = (daily["cost"] / daily["cv"]).replace([float("inf"), float("-inf")], 0).fillna(0)
+
+    # 値引き用辞書
+    cv_map = {(r.date.normalize(), str(r.media)): float(r.cv) for r in daily.itertuples()}
+    cpa_map = {(r.date.normalize(), str(r.media)): float(r.cpa) for r in daily.itertuples()}
+    total_by_date = daily.groupby("date", as_index=True)["cv"].sum().to_dict()
+
+    wb_out = Workbook()
+    ws = wb_out.active
+    month_label = pd.Timestamp(start_date).strftime("%-m月") if hasattr(pd.Timestamp(start_date), "strftime") else "プラン"
+    # Windows互換を考慮して %-m が使えない環境にも対応
+    month_label = f"{pd.Timestamp(start_date).month}月"
+    ws.title = f"{month_label}（最適プラン）"
+
+    # 色（添付テンプレに近い淡色）
+    pale_blue = "DDEBF7"
+    pale_green = "E2F0D9"
+    pale_green_2 = "F3F8EF"
+    weekend_pink = "F4CCCC"
+    total_yellow = "FFF2CC"
+    white = "FFFFFF"
+    grid = "B7B7B7"
+    red = "FF3333"
+    green = "00A651"
+    blue = "4472C4"
+    dark = "404040"
+
+    thin = Side(style="thin", color=grid)
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
+
+    fixed_cols = 4
+    first_date_col = fixed_cols + 1
+    total_col = first_date_col + len(dates)
+
+    # 列幅
+    ws.column_dimensions["A"].width = 5
+    ws.column_dimensions["B"].width = 16
+    ws.column_dimensions["C"].width = 34
+    ws.column_dimensions["D"].width = 24
+    for col in range(first_date_col, total_col):
+        ws.column_dimensions[get_column_letter(col)].width = 8.5
+    ws.column_dimensions[get_column_letter(total_col)].width = 12
+
+    # タイトル・条件
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=total_col)
+    ws.cell(1, 1, f"楽天カード {pd.Timestamp(start_date).year}年{pd.Timestamp(start_date).month}月 プランニング（最適プラン）")
+    ws.cell(1, 1).font = Font(size=14, bold=True, color=dark)
+    ws.cell(1, 1).alignment = left
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=total_col)
+    ws.cell(2, 1, f"CPN：{selected_cpn}　／　最適基準：{opt_mode}　／　予測期間：{pd.Timestamp(start_date).strftime('%Y/%m/%d')}～{pd.Timestamp(end_date).strftime('%Y/%m/%d')}")
+    ws.cell(2, 1).font = Font(size=9, color="666666")
+
+    # 上部サマリ
+    summary_start = 4
+    ws.cell(summary_start, 4, "")
+    for j, dt in enumerate(dates, start=first_date_col):
+        c = ws.cell(summary_start, j, dt.strftime("%m/%d"))
+        c.alignment = center
+        c.font = Font(size=8, bold=True)
+        c.fill = PatternFill("solid", fgColor=weekend_pink if dt.weekday() >= 5 else white)
+        c.border = border
+    tc = ws.cell(summary_start, total_col, "Total")
+    tc.fill = PatternFill("solid", fgColor=total_yellow)
+    tc.font = Font(size=8, bold=True)
+    tc.alignment = center
+    tc.border = border
+
+    summary_rows = [("Target", blue), ("Actual", dark), ("GAP", red)]
+    for idx, (label, font_color) in enumerate(summary_rows, start=summary_start + 1):
+        c = ws.cell(idx, 4, label)
+        c.fill = PatternFill("solid", fgColor=pale_blue)
+        c.font = Font(size=8, bold=(label == "Target"), color=font_color)
+        c.alignment = center
+        c.border = border
+        for j, dt in enumerate(dates, start=first_date_col):
+            cell = ws.cell(idx, j)
+            cell.border = border
+            cell.alignment = center
+            if dt.weekday() >= 5:
+                cell.fill = PatternFill("solid", fgColor=weekend_pink)
+            if label == "Target":
+                cell.value = round(float(total_by_date.get(dt.normalize(), 0)))
+                cell.font = Font(size=8, color=blue)
+            elif label == "Actual":
+                cell.value = None
+            else:
+                target_ref = f"{get_column_letter(j)}{summary_start + 1}"
+                cell.value = f"=-{target_ref}"
+                cell.font = Font(size=8, color=red)
+                cell.number_format = '#,##0;[Red](#,##0)'
+        total_cell = ws.cell(idx, total_col)
+        total_cell.fill = PatternFill("solid", fgColor=total_yellow)
+        total_cell.border = border
+        total_cell.alignment = center
+        if label == "Target":
+            total_cell.value = f"=SUM({get_column_letter(first_date_col)}{idx}:{get_column_letter(total_col-1)}{idx})"
+            total_cell.font = Font(size=8, color=blue, bold=True)
+        elif label == "Actual":
+            total_cell.value = "=0"
+        else:
+            total_cell.value = f"=SUM({get_column_letter(first_date_col)}{idx}:{get_column_letter(total_col-1)}{idx})"
+            total_cell.font = Font(size=8, color=red, bold=True)
+            total_cell.number_format = '#,##0;[Red](#,##0)'
+
+    # メイン表ヘッダ
+    header_date_row = 9
+    header_weekday_row = 10
+    for r in (header_date_row, header_weekday_row):
+        for c in range(1, total_col + 1):
+            ws.cell(r, c).border = border
+            ws.cell(r, c).alignment = center
+            ws.cell(r, c).font = Font(size=8, bold=True)
+
+    headers = ["No.", "SID / 商品ID", "媒体名", "区分"]
+    for c, value in enumerate(headers, start=1):
+        ws.merge_cells(start_row=header_date_row, start_column=c, end_row=header_weekday_row, end_column=c)
+        cell = ws.cell(header_date_row, c, value)
+        cell.fill = PatternFill("solid", fgColor=pale_blue)
+        cell.alignment = center
+        cell.font = Font(size=8, bold=True)
+        cell.border = border
+
+    jp_weekdays = "月火水木金土日"
+    for j, dt in enumerate(dates, start=first_date_col):
+        fill = weekend_pink if dt.weekday() >= 5 else white
+        ws.cell(header_date_row, j, dt.strftime("%m/%d"))
+        ws.cell(header_weekday_row, j, jp_weekdays[dt.weekday()])
+        for r in (header_date_row, header_weekday_row):
+            ws.cell(r, j).fill = PatternFill("solid", fgColor=fill)
+            ws.cell(r, j).font = Font(size=8, bold=True)
+            ws.cell(r, j).alignment = center
+            ws.cell(r, j).border = border
+
+    ws.merge_cells(start_row=header_date_row, start_column=total_col, end_row=header_weekday_row, end_column=total_col)
+    ws.cell(header_date_row, total_col, "Total")
+    ws.cell(header_date_row, total_col).fill = PatternFill("solid", fgColor=total_yellow)
+    ws.cell(header_date_row, total_col).font = Font(size=8, bold=True)
+    ws.cell(header_date_row, total_col).alignment = center
+    ws.cell(header_date_row, total_col).border = border
+
+    # 媒体ごとの4行ブロック
+    row = header_weekday_row + 1
+    metric_defs = [
+        ("Daily Target (Initiative)", blue),
+        ("Actual", dark),
+        ("Promotion Detail", green),
+        ("GAP", red),
+    ]
+    for no, media in enumerate(media_list, start=1):
+        start_row = row
+        end_row = row + 3
+        base_fill = pale_green if no % 2 == 0 else pale_green_2
+
+        # No / SID / 媒体名は4行結合
+        for col, value in [(1, no), (2, sid_map.get(media, "")), (3, media)]:
+            ws.merge_cells(start_row=start_row, start_column=col, end_row=end_row, end_column=col)
+            c = ws.cell(start_row, col, value)
+            c.alignment = center if col != 3 else left
+            c.font = Font(size=8)
+            c.fill = PatternFill("solid", fgColor=base_fill)
+            c.border = border
+            # merged範囲にも罫線・塗りを付与
+            for rr in range(start_row, end_row + 1):
+                ws.cell(rr, col).fill = PatternFill("solid", fgColor=base_fill)
+                ws.cell(rr, col).border = border
+
+        for offset, (label, font_color) in enumerate(metric_defs):
+            rr = start_row + offset
+            label_cell = ws.cell(rr, 4, label)
+            label_cell.alignment = left
+            label_cell.font = Font(size=8, color=font_color)
+            label_cell.fill = PatternFill("solid", fgColor=base_fill)
+            label_cell.border = border
+
+            for j, dt in enumerate(dates, start=first_date_col):
+                cell = ws.cell(rr, j)
+                cell.alignment = center
+                cell.border = border
+                cell.fill = PatternFill("solid", fgColor=weekend_pink if dt.weekday() >= 5 else base_fill)
+                key = (dt.normalize(), media)
+
+                if label == "Daily Target (Initiative)":
+                    cell.value = round(cv_map.get(key, 0))
+                    cell.font = Font(size=8, color=blue)
+                    cell.number_format = '#,##0'
+                elif label == "Actual":
+                    cell.value = None
+                elif label == "Promotion Detail":
+                    cell.value = round(cpa_map.get(key, 0)) if cv_map.get(key, 0) else 0
+                    cell.font = Font(size=8, color=green)
+                    cell.number_format = '¥#,##0'
+                else:
+                    target_ref = f"{get_column_letter(j)}{start_row}"
+                    cell.value = f"=-{target_ref}"
+                    cell.font = Font(size=8, color=red)
+                    cell.number_format = '#,##0;[Red](#,##0)'
+
+            total_cell = ws.cell(rr, total_col)
+            total_cell.fill = PatternFill("solid", fgColor=total_yellow)
+            total_cell.border = border
+            total_cell.alignment = center
+            total_cell.value = f"=SUM({get_column_letter(first_date_col)}{rr}:{get_column_letter(total_col-1)}{rr})"
+            if label == "Promotion Detail":
+                total_cell.number_format = '¥#,##0'
+                total_cell.font = Font(size=8, color=green)
+            elif label == "GAP":
+                total_cell.number_format = '#,##0;[Red](#,##0)'
+                total_cell.font = Font(size=8, color=red)
+            elif label == "Daily Target (Initiative)":
+                total_cell.font = Font(size=8, color=blue, bold=True)
+
+        row += 4
+
+    # 仕上げ
+    ws.freeze_panes = f"{get_column_letter(first_date_col)}{header_weekday_row + 1}"
+    ws.sheet_view.showGridLines = False
+    ws.auto_filter.ref = f"A{header_date_row}:C{row-1}"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_title_rows = f"1:{header_weekday_row}"
+    ws.print_area = f"A1:{get_column_letter(total_col)}{row-1}"
+
+    # 行高
+    ws.row_dimensions[1].height = 24
+    ws.row_dimensions[2].height = 18
+    for rr in range(4, row):
+        if rr not in (1, 2):
+            ws.row_dimensions[rr].height = 18
+
+    wb_out.save(output)
+    output.seek(0)
     return output.getvalue()
 
 
@@ -345,9 +620,22 @@ if uploaded_file and uploaded_master:
     gap = target_cv - forecast_df["forecast_cv"].sum()
     st.write(f"差分: {gap:.0f}")
 
+    submission_excel = create_submission_excel(
+        opt_summary=opt_summary,
+        history_df=history_df,
+        start_date=start_date,
+        end_date=end_date,
+        selected_cpn=selected_cpn,
+        opt_mode=opt_mode,
+    )
+    submission_filename = (
+        f"【提出用】楽天カード{pd.Timestamp(start_date).year}年"
+        f"{pd.Timestamp(start_date).month}月プランニング.xlsx"
+    )
+
     st.download_button(
-        "Excel DL",
-        data=to_excel_multi(sim_summary, opt_summary),
-        file_name="af_plan.xlsx",
+        "📥 最適プランを提出用ExcelでDL",
+        data=submission_excel,
+        file_name=submission_filename,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
