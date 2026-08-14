@@ -186,33 +186,37 @@ def load_data(file) -> pd.DataFrame:
     df["商品ID"] = df["商品ID"].map(_normalize_id_value)
 
     # ---------------------------------------------------------
-    # 承認実績を保持
-    # approved_cv = 承認された発生件数
-    # approval_base_cv = 承認判定が存在する発生件数
+    # 発行実績を保持
+    # ユーザー仕様:
+    #   成果承認フラグ == "Y" の件数が「発行数」
+    #
+    # approval_rate = 発行数 / 全件数
+    # future_issue  = Forecast × approval_rate
     # ---------------------------------------------------------
-    approval_col = _find_approval_column(df)
+    approval_col = "成果承認フラグ"
 
-    if approval_col is not None:
-        approval_flag = _approval_mask(df[approval_col])
-
-        # 承認/否認が判定できる行だけを承認率の分母にする。
-        known = approval_flag.notna()
-
-        df["approved_cv"] = 0.0
-        df.loc[known & approval_flag.fillna(False), "approved_cv"] = (
-            df.loc[known & approval_flag.fillna(False), "cv"]
+    if approval_col not in df.columns:
+        raise ValueError(
+            "実績CSVに『成果承認フラグ』列がありません。"
+            "発行数は『成果承認フラグ = Y』の件数から算出します。"
         )
 
-        df["approval_base_cv"] = 0.0
-        df.loc[known, "approval_base_cv"] = df.loc[known, "cv"]
+    approval_flag = (
+        df[approval_col]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
 
-        df["approval_source_column"] = approval_col
+    # Yの件数だけが発行数
+    df["approved_cv"] = 0.0
+    df.loc[approval_flag.eq("Y"), "approved_cv"] = (
+        df.loc[approval_flag.eq("Y"), "cv"]
+    )
 
-    else:
-        # 承認列が見つからない場合は、後段で明示的に検知できるようNaN。
-        df["approved_cv"] = pd.NA
-        df["approval_base_cv"] = pd.NA
-        df["approval_source_column"] = ""
+    # 承認率の分母は全発生件数
+    df["approval_base_cv"] = df["cv"]
+    df["approval_source_column"] = approval_col
 
     df = add_flags(df)
 
