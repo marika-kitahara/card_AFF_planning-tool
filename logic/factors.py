@@ -28,74 +28,65 @@ def _ordinary_weekday_mask(df: pd.DataFrame) -> pd.Series:
     )
 
 
-def calculate_transition_cpn_factor(
+def get_cpn_reference_periods(
     history_df: pd.DataFrame,
     selected_cpn: str,
-    reference_date: pd.Timestamp,
-) -> pd.DataFrame:
-    """前年同月の同一CPN実績を媒体×商品ID別の予測ベースとして返す。
-
-    前年CPN直前の定常実績と倍率は表示用の参考値であり、予測には使用しない。
-    """
-    columns = [
-        "media", "商品ID", "base_cv", "cost",
-        "normal_daily_cv", "cpn_daily_cv", "cpn_factor",
-        "reference_cpn_start", "reference_cpn_end",
-    ]
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """実績内に存在する指定CPNの日付を、連続したCPN期間ごとに返す。"""
     work = history_df.copy()
     work["date"] = pd.to_datetime(work["date"], errors="coerce").dt.normalize()
-    target = pd.Timestamp(reference_date).normalize() - pd.DateOffset(years=1)
+    dates = (
+        work.loc[work["CPN名"].eq(selected_cpn), "date"]
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+    )
+    if dates.empty:
+        return []
 
-    same_month = work[
-        work["CPN名"].eq(selected_cpn)
-        & work["date"].dt.year.eq(target.year)
-        & work["date"].dt.month.eq(target.month)
-    ].copy()
-    if same_month.empty:
+    block_id = dates.diff().dt.days.fillna(1).gt(1).cumsum()
+    periods = dates.groupby(block_id).agg(["min", "max"])
+    return [(pd.Timestamp(row["min"]), pd.Timestamp(row["max"])) for _, row in periods.iterrows()]
+
+
+def calculate_selected_cpn_base(
+    history_df: pd.DataFrame,
+    selected_cpn: str,
+    selected_periods: list[tuple[pd.Timestamp, pd.Timestamp]],
+) -> pd.DataFrame:
+    """選択した複数CPN期間の合計実績を総日数で割り、媒体×商品ID別の日平均を返す。
+
+    各期間の日平均を単純平均せず、選択期間全体のCV/COST合計 ÷ 選択期間の総日数で計算する。
+    これにより、期間の長さが異なる場合も実績日数に応じて重み付けされる。
+    """
+    columns = ["media", "商品ID", "base_cv", "cost"]
+    if not selected_periods:
         return pd.DataFrame(columns=columns)
 
-    cpn_dates = same_month["date"].drop_duplicates().sort_values()
-    block_id = cpn_dates.diff().dt.days.fillna(1).gt(1).cumsum()
-    periods = cpn_dates.groupby(block_id).agg(["min", "max"]).reset_index(drop=True)
-    periods["distance"] = (periods["min"] - target).abs()
-    chosen = periods.sort_values(["distance", "min"]).iloc[0]
-    cpn_start = pd.Timestamp(chosen["min"])
-    cpn_end = pd.Timestamp(chosen["max"])
+    work = history_df.copy()
+    work["date"] = pd.to_datetime(work["date"], errors="coerce").dt.normalize()
 
-    cpn_hist = same_month[same_month["date"].between(cpn_start, cpn_end)].copy()
-    daily_pair = (
-        cpn_hist.groupby(["date", "media", "商品ID"], as_index=False)
-        .agg(cv=("cv", "sum"), cost=("cost", "sum"))
-    )
+    mask = pd.Series(False, index=work.index)
+    total_days = 0
+    for start, end in selected_periods:
+        start = pd.Timestamp(start).normalize()
+        end = pd.Timestamp(end).normalize()
+        if end < start:
+            continue
+        mask |= work["date"].between(start, end)
+        total_days += (end - start).days + 1
+
+    selected = work[mask & work["CPN名"].eq(selected_cpn)].copy()
+    if selected.empty or total_days <= 0:
+        return pd.DataFrame(columns=columns)
+
     result = (
-        daily_pair.groupby(["media", "商品ID"], as_index=False)
-        .agg(base_cv=("cv", "mean"), cost=("cost", "mean"))
+        selected.groupby(["media", "商品ID"], as_index=False)
+        .agg(total_cv=("cv", "sum"), total_cost=("cost", "sum"))
     )
-
-    cpn_avg = (
-        cpn_hist.groupby(["date", "media"], as_index=False)["cv"].sum()
-        .groupby("media")["cv"].mean()
-    )
-
-    normal_labels = {"通常", "定常"}
-    normal_start = cpn_start - pd.Timedelta(days=TRANSITION_NORMAL_DAYS)
-    normal_hist = work[
-        work["date"].between(normal_start, cpn_start, inclusive="left")
-        & work["CPN名"].isin(normal_labels)
-    ]
-    normal_avg = (
-        normal_hist.groupby(["date", "media"], as_index=False)["cv"].sum()
-        .groupby("media")["cv"].mean()
-        if not normal_hist.empty else pd.Series(dtype=float)
-    )
-
-    result["normal_daily_cv"] = result["media"].map(normal_avg)
-    result["cpn_daily_cv"] = result["media"].map(cpn_avg)
-    result["cpn_factor"] = _safe_ratio(result["cpn_daily_cv"], result["normal_daily_cv"])
-    result["reference_cpn_start"] = cpn_start
-    result["reference_cpn_end"] = cpn_end
+    result["base_cv"] = result["total_cv"] / total_days
+    result["cost"] = result["total_cost"] / total_days
     return result[columns]
-
 
 def calculate_dynamic_factor_tables(history_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """
