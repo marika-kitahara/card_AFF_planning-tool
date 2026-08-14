@@ -2137,15 +2137,6 @@ if uploaded_file and uploaded_master:
         calc_key=calc_key,
     )
 
-    target_cv = st.sidebar.number_input(
-        "目標",
-        min_value=0,
-        value=1000,
-    )
-
-    gap = target_cv - forecast_df["forecast_cv"].sum()
-    st.write(f"差分: {gap:.0f}")
-
     submission_filename = (
         f"【提出用】楽天カード"
         f"{pd.Timestamp(start_date).year}年"
