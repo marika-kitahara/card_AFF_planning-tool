@@ -59,6 +59,18 @@ def _read_csv_with_fallback(file) -> pd.DataFrame:
     raise ValueError("CSVの文字コードを判定できませんでした。UTF-8またはShift-JISで保存してください。")
 
 
+def _normalize_id_value(value) -> str:
+    """Excel/CSV由来のIDを 12345.0 ではなく 12345 のように安定して文字列化する。"""
+    if pd.isna(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    text = str(value).strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        return text[:-2]
+    return text
+
+
 def load_data(file) -> pd.DataFrame:
     df = _read_csv_with_fallback(file)
 
@@ -67,10 +79,15 @@ def load_data(file) -> pd.DataFrame:
         raise ValueError(f"実績CSVに必要な列がありません: {', '.join(sorted(missing))}")
 
     df = df.copy()
+    if df.shape[1] < 6:
+        raise ValueError("実績CSVにF列がありません。SIDは実績データのF列から取得します。")
+
+    # SIDは列名ではなく、ユーザー仕様どおり「実績データのF列」を正として保持する。
+    df["SID"] = df.iloc[:, 5].map(_normalize_id_value)
     df["media"] = df["パートナーサイト名"].astype(str).str.strip()
     df["cv"] = pd.to_numeric(df["件数"], errors="coerce")
     df["cost"] = pd.to_numeric(df["報酬額"], errors="coerce")
-    df["商品ID"] = df["商品ID"].astype(str).str.strip()
+    df["商品ID"] = df["商品ID"].map(_normalize_id_value)
     df = add_flags(df)
 
     df = df.dropna(subset=["date", "cv", "cost"])
@@ -78,7 +95,7 @@ def load_data(file) -> pd.DataFrame:
         raise ValueError("有効な実績データがありません。日付・件数・報酬額を確認してください。")
 
     return (
-        df.groupby(["date", "media", "商品ID"], dropna=False)
+        df.groupby(["date", "media", "SID", "商品ID"], dropna=False)
         .agg(
             cv=("cv", "sum"),
             cost=("cost", "sum"),
