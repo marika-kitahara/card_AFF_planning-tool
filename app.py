@@ -121,6 +121,8 @@ def to_excel_multi(sim_df, opt_df):
 def _template_path() -> Path:
     base = Path(__file__).resolve().parent
     candidates = [
+        base / "assets" / "submission_template_v2.xlsx",
+        base / "submission_template_v2.xlsx",
         base / "assets" / "submission_template_fast.xlsx",
         base / "submission_template_fast.xlsx",
         base / "assets" / "submission_template.xlsx",
@@ -278,7 +280,116 @@ def _calculate_media_approval_rates(history_df: pd.DataFrame) -> dict:
     return rate_map
 
 
-def create_submission_excel(opt_summary, history_df, start_date, end_date, selected_cpn, opt_mode):
+
+def _calculate_period_media_metrics(history_df: pd.DataFrame):
+    """
+    媒体別に定常・マジ得の過去実績指標を作る。
+
+    定常承認率:
+        定常/通常期間の 成果承認フラグY件数 / 全件数
+
+    マジ得承認率:
+        マジ得期間の 成果承認フラグY件数 / 全件数
+
+    マジ得単価:
+        マジ得期間の cost / cv
+
+    媒体に該当期間実績がない場合は、その期間の全媒体加重値をフォールバック。
+    """
+    required = {
+        "media", "CPN名", "cv", "cost",
+        "approved_cv", "approval_base_cv",
+    }
+    missing = required - set(history_df.columns)
+    if missing:
+        raise ValueError(
+            "定常・マジ得指標の算出に必要な列がありません: "
+            + ", ".join(sorted(missing))
+        )
+
+    work = history_df[
+        ["media", "CPN名", "cv", "cost", "approved_cv", "approval_base_cv"]
+    ].copy()
+
+    work["media"] = work["media"].astype(str)
+    work["CPN名"] = work["CPN名"].astype(str).str.strip()
+    for col in ["cv", "cost", "approved_cv", "approval_base_cv"]:
+        work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0)
+
+    def build(mask):
+        sub = work[mask].copy()
+
+        if sub.empty:
+            return {}, 0.0, {}, 0.0
+
+        agg = (
+            sub.groupby("media", as_index=False)
+            .agg(
+                cv=("cv", "sum"),
+                cost=("cost", "sum"),
+                approved_cv=("approved_cv", "sum"),
+                approval_base_cv=("approval_base_cv", "sum"),
+            )
+        )
+
+        agg["approval_rate"] = (
+            agg["approved_cv"]
+            / agg["approval_base_cv"].replace(0, pd.NA)
+        ).fillna(0).clip(0, 1)
+
+        agg["unit_price"] = (
+            agg["cost"]
+            / agg["cv"].replace(0, pd.NA)
+        ).fillna(0)
+
+        total_base = sub["approval_base_cv"].sum()
+        overall_rate = (
+            float(sub["approved_cv"].sum() / total_base)
+            if total_base > 0 else 0.0
+        )
+        total_cv = sub["cv"].sum()
+        overall_unit = (
+            float(sub["cost"].sum() / total_cv)
+            if total_cv > 0 else 0.0
+        )
+
+        rate_map = dict(zip(agg["media"], agg["approval_rate"].astype(float)))
+        unit_map = dict(zip(agg["media"], agg["unit_price"].astype(float)))
+        return rate_map, overall_rate, unit_map, overall_unit
+
+    normal_mask = work["CPN名"].isin(["通常", "定常"])
+    magi_mask = work["CPN名"].eq("マジ得")
+
+    normal_rate_map, normal_rate_all, normal_unit_map, normal_unit_all = build(normal_mask)
+    magi_rate_map, magi_rate_all, magi_unit_map, magi_unit_all = build(magi_mask)
+
+    return {
+        "normal_rate": normal_rate_map,
+        "normal_rate_all": normal_rate_all,
+        "normal_unit": normal_unit_map,
+        "normal_unit_all": normal_unit_all,
+        "magi_rate": magi_rate_map,
+        "magi_rate_all": magi_rate_all,
+        "magi_unit": magi_unit_map,
+        "magi_unit_all": magi_unit_all,
+    }
+
+
+def _future_period_name(date_value, future_cpn_map, selected_cpn):
+    """
+    未来日を定常/マジ得に分類する。
+    CPNマスタに当日登録があればそれを優先。
+    未登録の場合はUI選択CPNを使用。
+    """
+    cpn_name = future_cpn_map.get(
+        pd.Timestamp(date_value).normalize(),
+        selected_cpn,
+    )
+    cpn_name = str(cpn_name).strip()
+    return "マジ得" if cpn_name == "マジ得" else "定常"
+
+
+def create_submission_excel(opt_summary, history_df, cpn_master, start_date, end_date, selected_cpn, opt_mode):
     """
     添付された提出用Excelそのものをテンプレートとして使い、
     最適プランの結果だけを全7シートへ反映する。
@@ -314,9 +425,15 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
         .replace([float("inf"), float("-inf")], 0)
         .fillna(0)
     )
-    media_list = list(dict.fromkeys(daily["media"].tolist()))
 
-    # 高速テンプレートは150媒体分の空枠を事前確保している。
+    # 媒体は予測件数の多い順。
+    media_totals = (
+        daily.groupby("media", as_index=False)
+        .agg(total_cv=("cv", "sum"), total_cost=("cost", "sum"))
+        .sort_values(["total_cv", "total_cost", "media"], ascending=[False, False, True])
+    )
+    media_list = media_totals["media"].astype(str).tolist()
+
     MAX_TEMPLATE_MEDIA = 150
     if len(media_list) > MAX_TEMPLATE_MEDIA:
         raise ValueError(
@@ -324,34 +441,90 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
             f"現在は{len(media_list)}媒体です。"
         )
 
-    cv_map = {(r.date, r.media): float(r.cv) for r in daily.itertuples()}
-    cost_map = {(r.date, r.media): float(r.cost) for r in daily.itertuples()}
-    cpa_map = {(r.date, r.media): float(r.cpa) for r in daily.itertuples()}
+    cv_map = {(r.date, str(r.media)): float(r.cv) for r in daily.itertuples()}
+    raw_cost_map = {(r.date, str(r.media)): float(r.cost) for r in daily.itertuples()}
+    cpa_map = {(r.date, str(r.media)): float(r.cpa) for r in daily.itertuples()}
+
     total_cv_by_date = daily.groupby("date")["cv"].sum().to_dict()
-    total_cost_by_date = daily.groupby("date")["cost"].sum().to_dict()
 
-    # ---------------------------------------------------------
-    # 過去実績から媒体別承認率を算出
-    # 発行数 = Forecast × 承認率
-    # ---------------------------------------------------------
-    approval_rate_map = _calculate_media_approval_rates(history_df)
-    overall_approval_fallback = approval_rate_map["__overall__"]
+    # 媒体別の最適プラン単価① = 最適プラン合計cost / 合計CV
+    opt_unit_map = {}
+    for r in media_totals.itertuples():
+        opt_unit_map[str(r.media)] = (
+            float(r.total_cost / r.total_cv)
+            if r.total_cv else 0.0
+        )
 
+    # 過去実績から定常・マジ得別の承認率 / マジ得単価を算出。
+    period_metrics = _calculate_period_media_metrics(history_df)
+
+    normal_rate_map = period_metrics["normal_rate"]
+    magi_rate_map = period_metrics["magi_rate"]
+    normal_rate_all = period_metrics["normal_rate_all"]
+    magi_rate_all = period_metrics["magi_rate_all"]
+    magi_unit_map = period_metrics["magi_unit"]
+    magi_unit_all = period_metrics["magi_unit_all"]
+
+    # 未来日ごとのCPN区分。
+    future_cpn_map = {}
+    if cpn_master is not None and not cpn_master.empty:
+        fm = cpn_master[["日付", "CPN名"]].copy()
+        fm["日付"] = pd.to_datetime(fm["日付"], errors="coerce").dt.normalize()
+        fm = fm.dropna(subset=["日付"])
+        future_cpn_map = dict(zip(fm["日付"], fm["CPN名"]))
+
+    # 全日次指標を一本化。
     issue_map = {}
+    expected_cost_map = {}
+    period_unit_map = {}
     total_issue_by_date = {}
+    total_cost_by_date = {}
+
+    normal_forecast_by_media = {m: 0.0 for m in media_list}
+    magi_forecast_by_media = {m: 0.0 for m in media_list}
 
     for row in daily.itertuples():
-        rate = approval_rate_map.get(
-            str(row.media),
-            overall_approval_fallback,
-        )
-        issue = float(row.cv) * rate
+        dt = pd.Timestamp(row.date).normalize()
+        media = str(row.media)
+        cv = float(row.cv)
 
-        issue_map[(row.date, str(row.media))] = issue
-        total_issue_by_date[row.date] = (
-            total_issue_by_date.get(row.date, 0.0)
-            + issue
-        )
+        normal_rate = normal_rate_map.get(media, normal_rate_all)
+        magi_rate = magi_rate_map.get(media, magi_rate_all)
+
+        opt_unit = opt_unit_map.get(media, 0.0)
+        magi_unit = magi_unit_map.get(media, magi_unit_all)
+        if magi_unit <= 0:
+            magi_unit = opt_unit
+
+        period = _future_period_name(dt, future_cpn_map, selected_cpn)
+
+        if period == "マジ得":
+            rate = magi_rate
+            unit_price = magi_unit
+            magi_forecast_by_media[media] += cv
+        else:
+            rate = normal_rate
+            unit_price = opt_unit
+            normal_forecast_by_media[media] += cv
+
+        issue = cv * rate
+        expected_cost = issue * unit_price
+
+        issue_map[(dt, media)] = issue
+        expected_cost_map[(dt, media)] = expected_cost
+        period_unit_map[(dt, media)] = unit_price
+
+        total_issue_by_date[dt] = total_issue_by_date.get(dt, 0.0) + issue
+        total_cost_by_date[dt] = total_cost_by_date.get(dt, 0.0) + expected_cost
+
+    normal_issue_by_media = {
+        m: normal_forecast_by_media[m] * normal_rate_map.get(m, normal_rate_all)
+        for m in media_list
+    }
+    magi_issue_by_media = {
+        m: magi_forecast_by_media[m] * magi_rate_map.get(m, magi_rate_all)
+        for m in media_list
+    }
 
     # SIDは実績CSVのF列を正とする。
     sid_map = {}
@@ -368,6 +541,11 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
 
     template = _template_path()
     wb_out = load_workbook(template)
+
+    # 今回は短縮承認系2シートを成果物から除外。
+    for remove_name in ["短縮承認除外", "短縮承認日程"]:
+        if remove_name in wb_out.sheetnames:
+            del wb_out[remove_name]
 
     # 高速テンプレートは数式依存を最小化しているため、
     # 保存時の強制フル再計算指定は行わない。
@@ -492,7 +670,7 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
             sum(cv_map.get((d.normalize(), media), 0) for d in dates)
         )
         total_cost = round(
-            sum(cost_map.get((d.normalize(), media), 0) for d in dates)
+            sum(expected_cost_map.get((d.normalize(), media), 0) for d in dates)
         )
         overall_cpa = round(total_cost / total_cv) if total_cv else 0
 
@@ -503,12 +681,14 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
         _set_value(main_ws, r0, 7, total_cv)
         _set_value(main_ws, r0, 8, 0)
         _set_value(main_ws, r0, 10, 0)
-        approval_rate = approval_rate_map.get(
-            media,
-            overall_approval_fallback,
+        normal_rate = normal_rate_map.get(media, normal_rate_all)
+        selected_rate = (
+            magi_rate_map.get(media, magi_rate_all)
+            if selected_cpn == "マジ得"
+            else normal_rate
         )
-        _set_percent(main_ws, r0, 11, approval_rate)
-        _set_percent(main_ws, r0, 12, approval_rate)
+        _set_percent(main_ws, r0, 11, normal_rate)
+        _set_percent(main_ws, r0, 12, selected_rate)
         _set_value(main_ws, r0, 17, total_cost)
         _set_value(main_ws, r0, 19, media_type)
 
@@ -526,11 +706,11 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
             if i < len(dates):
                 dt = dates[i].normalize()
                 cv = round(cv_map.get((dt, media), 0))
-                cpa = round(cpa_map.get((dt, media), 0)) if cv else 0
+                unit_price = round(period_unit_map.get((dt, media), 0))
 
                 _set_value(main_ws, r0, col, cv)
                 _set_value(main_ws, r0 + 1, col, None)
-                _set_value(main_ws, r0 + 2, col, cpa)
+                _set_value(main_ws, r0 + 2, col, unit_price)
                 _set_value(main_ws, r0 + 3, col, -cv)
             else:
                 for off in range(4):
@@ -542,209 +722,154 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
         _set_value(main_ws, r0 + 3, total_col, -total_cv)
 
     # =========================================================
-    # 2) 件数(合算）
+    # 2) 件数 / 3) 発行 / 4) コスト計算
+    # 3シートとも同じ列構造:
+    # A SID / B 媒体名 / C 単価①最適 / D 単価②マジ得 /
+    # E 定常承認率 / F 定常発行数 /
+    # G マジ得承認率 / H マジ得発行数 /
+    # I:AO 日次 / AP Total
     # =========================================================
-    count_ws = wb_out["件数(合算）"]
-    count_first_date_col = 16  # P
-    count_total_col = 49       # AW
+    metric_specs = [
+        ("件数(合算）", "count"),
+        ("発行(合算）", "issue"),
+        ("コスト計算用(合算）", "cost"),
+    ]
 
-    _set_date_slots(
-        count_ws,
-        7,
-        count_first_date_col,
-        date_slots,
-        dates,
-        count_total_col,
-    )
+    metric_first_date_col = 9   # I
+    metric_total_col = 42       # AP
+    metric_header_row = 3
+    metric_data_start = 4
 
-    for idx, media in enumerate(media_list):
-        r = 8 + idx
+    for sheet_name, metric_kind in metric_specs:
+        ws = wb_out[sheet_name]
 
-        sid = sid_map.get(media, "")
-        _set_value(count_ws, r, 1, sid)
-        _set_value(count_ws, r, 2, media)
-        approval_rate = approval_rate_map.get(
-            media,
-            overall_approval_fallback,
+        _set_date_slots(
+            ws,
+            metric_header_row,
+            metric_first_date_col,
+            date_slots,
+            dates,
+            metric_total_col,
         )
-        _set_percent(count_ws, r, 11, approval_rate)
-        _set_percent(count_ws, r, 13, approval_rate)
 
-        total_cv = 0
-        for i in range(date_slots):
-            c = count_first_date_col + i
-            if i < len(dates):
-                val = round(cv_map.get((dates[i].normalize(), media), 0))
-                _set_value(count_ws, r, c, val)
-                total_cv += val
-            else:
-                _set_value(count_ws, r, c, None)
+        # 固定列ヘッダーを毎回明示。
+        headers = [
+            "SID",
+            "媒体名",
+            "単価①\n最適プラン",
+            "単価②\nマジ得",
+            "定常承認率",
+            "定常発行数",
+            "マジ得承認率",
+            "マジ得発行数",
+        ]
+        for c, header in enumerate(headers, start=1):
+            _set_value(ws, metric_header_row, c, header)
 
-        _set_value(count_ws, r, count_total_col, total_cv)
+        for idx, media in enumerate(media_list):
+            r = metric_data_start + idx
 
-    # =========================================================
-    # 3) 発行(合算） : Forecast × 過去実績承認率
-    # =========================================================
-    issue_ws = wb_out["発行(合算）"]
-    issue_first_date_col = 15  # O
-    issue_total_col = 48       # AV
+            normal_rate = normal_rate_map.get(media, normal_rate_all)
+            magi_rate = magi_rate_map.get(media, magi_rate_all)
 
-    _set_date_slots(
-        issue_ws,
-        5,
-        issue_first_date_col,
-        date_slots,
-        dates,
-        issue_total_col,
-    )
+            opt_unit = opt_unit_map.get(media, 0.0)
+            magi_unit = magi_unit_map.get(media, magi_unit_all)
+            if magi_unit <= 0:
+                magi_unit = opt_unit
 
-    for idx, media in enumerate(media_list):
-        r = 6 + idx
+            _set_value(ws, r, 1, sid_map.get(media, ""))
+            _set_value(ws, r, 2, media)
+            _set_value(ws, r, 3, round(opt_unit))
+            _set_value(ws, r, 4, round(magi_unit))
+            _set_percent(ws, r, 5, normal_rate)
+            _set_value(ws, r, 6, round(normal_issue_by_media.get(media, 0)))
+            _set_percent(ws, r, 7, magi_rate)
+            _set_value(ws, r, 8, round(magi_issue_by_media.get(media, 0)))
 
-        _set_value(issue_ws, r, 1, sid_map.get(media, ""))
-        _set_value(issue_ws, r, 2, media)
-        approval_rate = approval_rate_map.get(
-            media,
-            overall_approval_fallback,
-        )
-        _set_percent(issue_ws, r, 3, approval_rate)
-        _set_percent(issue_ws, r, 4, approval_rate)
+            row_total = 0.0
 
-        total_issue = 0
-        for i in range(date_slots):
-            c = issue_first_date_col + i
-            if i < len(dates):
+            for i in range(date_slots):
+                c = metric_first_date_col + i
+
+                if i >= len(dates):
+                    _set_value(ws, r, c, None)
+                    continue
+
                 dt = dates[i].normalize()
-                val = round(
-                    issue_map.get((dt, media), 0)
-                )
-                _set_value(issue_ws, r, c, val)
-                total_issue += val
-            else:
-                _set_value(issue_ws, r, c, None)
 
-        _set_value(issue_ws, r, issue_total_col, total_issue)
+                if metric_kind == "count":
+                    value = cv_map.get((dt, media), 0)
+                elif metric_kind == "issue":
+                    value = issue_map.get((dt, media), 0)
+                else:
+                    value = expected_cost_map.get((dt, media), 0)
+
+                value = round(value)
+                _set_value(ws, r, c, value)
+                row_total += value
+
+            _set_value(ws, r, metric_total_col, round(row_total))
 
     # =========================================================
-    # 4) コスト計算用(合算） : 最適プランcostを直接反映
+    # 5) 全体サマリ
     # =========================================================
-    cost_ws = wb_out["コスト計算用(合算）"]
-    cost_first_date_col = 15  # O
-    cost_total_col = 48       # AV
-
-    _set_date_slots(
-        cost_ws,
-        6,
-        cost_first_date_col,
-        date_slots,
-        dates,
-        cost_total_col,
+    sws = wb_out["全体サマリ（定常期間サマリ）"]
+    _set_value(
+        sws,
+        1,
+        1,
+        f"{pd.Timestamp(start_date).month}月度サマリ 件数・発行・コスト",
     )
 
-    for idx, media in enumerate(media_list):
-        r = 7 + idx
+    sum_forecast = 0
+    sum_issue = 0
+    sum_cost = 0
 
-        _set_value(cost_ws, r, 1, sid_map.get(media, ""))
-        _set_value(cost_ws, r, 2, media)
-        approval_rate = approval_rate_map.get(
-            media,
-            overall_approval_fallback,
-        )
-        _set_percent(cost_ws, r, 11, approval_rate)
-        _set_percent(cost_ws, r, 12, approval_rate)
-        _set_percent(cost_ws, r, 13, approval_rate)
-        _set_percent(cost_ws, r, 14, approval_rate)
+    for i in range(33):
+        r = 3 + i
 
-        total_cost = 0
-        for i in range(date_slots):
-            c = cost_first_date_col + i
-            if i < len(dates):
-                val = round(cost_map.get((dates[i].normalize(), media), 0))
-                _set_value(cost_ws, r, c, val)
-                total_cost += val
-            else:
-                _set_value(cost_ws, r, c, None)
+        if i < len(dates):
+            dt = dates[i].normalize()
+            forecast = round(total_cv_by_date.get(dt, 0))
+            issue = round(total_issue_by_date.get(dt, 0))
+            cost = round(total_cost_by_date.get(dt, 0))
 
-        _set_value(cost_ws, r, cost_total_col, total_cost)
+            approval_rate = issue / forecast if forecast else 0
+            issue_cpa = round(cost / issue) if issue else 0
 
-    # =========================================================
-    # 5) 全体サマリ / 6) 短縮承認除外
-    # =========================================================
-    for summary_name in ["全体サマリ（定常期間サマリ）", "短縮承認除外"]:
-        sws = wb_out[summary_name]
-        _set_value(
-            sws,
-            1,
-            2,
-            f"{pd.Timestamp(start_date).month}月度サマリ 件数コスト",
-        )
+            _set_value(sws, r, 1, dates[i].to_pydatetime())
+            if not isinstance(sws.cell(r, 1), MergedCell):
+                sws.cell(r, 1).number_format = "m/d"
 
-        # 日次33行をテンプレの3行目から使用
-        for i in range(33):
-            r = 3 + i
+            # A日付 B目標 CForecast DGAP E発行 F発行GAP G承認率 H発行コスト I発行CPA
+            _set_value(sws, r, 2, forecast)
+            _set_value(sws, r, 3, forecast)
+            _set_value(sws, r, 4, 0)
+            _set_value(sws, r, 5, issue)
+            _set_value(sws, r, 6, 0)
+            _set_percent(sws, r, 7, approval_rate)
+            _set_value(sws, r, 8, cost)
+            _set_value(sws, r, 9, issue_cpa)
 
-            if i < len(dates):
-                dt = dates[i].normalize()
-                forecast = round(total_cv_by_date.get(dt, 0))
-                issue = round(total_issue_by_date.get(dt, 0))
-                cost = round(total_cost_by_date.get(dt, 0))
+            sum_forecast += forecast
+            sum_issue += issue
+            sum_cost += cost
+        else:
+            for c in range(1, 10):
+                _set_value(sws, r, c, None)
 
-                approval_rate = (
-                    issue / forecast
-                    if forecast
-                    else 0
-                )
-                issue_cpa = (
-                    round(cost / issue)
-                    if issue
-                    else 0
-                )
+    total_rate = sum_issue / sum_forecast if sum_forecast else 0
+    total_cpa = round(sum_cost / sum_issue) if sum_issue else 0
 
-                _set_value(sws, r, 1, dates[i].to_pydatetime())
-                if not isinstance(sws.cell(r, 1), MergedCell):
-                    sws.cell(r, 1).number_format = "m/d"
-
-                # B=目標 / C=Forecast / E=発行 / G=承認率 / H=発行コスト / I=発行CPA
-                _set_value(sws, r, 2, forecast)
-                _set_value(sws, r, 3, forecast)
-                _set_value(sws, r, 5, issue)
-                _set_percent(sws, r, 7, approval_rate)
-                _set_value(sws, r, 8, cost)
-                _set_value(sws, r, 9, issue_cpa)
-            else:
-                for c in range(1, 10):
-                    _set_value(sws, r, c, None)
-
-    # =========================================================
-    # 7) 短縮承認日程
-    # =========================================================
-    sched_ws = wb_out["短縮承認日程"]
-    start_ts = pd.Timestamp(start_date)
-    sched_start = (
-        (start_ts - pd.DateOffset(months=1))
-        .replace(day=1)
-        .normalize()
-    )
-    sched_dates = pd.date_range(sched_start, periods=64, freq="D")
-
-    for i, dt in enumerate(sched_dates, start=2):
-        _set_value(sched_ws, i, 1, dt.to_pydatetime())
-        if not isinstance(sched_ws.cell(i, 1), MergedCell):
-            sched_ws.cell(i, 1).number_format = "m/d"
-
-        _set_value(sched_ws, i, 2, "月火水木金土日"[dt.weekday()])
-
-        _set_value(sched_ws, i, 7, dt.to_pydatetime())
-        if not isinstance(sched_ws.cell(i, 7), MergedCell):
-            sched_ws.cell(i, 7).number_format = "m/d"
-
-        _set_value(sched_ws, i, 8, "月火水木金土日"[dt.weekday()])
-
-        for c in range(3, 7):
-            _set_value(sched_ws, i, c, None)
-
-        for c in range(9, 13):
-            _set_value(sched_ws, i, c, None)
+    _set_value(sws, 36, 1, "Total")
+    _set_value(sws, 36, 2, sum_forecast)
+    _set_value(sws, 36, 3, sum_forecast)
+    _set_value(sws, 36, 4, 0)
+    _set_value(sws, 36, 5, sum_issue)
+    _set_value(sws, 36, 6, 0)
+    _set_percent(sws, 36, 7, total_rate)
+    _set_value(sws, 36, 8, sum_cost)
+    _set_value(sws, 36, 9, total_cpa)
 
     output = BytesIO()
     wb_out.save(output)
@@ -758,6 +883,7 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
 def _submission_download_body(
     opt_summary,
     history_df,
+    cpn_master,
     start_date,
     end_date,
     selected_cpn,
@@ -773,6 +899,7 @@ def _submission_download_body(
         return create_submission_excel(
             opt_summary=opt_summary,
             history_df=history_df,
+            cpn_master=cpn_master,
             start_date=start_date,
             end_date=end_date,
             selected_cpn=selected_cpn,
@@ -961,32 +1088,44 @@ if uploaded_file and uploaded_master:
         history_df["media"].isin(selected_media)
     ].copy()
 
-    # 承認率はExcel出力だけでなく画面上でも確認できるようにする。
+    # 定常 / マジ得の承認率を画面でも確認。
     try:
-        _approval_map_preview = _calculate_media_approval_rates(history_df)
-        _overall_approval = _approval_map_preview.pop("__overall__")
-
+        _period_preview = _calculate_period_media_metrics(history_df)
         approval_preview = pd.DataFrame(
             [
                 {
                     "媒体": media,
-                    "過去実績承認率": _approval_map_preview.get(
+                    "定常承認率": _period_preview["normal_rate"].get(
                         media,
-                        _overall_approval,
+                        _period_preview["normal_rate_all"],
+                    ),
+                    "マジ得承認率": _period_preview["magi_rate"].get(
+                        media,
+                        _period_preview["magi_rate_all"],
+                    ),
+                    "マジ得単価": _period_preview["magi_unit"].get(
+                        media,
+                        _period_preview["magi_unit_all"],
                     ),
                 }
                 for media in selected_media
             ]
         )
-        approval_preview["過去実績承認率"] = (
-            approval_preview["過去実績承認率"]
-            .map(lambda x: f"{x:.1%}")
+
+        approval_preview["定常承認率"] = approval_preview["定常承認率"].map(
+            lambda x: f"{x:.1%}"
+        )
+        approval_preview["マジ得承認率"] = approval_preview["マジ得承認率"].map(
+            lambda x: f"{x:.1%}"
+        )
+        approval_preview["マジ得単価"] = approval_preview["マジ得単価"].map(
+            lambda x: f"¥{x:,.0f}"
         )
 
-        with st.expander("✅ 過去実績から算出した承認率"):
+        with st.expander("✅ 定常・マジ得の過去実績指標"):
             st.caption(
-                f"全体加重承認率: {_overall_approval:.1%} / "
-                "媒体別は『成果承認フラグ=Yの件数 ÷ 全件数』で算出"
+                "承認率 = 成果承認フラグYの件数 ÷ 全件数 / "
+                "マジ得単価 = マジ得期間cost ÷ CV"
             )
             st.dataframe(
                 approval_preview,
@@ -996,7 +1135,7 @@ if uploaded_file and uploaded_master:
 
     except ValueError as approval_exc:
         st.warning(
-            "承認率はまだ算出できません。"
+            "定常・マジ得指標を算出できません。"
             f"{approval_exc}"
         )
 
@@ -1540,6 +1679,7 @@ if uploaded_file and uploaded_master:
     render_submission_download(
         opt_summary=opt_summary,
         history_df=history_df,
+        cpn_master=cpn_master,
         start_date=start_date,
         end_date=end_date,
         selected_cpn=selected_cpn,
