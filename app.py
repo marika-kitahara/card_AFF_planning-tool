@@ -204,6 +204,103 @@ def _set_value(ws, row, col, value):
     cell.value = value
 
 
+
+def _calculate_media_approval_rates(history_df: pd.DataFrame) -> dict:
+    """
+    過去実績から媒体別の承認率を算出する。
+
+    承認率 = 承認件数合計 / 承認判定対象の発生件数合計
+
+    媒体に承認実績がない場合は全媒体の加重承認率をフォールバックに使う。
+    全体でも承認実績がない場合はエラーにする。
+    """
+    required = {"media", "approved_cv", "approval_base_cv"}
+    missing = required - set(history_df.columns)
+
+    if missing:
+        raise ValueError(
+            "承認率算出用データがありません。"
+            "data/loader.py を承認率対応版へ更新してください。"
+        )
+
+    work = history_df[
+        ["media", "approved_cv", "approval_base_cv"]
+    ].copy()
+
+    work["approved_cv"] = pd.to_numeric(
+        work["approved_cv"],
+        errors="coerce",
+    )
+    work["approval_base_cv"] = pd.to_numeric(
+        work["approval_base_cv"],
+        errors="coerce",
+    )
+
+    valid = work[
+        work["approval_base_cv"].notna()
+        & (work["approval_base_cv"] > 0)
+    ].copy()
+
+    if valid.empty:
+        source_col = ""
+        if "approval_source_column" in history_df.columns:
+            sources = (
+                history_df["approval_source_column"]
+                .dropna()
+                .astype(str)
+                .str.strip()
+            )
+            sources = sources[sources != ""]
+            if not sources.empty:
+                source_col = sources.iloc[0]
+
+        if source_col:
+            raise ValueError(
+                f"承認列『{source_col}』は見つかりましたが、"
+                "Y/N・1/0・承認/否認として判定できる実績がありません。"
+            )
+
+        raise ValueError(
+            "実績CSVから承認判定列を見つけられませんでした。"
+            "『承認フラグ』『承認状況』『承認ステータス』『承認』"
+            "などの列を確認してください。"
+        )
+
+    total_base = valid["approval_base_cv"].sum()
+    total_approved = valid["approved_cv"].fillna(0).sum()
+
+    overall_rate = (
+        float(total_approved / total_base)
+        if total_base > 0
+        else 0.0
+    )
+    overall_rate = min(max(overall_rate, 0.0), 1.0)
+
+    media_rates = (
+        valid.groupby("media", as_index=False)
+        .agg(
+            approved_cv=("approved_cv", "sum"),
+            approval_base_cv=("approval_base_cv", "sum"),
+        )
+    )
+
+    media_rates["approval_rate"] = (
+        media_rates["approved_cv"]
+        / media_rates["approval_base_cv"]
+    ).clip(0, 1)
+
+    rate_map = dict(
+        zip(
+            media_rates["media"].astype(str),
+            media_rates["approval_rate"].astype(float),
+        )
+    )
+
+    # どの媒体でも必ず率が取れるよう全体率を保持
+    rate_map["__overall__"] = overall_rate
+    return rate_map
+
+
 def create_submission_excel(opt_summary, history_df, start_date, end_date, selected_cpn, opt_mode):
     """
     添付された提出用Excelそのものをテンプレートとして使い、
@@ -212,7 +309,8 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
     - SID: 実績データF列を loader.py で保持した history_df["SID"]
     - 件数: 最適プランCV
     - コスト: 最適プランcost
-    - 発行: 現行アプリが承認状況を加味しないため、最適プランCVをそのまま表示
+    - 承認率: 過去実績から媒体別に算出
+    - 発行: 最適プランForecast × 媒体別承認率
     - Actual: 提出時点では未入力
 
     ※テンプレ内の既存媒体名や数値は、出力時に対象範囲をクリアしてから
@@ -246,6 +344,29 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
     cpa_map = {(r.date, r.media): float(r.cpa) for r in daily.itertuples()}
     total_cv_by_date = daily.groupby("date")["cv"].sum().to_dict()
     total_cost_by_date = daily.groupby("date")["cost"].sum().to_dict()
+
+    # ---------------------------------------------------------
+    # 過去実績から媒体別承認率を算出
+    # 発行数 = Forecast × 承認率
+    # ---------------------------------------------------------
+    approval_rate_map = _calculate_media_approval_rates(history_df)
+    overall_approval_fallback = approval_rate_map["__overall__"]
+
+    issue_map = {}
+    total_issue_by_date = {}
+
+    for row in daily.itertuples():
+        rate = approval_rate_map.get(
+            str(row.media),
+            overall_approval_fallback,
+        )
+        issue = float(row.cv) * rate
+
+        issue_map[(row.date, str(row.media))] = issue
+        total_issue_by_date[row.date] = (
+            total_issue_by_date.get(row.date, 0.0)
+            + issue
+        )
 
     # SIDは実績CSVのF列を正とする。
     sid_map = {}
@@ -447,8 +568,12 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
         _set_value(main_ws, r0, 7, total_cv)
         _set_value(main_ws, r0, 8, 0)
         _set_value(main_ws, r0, 10, 0)
-        _set_value(main_ws, r0, 11, 1)
-        _set_value(main_ws, r0, 12, 1)
+        approval_rate = approval_rate_map.get(
+            media,
+            overall_approval_fallback,
+        )
+        _set_value(main_ws, r0, 11, approval_rate)
+        _set_value(main_ws, r0, 12, approval_rate)
         _set_value(main_ws, r0, 17, total_cost)
         _set_value(main_ws, r0, 19, media_type)
 
@@ -511,8 +636,12 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
         sid = sid_map.get(media, "")
         _set_value(count_ws, r, 1, sid)
         _set_value(count_ws, r, 2, media)
-        _set_value(count_ws, r, 11, 1)
-        _set_value(count_ws, r, 13, 1)
+        approval_rate = approval_rate_map.get(
+            media,
+            overall_approval_fallback,
+        )
+        _set_value(count_ws, r, 11, approval_rate)
+        _set_value(count_ws, r, 13, approval_rate)
 
         total_cv = 0
         for i in range(date_slots):
@@ -527,7 +656,7 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
         _set_value(count_ws, r, count_total_col, total_cv)
 
     # =========================================================
-    # 3) 発行(合算） : 現行アプリは承認加味なしのためCVをそのまま表示
+    # 3) 発行(合算） : Forecast × 過去実績承認率
     # =========================================================
     issue_ws = wb_out["発行(合算）"]
     issue_first_date_col = 15  # O
@@ -555,20 +684,27 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
 
         _set_value(issue_ws, r, 1, sid_map.get(media, ""))
         _set_value(issue_ws, r, 2, media)
-        _set_value(issue_ws, r, 3, 1)
-        _set_value(issue_ws, r, 4, 1)
+        approval_rate = approval_rate_map.get(
+            media,
+            overall_approval_fallback,
+        )
+        _set_value(issue_ws, r, 3, approval_rate)
+        _set_value(issue_ws, r, 4, approval_rate)
 
-        total_cv = 0
+        total_issue = 0
         for i in range(date_slots):
             c = issue_first_date_col + i
             if i < len(dates):
-                val = round(cv_map.get((dates[i].normalize(), media), 0))
+                dt = dates[i].normalize()
+                val = round(
+                    issue_map.get((dt, media), 0)
+                )
                 _set_value(issue_ws, r, c, val)
-                total_cv += val
+                total_issue += val
             else:
                 _set_value(issue_ws, r, c, None)
 
-        _set_value(issue_ws, r, issue_total_col, total_cv)
+        _set_value(issue_ws, r, issue_total_col, total_issue)
 
     # =========================================================
     # 4) コスト計算用(合算） : 最適プランcostを直接反映
@@ -599,10 +735,14 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
 
         _set_value(cost_ws, r, 1, sid_map.get(media, ""))
         _set_value(cost_ws, r, 2, media)
-        _set_value(cost_ws, r, 11, 1)
-        _set_value(cost_ws, r, 12, 1)
-        _set_value(cost_ws, r, 13, 1)
-        _set_value(cost_ws, r, 14, 1)
+        approval_rate = approval_rate_map.get(
+            media,
+            overall_approval_fallback,
+        )
+        _set_value(cost_ws, r, 11, approval_rate)
+        _set_value(cost_ws, r, 12, approval_rate)
+        _set_value(cost_ws, r, 13, approval_rate)
+        _set_value(cost_ws, r, 14, approval_rate)
 
         total_cost = 0
         for i in range(date_slots):
@@ -634,20 +774,32 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
 
             if i < len(dates):
                 dt = dates[i].normalize()
-                cv = round(total_cv_by_date.get(dt, 0))
+                forecast = round(total_cv_by_date.get(dt, 0))
+                issue = round(total_issue_by_date.get(dt, 0))
                 cost = round(total_cost_by_date.get(dt, 0))
-                cpa = round(cost / cv) if cv else 0
+
+                approval_rate = (
+                    issue / forecast
+                    if forecast
+                    else 0
+                )
+                issue_cpa = (
+                    round(cost / issue)
+                    if issue
+                    else 0
+                )
 
                 _set_value(sws, r, 1, dates[i].to_pydatetime())
                 if not isinstance(sws.cell(r, 1), MergedCell):
                     sws.cell(r, 1).number_format = "m/d"
 
-                _set_value(sws, r, 2, cv)
-                _set_value(sws, r, 3, cv)
-                _set_value(sws, r, 5, cv)
-                _set_value(sws, r, 7, 1 if cv else 0)
+                # B=目標 / C=Forecast / E=発行 / G=承認率 / H=発行コスト / I=発行CPA
+                _set_value(sws, r, 2, forecast)
+                _set_value(sws, r, 3, forecast)
+                _set_value(sws, r, 5, issue)
+                _set_value(sws, r, 7, approval_rate)
                 _set_value(sws, r, 8, cost)
-                _set_value(sws, r, 9, cpa)
+                _set_value(sws, r, 9, issue_cpa)
             else:
                 for c in range(1, 10):
                     _set_value(sws, r, c, None)
@@ -897,6 +1049,45 @@ if uploaded_file and uploaded_master:
     history_df = history_df[
         history_df["media"].isin(selected_media)
     ].copy()
+
+    # 承認率はExcel出力だけでなく画面上でも確認できるようにする。
+    try:
+        _approval_map_preview = _calculate_media_approval_rates(history_df)
+        _overall_approval = _approval_map_preview.pop("__overall__")
+
+        approval_preview = pd.DataFrame(
+            [
+                {
+                    "媒体": media,
+                    "過去実績承認率": _approval_map_preview.get(
+                        media,
+                        _overall_approval,
+                    ),
+                }
+                for media in selected_media
+            ]
+        )
+        approval_preview["過去実績承認率"] = (
+            approval_preview["過去実績承認率"]
+            .map(lambda x: f"{x:.1%}")
+        )
+
+        with st.expander("✅ 過去実績から算出した承認率"):
+            st.caption(
+                f"全体加重承認率: {_overall_approval:.1%} / "
+                "媒体別は承認件数 ÷ 承認判定対象の発生件数で算出"
+            )
+            st.dataframe(
+                approval_preview,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    except ValueError as approval_exc:
+        st.warning(
+            "承認率はまだ算出できません。"
+            f"{approval_exc}"
+        )
 
     st.sidebar.header("📊 CPN選択")
 
