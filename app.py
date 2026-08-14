@@ -391,12 +391,17 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
     # 既存値だけ消し、列幅・罫線等のテンプレ設定は保持。
     _clear_values(main_ws, detail_start, detail_end, 1, total_col)
 
+    # 必要な明細行を最初にまとめて確保する。
+    # insert_rows() を媒体ごとに繰り返すと、openpyxl が既存セルを毎回移動するため非常に重くなる。
+    required_main_end = detail_start + max(len(media_list) - 1, 0) * 4 + 3
+    if media_list and required_main_end > main_ws.max_row:
+        main_ws.insert_rows(
+            main_ws.max_row + 1,
+            amount=required_main_end - main_ws.max_row,
+        )
+
     for idx, media in enumerate(media_list, start=0):
         r0 = detail_start + idx * 4
-
-        # 必要行数を確保
-        while r0 + 3 > main_ws.max_row:
-            main_ws.insert_rows(main_ws.max_row + 1)
 
         # 4行すべてにテンプレの同じ行パターンを適用
         for off in range(4):
@@ -482,10 +487,15 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
     )
     _clear_values(count_ws, 8, count_ws.max_row, 1, count_total_col)
 
+    required_count_end = 8 + max(len(media_list) - 1, 0)
+    if media_list and required_count_end > count_ws.max_row:
+        count_ws.insert_rows(
+            count_ws.max_row + 1,
+            amount=required_count_end - count_ws.max_row,
+        )
+
     for idx, media in enumerate(media_list):
         r = 8 + idx
-        while r > count_ws.max_row:
-            count_ws.insert_rows(count_ws.max_row + 1)
 
         sid = sid_map.get(media, "")
         _set_value(count_ws, r, 1, sid)
@@ -522,10 +532,15 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
     )
     _clear_values(issue_ws, 6, issue_ws.max_row, 1, issue_total_col)
 
+    required_issue_end = 6 + max(len(media_list) - 1, 0)
+    if media_list and required_issue_end > issue_ws.max_row:
+        issue_ws.insert_rows(
+            issue_ws.max_row + 1,
+            amount=required_issue_end - issue_ws.max_row,
+        )
+
     for idx, media in enumerate(media_list):
         r = 6 + idx
-        while r > issue_ws.max_row:
-            issue_ws.insert_rows(issue_ws.max_row + 1)
 
         _set_value(issue_ws, r, 1, sid_map.get(media, ""))
         _set_value(issue_ws, r, 2, media)
@@ -561,10 +576,15 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
     )
     _clear_values(cost_ws, 7, cost_ws.max_row, 1, cost_total_col)
 
+    required_cost_end = 7 + max(len(media_list) - 1, 0)
+    if media_list and required_cost_end > cost_ws.max_row:
+        cost_ws.insert_rows(
+            cost_ws.max_row + 1,
+            amount=required_cost_end - cost_ws.max_row,
+        )
+
     for idx, media in enumerate(media_list):
         r = 7 + idx
-        while r > cost_ws.max_row:
-            cost_ws.insert_rows(cost_ws.max_row + 1)
 
         _set_value(cost_ws, r, 1, sid_map.get(media, ""))
         _set_value(cost_ws, r, 2, media)
