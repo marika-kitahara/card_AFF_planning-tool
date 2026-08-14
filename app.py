@@ -690,6 +690,58 @@ def create_submission_excel(opt_summary, history_df, start_date, end_date, selec
 
 
 # -----------------------
+# ✅ 提出用Excelダウンロード専用Fragment
+# -----------------------
+def _submission_download_body(
+    opt_summary,
+    history_df,
+    start_date,
+    end_date,
+    selected_cpn,
+    opt_mode,
+    submission_filename,
+):
+    """
+    提出用Excelはクリックされた時だけ生成する。
+    data に callable を渡すため、画面描画時にはExcelを作らない。
+    """
+
+    def build_submission_excel():
+        return create_submission_excel(
+            opt_summary=opt_summary,
+            history_df=history_df,
+            start_date=start_date,
+            end_date=end_date,
+            selected_cpn=selected_cpn,
+            opt_mode=opt_mode,
+        )
+
+    st.download_button(
+        "📥 提出用Excelを生成してDL",
+        data=build_submission_excel,
+        file_name=submission_filename,
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        on_click="ignore",
+        type="primary",
+        use_container_width=True,
+    )
+
+
+# st.fragment が使えるStreamlitでは、
+# このボタン操作だけを独立再実行する。
+if hasattr(st, "fragment"):
+    render_submission_download = st.fragment(
+        _submission_download_body
+    )
+else:
+    # 古いStreamlitでも起動自体は可能。
+    render_submission_download = _submission_download_body
+
+
+# -----------------------
 # ✅ 補助関数
 # -----------------------
 def _truthy(series: pd.Series) -> pd.Series:
@@ -1164,6 +1216,18 @@ if uploaded_file and uploaded_master:
         opt_df = cached_calc["opt_df"]
         opt_summary = cached_calc["opt_summary"]
 
+        sim_report_table = cached_calc.get("sim_report_table")
+        opt_report_table = cached_calc.get("opt_report_table")
+
+        # 旧キャッシュに表示用テーブルがない場合だけ1回作る。
+        if sim_report_table is None:
+            sim_report_table = create_report_table(sim_summary)
+            cached_calc["sim_report_table"] = sim_report_table
+
+        if opt_report_table is None:
+            opt_report_table = create_report_table(opt_summary)
+            cached_calc["opt_report_table"] = opt_report_table
+
     else:
         future_dates = pd.date_range(
             start=start_date,
@@ -1292,12 +1356,19 @@ if uploaded_file and uploaded_master:
         )
 
         st.session_state["_planning_calc_key"] = calc_key
+        # 表示用テーブルもここで1回だけ作って保存する。
+        # Excelボタン操作や他ウィジェット操作で同じ表を作り直さない。
+        sim_report_table = create_report_table(sim_summary)
+        opt_report_table = create_report_table(opt_summary)
+
         st.session_state["_planning_calc"] = {
             "forecast_df": forecast_df,
             "sim_df": sim_df,
             "sim_summary": sim_summary,
             "opt_df": opt_df,
             "opt_summary": opt_summary,
+            "sim_report_table": sim_report_table,
+            "opt_report_table": opt_report_table,
         }
 
         # 条件が変わって再計算した場合、古い提出Excelは破棄
@@ -1333,13 +1404,13 @@ if uploaded_file and uploaded_master:
 
     st.subheader("📊 松竹梅")
     st.dataframe(
-        create_report_table(sim_summary),
+        sim_report_table,
         use_container_width=True,
     )
 
     st.subheader("🚀 最適プラン")
     st.dataframe(
-        create_report_table(opt_summary),
+        opt_report_table,
         use_container_width=True,
     )
 
@@ -1360,45 +1431,16 @@ if uploaded_file and uploaded_master:
     )
 
     # ---------------------------------------------------------
-    # 提出用Excelは画面表示のたびに自動生成しない。
-    # Streamlitはウィジェット操作のたびに上から再実行されるため、
-    # create_submission_excel() を常時実行するとDLボタン表示まで重くなる。
-    # 「生成」ボタンを押した時だけ作成し、session_stateに保持する。
+    # 提出用Excel操作は独立Fragment。
+    # ボタンを押しても予測・松竹梅・最適化は再実行しない。
+    # Excel自体もクリックされるまで生成しない。
     # ---------------------------------------------------------
-    submission_key = (
-        f"{start_date}_{end_date}_{selected_cpn}_{opt_mode}_"
-        f"{','.join(map(str, selected_media))}"
+    render_submission_download(
+        opt_summary=opt_summary,
+        history_df=history_df,
+        start_date=start_date,
+        end_date=end_date,
+        selected_cpn=selected_cpn,
+        opt_mode=opt_mode,
+        submission_filename=submission_filename,
     )
-
-    # 条件が変わったら古い成果物を破棄
-    if st.session_state.get("submission_key") != submission_key:
-        st.session_state.pop("submission_excel", None)
-        st.session_state["submission_key"] = submission_key
-
-    if st.button(
-        "📄 提出用Excelを生成",
-        type="primary",
-        use_container_width=True,
-    ):
-        with st.spinner("提出用Excelを作成しています..."):
-            st.session_state["submission_excel"] = create_submission_excel(
-                opt_summary=opt_summary,
-                history_df=history_df,
-                start_date=start_date,
-                end_date=end_date,
-                selected_cpn=selected_cpn,
-                opt_mode=opt_mode,
-            )
-
-    if "submission_excel" in st.session_state:
-        st.success("提出用Excelの作成が完了しました。")
-        st.download_button(
-            "📥 最適プランを提出用ExcelでDL",
-            data=st.session_state["submission_excel"],
-            file_name=submission_filename,
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "spreadsheetml.sheet"
-            ),
-            use_container_width=True,
-        )
