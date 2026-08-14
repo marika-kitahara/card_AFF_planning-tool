@@ -577,15 +577,20 @@ def _manual_settings_signature(df: pd.DataFrame):
     )
 
 
-def _manual_settings_body(
+def render_manual_settings(
     opt_summary,
     history_df,
     selected_cpn,
     calc_key,
 ):
-    """最適プラン直下の手動設定エディタ。"""
-    settings_key = f"manual_settings_{hash(str(calc_key))}"
+    """
+    手動設定エディタの安全版。
 
+    st.fragment / st.rerun は使用しない。
+    data_editor の編集時はStreamlit標準の再実行に任せる。
+    予測・最適化結果は既存のsession_stateキャッシュを再利用するため、
+    重い再計算は発生しない。
+    """
     if st.session_state.get("_manual_calc_key") != calc_key:
         st.session_state["_manual_calc_key"] = calc_key
         st.session_state["_manual_settings"] = _build_manual_settings_defaults(
@@ -593,8 +598,14 @@ def _manual_settings_body(
             history_df=history_df,
             selected_cpn=selected_cpn,
         )
-        st.session_state["_manual_editor_version"] = (
-            st.session_state.get("_manual_editor_version", 0) + 1
+
+        # 計算条件が変わった時だけEditorのwidget stateもリセット
+        old_widget_key = st.session_state.get("_manual_widget_key")
+        if old_widget_key:
+            st.session_state.pop(old_widget_key, None)
+
+        st.session_state["_manual_widget_key"] = (
+            f"manual_settings_editor_{abs(hash(str(calc_key)))}"
         )
 
     current = _normalize_manual_settings(
@@ -608,11 +619,14 @@ def _manual_settings_body(
         )
     )
 
-    editor_version = st.session_state.get("_manual_editor_version", 0)
+    widget_key = st.session_state.get(
+        "_manual_widget_key",
+        f"manual_settings_editor_{abs(hash(str(calc_key)))}",
+    )
 
     edited = st.data_editor(
         current,
-        key=f"{settings_key}_{editor_version}",
+        key=widget_key,
         use_container_width=True,
         hide_index=True,
         num_rows="fixed",
@@ -642,7 +656,8 @@ def _manual_settings_body(
                 min_value=0.0,
                 max_value=1.0,
                 step=0.001,
-                format="%.1f%%",
+                format="%.3f",
+                help="0.50 = 50% として入力",
             ),
             "今回採用件数": st.column_config.NumberColumn(
                 "今回採用件数",
@@ -668,19 +683,9 @@ def _manual_settings_body(
     )
 
     normalized = _normalize_manual_settings(edited)
-
-    if _manual_settings_signature(normalized) != _manual_settings_signature(current):
-        st.session_state["_manual_settings"] = normalized
-        st.session_state["_manual_editor_version"] = editor_version + 1
-        if hasattr(st, "rerun"):
-            try:
-                st.rerun(scope="fragment")
-            except TypeError:
-                st.rerun()
-        return
-
     st.session_state["_manual_settings"] = normalized
 
+    # 派生値はEditorの下に必ず最新値を表示。
     total_count = normalized["今回採用件数"].sum()
     total_issue = normalized["承認件数"].sum()
     total_cost = normalized["費用"].sum()
@@ -693,11 +698,32 @@ def _manual_settings_body(
     c3.metric("全体承認率", f"{overall_rate:.1%}")
     c4.metric("全体発行CPA", f"¥{overall_cpa:,.0f}")
 
+    # 自動計算結果の確認用
+    derived = normalized[
+        [
+            "媒体名",
+            "承認件数",
+            "発行CPA",
+        ]
+    ].copy()
 
-if hasattr(st, "fragment"):
-    render_manual_settings = st.fragment(_manual_settings_body)
-else:
-    render_manual_settings = _manual_settings_body
+    with st.expander("自動計算結果を確認"):
+        st.dataframe(
+            derived,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "媒体名": st.column_config.TextColumn("媒体名"),
+                "承認件数": st.column_config.NumberColumn(
+                    "承認件数",
+                    format="%.1f",
+                ),
+                "発行CPA": st.column_config.NumberColumn(
+                    "発行CPA",
+                    format="¥%d",
+                ),
+            },
+        )
 
 
 def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings, start_date, end_date, selected_cpn, opt_mode):
