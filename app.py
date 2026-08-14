@@ -106,6 +106,14 @@ def create_report_table(df):
 # -----------------------
 def to_excel_multi(sim_df, opt_df):
 
+    # =========================================================
+    # 既存移管合算シート：不要列 E:W を最終出力時に削除
+    # 元レイアウトへの書き込み完了後に削除することで、
+    # 既存の列番号ベースの出力ロジックへの影響を避ける。
+    # =========================================================
+    main_ws = wb_out["10月（既存移管合算）"]
+    main_ws.delete_cols(5, 19)  # E:W（19列）
+
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
