@@ -338,7 +338,7 @@ if uploaded_file and uploaded_master:
     opt_summary["cpa"] = (opt_summary["cost"] / opt_summary["cv"]).replace([float("inf"), float("-inf")], 0).fillna(0)
     opt_summary["date"] = format_date(opt_summary)
 
-    st.subheader("🚀 最適プラン")
+    st.subheader("🚀 最適プラン") 
     st.dataframe(create_report_table(opt_summary), use_container_width=True)
 
     target_cv = st.sidebar.number_input("目標", min_value=0, value=1000)
