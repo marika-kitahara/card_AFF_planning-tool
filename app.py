@@ -131,7 +131,8 @@ if uploaded_file and uploaded_master:
         from data.loader import add_business_edge_flags
         from logic.factors import (
             calculate_dynamic_factor_tables,
-            calculate_transition_cpn_factor,
+            calculate_selected_cpn_base,
+            get_cpn_reference_periods,
             enforce_premium_media_cost,
         )
         from config.constants import RECENT_NORMAL_DAYS
@@ -178,11 +179,8 @@ if uploaded_file and uploaded_master:
 
     st.sidebar.header("📊 CPN選択")
     cpn_list = sorted(cpn_master["CPN名"].dropna().astype(str).unique())
-    selected_cpn = st.sidebar.selectbox("CPN", cpn_list)
-
-    cpn_period = cpn_master[cpn_master["CPN名"] == selected_cpn]
-    if not cpn_period.empty:
-        st.sidebar.write(f"マスタ期間: {cpn_period['日付'].min().date()} ～ {cpn_period['日付'].max().date()}")
+    default_cpn_index = cpn_list.index("マジ得") if "マジ得" in cpn_list else 0
+    selected_cpn = st.sidebar.selectbox("CPN", cpn_list, index=default_cpn_index)
 
     today = datetime.date.today()
     start_date = st.sidebar.date_input("予測開始", today)
@@ -191,7 +189,6 @@ if uploaded_file and uploaded_master:
         st.error("予測期間の開始日は終了日以前にしてください。")
         st.stop()
 
-    reference_date = pd.Timestamp(start_date).normalize()
     normal_labels = {"通常", "定常"}
     is_normal_selected = selected_cpn in normal_labels
 
@@ -213,7 +210,6 @@ if uploaded_file and uploaded_master:
             )
             st.stop()
 
-        # 定常では参照CPN開始・終了の列は出さない。参照期間だけを案内する。
         st.subheader("📈 前年同期間の定常実績")
         st.caption(
             f"参照期間: {normal_reference_start.date()} ～ {normal_reference_end.date()}（予測期間の365日前）"
@@ -225,48 +221,55 @@ if uploaded_file and uploaded_master:
         )
         normal_display["前年同期間の定常CV/日"] = normal_display["前年同期間の定常CV/日"].round(2)
         st.dataframe(normal_display, use_container_width=True, hide_index=True)
-        cpn_factor_map = pd.Series(dtype=float)
     else:
-        # キャンペーンは前年同月・同一CPNの平均件数を予測ベースとして直接使用する。
-        cpn_base_table = calculate_transition_cpn_factor(history_df, selected_cpn, reference_date)
-        if cpn_base_table.empty:
-            st.error(
-                "前年同月に同一キャンペーンの実績がありません。"
-                "CPN名と前年同月のマスタ登録を確認してください。"
-            )
+        # 実績内に存在する同一CPNの連続期間を候補化し、複数選択できるようにする。
+        available_periods = get_cpn_reference_periods(history_df, selected_cpn)
+        if not available_periods:
+            st.error(f"実績内に『{selected_cpn}』のキャンペーン期間がありません。")
             st.stop()
 
-        base_pair = cpn_base_table[["media", "商品ID", "base_cv", "cost"]].copy()
+        period_options = {
+            f"{start.strftime('%Y/%m/%d')} ～ {end.strftime('%Y/%m/%d')}": (start, end)
+            for start, end in available_periods
+        }
+        selected_period_labels = st.sidebar.multiselect(
+            "CPN参照期間（複数選択可）",
+            options=list(period_options.keys()),
+            default=list(period_options.keys()),
+        )
+        if not selected_period_labels:
+            st.warning("CPN参照期間を1つ以上選択してください。")
+            st.stop()
+
+        selected_periods = [period_options[label] for label in selected_period_labels]
+        base_pair = calculate_selected_cpn_base(history_df, selected_cpn, selected_periods)
         base_pair = base_pair[base_pair["media"].isin(selected_media)]
         if base_pair.empty:
-            st.error("対象媒体の前年同月・同一キャンペーン実績がありません。")
+            st.error("選択したCPN参照期間に対象媒体の実績がありません。")
             st.stop()
 
-        st.subheader("📈 CPN実績")
-        display_factor = (
-            cpn_base_table.groupby(
-                ["media", "reference_cpn_start", "reference_cpn_end"],
-                as_index=False,
-            )
-            .agg(
-                normal_daily_cv=("normal_daily_cv", "first"),
-                cpn_daily_cv=("cpn_daily_cv", "first"),
-                cpn_factor=("cpn_factor", "first"),
-            )
+        total_reference_days = sum((end - start).days + 1 for start, end in selected_periods)
+        st.subheader("📈 選択CPN期間の実績")
+        st.caption(
+            f"選択期間: {len(selected_periods)}期間 / 合計 {total_reference_days}日。"
+            " 選択期間のCV・COST合計を合計日数で割った日平均を予測ベースに使用します。"
         )
-        display_factor["normal_daily_cv"] = display_factor["normal_daily_cv"].round(2)
-        display_factor["cpn_daily_cv"] = display_factor["cpn_daily_cv"].round(2)
-        display_factor["cpn_factor"] = display_factor["cpn_factor"].round(3)
-        display_factor = display_factor.rename(columns={
-            "media": "媒体",
-            "normal_daily_cv": "前年CPN直前の定常CV/日（参考）",
-            "cpn_daily_cv": "前年同月・同一CPNのCV/日",
-            "cpn_factor": "参考CPN倍率（予測には未使用）",
-            "reference_cpn_start": "参照CPN開始",
-            "reference_cpn_end": "参照CPN終了",
-        })
-        st.dataframe(display_factor, use_container_width=True, hide_index=True)
-        cpn_factor_map = pd.Series(dtype=float)
+        for label in selected_period_labels:
+            st.write(f"・{label}")
+
+        cpn_display = (
+            base_pair.groupby("media", as_index=False)
+            .agg(
+                **{
+                    "選択期間CV/日": ("base_cv", "sum"),
+                    "選択期間COST/日": ("cost", "sum"),
+                }
+            )
+            .rename(columns={"media": "媒体"})
+        )
+        cpn_display["選択期間CV/日"] = cpn_display["選択期間CV/日"].round(2)
+        cpn_display["選択期間COST/日"] = cpn_display["選択期間COST/日"].round(0)
+        st.dataframe(cpn_display, use_container_width=True, hide_index=True)
 
     factor_tables = calculate_dynamic_factor_tables(history_df)
     st.subheader("📐 実績から算出した変動係数")
