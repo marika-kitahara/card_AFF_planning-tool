@@ -1678,11 +1678,12 @@ def _daily_pair_average(df: pd.DataFrame) -> pd.DataFrame:
 st.set_page_config(page_title="AFプランニングツール", layout="wide")
 st.title("📊 件数予測＆プランニングツール")
 st.caption(
-    "実績CSV・最新のCPNマスタ・媒体名マスタをアップロードしてください。"
+    "実績CSVと最新のCPNマスタをアップロードしてください。"
+    "CPNマスタ内の『CPNマスタ』『媒体名マスタ』シートを使用します。"
     "ファイルはGitHubには保存されません。"
 )
 
-col1, col2, col3 = st.columns(3)
+col1, col2 = st.columns(2)
 
 with col1:
     uploaded_file = st.file_uploader("① 実績CSV", type=["csv"])
@@ -1691,15 +1692,10 @@ with col2:
     uploaded_master = st.file_uploader(
         "② CPNマスタ",
         type=["xlsx", "xlsm"],
+        help="『CPNマスタ』『媒体名マスタ』の2シートを含むExcelをアップロードしてください。",
     )
 
-with col3:
-    uploaded_media_master = st.file_uploader(
-        "③ 媒体名マスタ",
-        type=["xlsx", "xlsm"],
-    )
-
-if uploaded_file and uploaded_master and uploaded_media_master:
+if uploaded_file and uploaded_master:
     try:
         from data.loader import add_business_edge_flags
         from logic.factors import (
@@ -1716,8 +1712,11 @@ if uploaded_file and uploaded_master and uploaded_media_master:
             errors="coerce",
         ).dt.normalize()
 
+        # 同一Excel内の「CPNマスタ」シートを読み込む。
+        uploaded_master.seek(0)
         cpn_master = pd.read_excel(
             uploaded_master,
+            sheet_name="CPNマスタ",
             engine="openpyxl",
         )
 
@@ -1775,8 +1774,11 @@ if uploaded_file and uploaded_master and uploaded_media_master:
             else 0
         )
 
-        # 媒体名マスタはGitHub配置ではなく、画面から毎回アップロードして読み込む。
-        media_master = load_media_master(uploaded_media_master)
+        # 同一Excel内の「媒体名マスタ」シートをSIDマスタとして読み込む。
+        media_master = load_media_master(
+            uploaded_master,
+            sheet_name="媒体名マスタ",
+        )
 
     except Exception as exc:
         st.error(f"ファイルの読み込みに失敗しました: {exc}")
