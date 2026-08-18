@@ -76,6 +76,41 @@ def _normalize_id_value(value) -> str:
     return text
 
 
+
+def load_media_master(file) -> pd.DataFrame:
+    """アップロードされた媒体名マスタを読み込む。A:SID / B:媒体名 / C:カテゴリ想定。"""
+    media_master = pd.read_excel(file, engine="openpyxl")
+
+    required_columns = {"SID", "媒体名"}
+    missing = required_columns - set(media_master.columns)
+    if missing:
+        raise ValueError(
+            "媒体名マスタに必要な列がありません: "
+            + ", ".join(sorted(missing))
+        )
+
+    media_master = media_master.copy()
+    media_master["SID"] = media_master["SID"].map(_normalize_id_value)
+    media_master["媒体名"] = (
+        media_master["媒体名"].astype("string").str.strip()
+    )
+
+    if "カテゴリ" not in media_master.columns:
+        media_master["カテゴリ"] = "未分類"
+
+    media_master["カテゴリ"] = (
+        media_master["カテゴリ"]
+        .astype("string")
+        .str.strip()
+        .replace("", pd.NA)
+        .fillna("未分類")
+    )
+
+    media_master = media_master[media_master["SID"].ne("")].copy()
+    media_master = media_master.drop_duplicates(subset=["SID"], keep="last")
+
+    return media_master[["SID", "媒体名", "カテゴリ"]]
+
 def _normalize_flag_text(value) -> str:
     if pd.isna(value):
         return ""
