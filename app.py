@@ -6,6 +6,9 @@ import streamlit as st
 import pandas as pd
 import datetime
 from io import BytesIO
+
+import matplotlib.pyplot as plt
+import japanize_matplotlib  # noqa: F401
 from pathlib import Path
 from copy import copy
 
@@ -14,10 +17,11 @@ from openpyxl.cell.cell import MergedCell
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from data.loader import load_data
+from data.loader import load_data, load_media_master
 from logic.forecast import forecast_cv
 from logic.simulation import simulate_plan
 from logic.optimize import optimize_budget
+from logic.analytics import prepare_monthly_performance, prepare_unit_price_band_matrix
 
 
 # -----------------------
@@ -1415,6 +1419,143 @@ def _truthy(series: pd.Series) -> pd.Series:
     )
 
 
+def _normalize_sid(value) -> str:
+    if pd.isna(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    text = str(value).strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        return text[:-2]
+    return text
+
+
+def _figure_png_bytes(fig) -> bytes:
+    buffer = BytesIO()
+    fig.savefig(buffer, format="png", dpi=180, bbox_inches="tight")
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def render_history_analytics(history_df: pd.DataFrame):
+    st.subheader("📈 月度別 過去実績分析")
+    st.caption(
+        "月度はCPNマスタの『月度』を正として集計。"
+        "発行数 = 成果承認フラグYの件数、発行CPA = コスト ÷ 発行数です。"
+    )
+
+    monthly = prepare_monthly_performance(history_df)
+    if monthly.empty:
+        st.info("月度が付与された過去実績がないため、月度別グラフを表示できません。")
+        return
+
+    preview = monthly[["月度", "発生件数", "発行数", "コスト", "発行CPA"]].copy()
+    preview["発行CPA"] = preview["発行CPA"].map(
+        lambda x: "" if pd.isna(x) else f"¥{x:,.0f}"
+    )
+    preview["コスト"] = preview["コスト"].map(lambda x: f"¥{x:,.0f}")
+
+    tab_issue, tab_band, tab_table = st.tabs([
+        "発行数・発行CPA",
+        "単価帯",
+        "集計表",
+    ])
+
+    with tab_issue:
+        x = range(len(monthly))
+        labels = monthly["月度"].astype(str).tolist()
+
+        fig_count, ax_count = plt.subplots(figsize=(12, 5))
+        ax_count.bar(x, monthly["発行数"])
+        ax_count.set_title("月度別 発行数")
+        ax_count.set_ylabel("発行数")
+        ax_count.set_xticks(list(x))
+        ax_count.set_xticklabels(labels, rotation=45, ha="right")
+        ax_count.grid(axis="y", alpha=0.25)
+        fig_count.tight_layout()
+        st.pyplot(fig_count, use_container_width=True)
+        st.download_button(
+            "月度別 発行数グラフをPNG保存",
+            data=_figure_png_bytes(fig_count),
+            file_name="月度別_発行数.png",
+            mime="image/png",
+            key="download_monthly_issue_count",
+        )
+        plt.close(fig_count)
+
+        fig_cpa, ax_cpa = plt.subplots(figsize=(12, 5))
+        ax_cpa.plot(x, monthly["発行CPA"], marker="o")
+        ax_cpa.set_title("月度別 発行CPA")
+        ax_cpa.set_ylabel("発行CPA（円）")
+        ax_cpa.set_xticks(list(x))
+        ax_cpa.set_xticklabels(labels, rotation=45, ha="right")
+        ax_cpa.grid(axis="y", alpha=0.25)
+        fig_cpa.tight_layout()
+        st.pyplot(fig_cpa, use_container_width=True)
+        st.download_button(
+            "月度別 発行CPAグラフをPNG保存",
+            data=_figure_png_bytes(fig_cpa),
+            file_name="月度別_発行CPA.png",
+            mime="image/png",
+            key="download_monthly_issue_cpa",
+        )
+        plt.close(fig_cpa)
+
+    with tab_band:
+        control1, control2 = st.columns([1, 1])
+        with control1:
+            band_step = st.number_input(
+                "単価帯の刻み幅（円）",
+                min_value=500,
+                max_value=50000,
+                value=4000,
+                step=500,
+            )
+        with control2:
+            band_metric = st.selectbox(
+                "積み上げる指標",
+                ["発行数", "発生件数"],
+                index=0,
+            )
+
+        band_matrix = prepare_unit_price_band_matrix(
+            history_df,
+            band_step=int(band_step),
+            value_metric=band_metric,
+        )
+
+        if band_matrix.empty:
+            st.info("単価帯グラフを作成できる実績がありません。")
+        else:
+            fig_band, ax_band = plt.subplots(figsize=(12, 6))
+            band_matrix.plot(kind="bar", stacked=True, ax=ax_band, width=0.8)
+            ax_band.set_title(
+                f"月度別 単価帯構成（{int(band_step):,}円刻み / {band_metric}）"
+            )
+            ax_band.set_xlabel("月度")
+            ax_band.set_ylabel(band_metric)
+            ax_band.tick_params(axis="x", rotation=45)
+            ax_band.legend(
+                title="単価帯",
+                bbox_to_anchor=(1.02, 1),
+                loc="upper left",
+            )
+            ax_band.grid(axis="y", alpha=0.25)
+            fig_band.tight_layout()
+            st.pyplot(fig_band, use_container_width=True)
+            st.download_button(
+                "単価帯グラフをPNG保存",
+                data=_figure_png_bytes(fig_band),
+                file_name=f"月度別_単価帯_{int(band_step)}円刻み.png",
+                mime="image/png",
+                key="download_unit_price_band",
+            )
+            plt.close(fig_band)
+
+    with tab_table:
+        st.dataframe(preview, use_container_width=True, hide_index=True)
+
+
 def _daily_pair_average(df: pd.DataFrame) -> pd.DataFrame:
     daily = (
         df.groupby(["date", "media", "商品ID"], as_index=False)
@@ -1432,11 +1573,11 @@ def _daily_pair_average(df: pd.DataFrame) -> pd.DataFrame:
 st.set_page_config(page_title="AFプランニングツール", layout="wide")
 st.title("📊 件数予測＆プランニングツール")
 st.caption(
-    "実績CSVと最新のCPNマスタをアップロードしてください。"
+    "実績CSV・最新のCPNマスタ・媒体名マスタをアップロードしてください。"
     "ファイルはGitHubには保存されません。"
 )
 
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 
 with col1:
     uploaded_file = st.file_uploader("① 実績CSV", type=["csv"])
@@ -1447,7 +1588,13 @@ with col2:
         type=["xlsx", "xlsm"],
     )
 
-if uploaded_file and uploaded_master:
+with col3:
+    uploaded_media_master = st.file_uploader(
+        "③ 媒体名マスタ",
+        type=["xlsx", "xlsm"],
+    )
+
+if uploaded_file and uploaded_master and uploaded_media_master:
     try:
         from data.loader import add_business_edge_flags
         from logic.factors import (
@@ -1469,7 +1616,7 @@ if uploaded_file and uploaded_master:
             engine="openpyxl",
         )
 
-        required_master_columns = {"日付", "CPN名"}
+        required_master_columns = {"日付", "CPN名", "月度"}
         missing_master = required_master_columns - set(cpn_master.columns)
 
         if missing_master:
@@ -1488,8 +1635,18 @@ if uploaded_file and uploaded_master:
             .astype("string")
             .str.strip()
         )
+        cpn_master["月度"] = (
+            cpn_master["月度"]
+            .astype("string")
+            .str.strip()
+        )
         cpn_master = cpn_master.dropna(
             subset=["日付", "CPN名"]
+        )
+        cpn_master["月度"] = (
+            cpn_master["月度"]
+            .replace("", pd.NA)
+            .fillna("未設定")
         )
         cpn_master = cpn_master.drop_duplicates(
             subset=["日付"],
@@ -1513,6 +1670,9 @@ if uploaded_file and uploaded_master:
             else 0
         )
 
+        # 媒体名マスタはGitHub配置ではなく、画面から毎回アップロードして読み込む。
+        media_master = load_media_master(uploaded_media_master)
+
     except Exception as exc:
         st.error(f"ファイルの読み込みに失敗しました: {exc}")
         st.stop()
@@ -1522,6 +1682,7 @@ if uploaded_file and uploaded_master:
             [
                 "日付",
                 "CPN名",
+                "月度",
                 "line_oa_flag",
                 "magitoku_after_flag",
             ]
@@ -1542,9 +1703,50 @@ if uploaded_file and uploaded_master:
         .fillna(0)
         .astype(int)
     )
+    history_df["月度"] = (
+        history_df["月度"]
+        .astype("string")
+        .str.strip()
+        .replace("", pd.NA)
+        .fillna("未設定")
+    )
+
+    history_df = history_df.merge(
+        media_master[["SID", "媒体名", "カテゴリ"]],
+        on="SID",
+        how="left",
+    )
+    history_df["raw_media"] = history_df["media"]
+    mapped_media = (
+        history_df["媒体名"]
+        .astype("string")
+        .str.strip()
+        .replace("", pd.NA)
+    )
+    history_df["media"] = mapped_media.fillna(history_df["raw_media"])
+    history_df["media_category"] = (
+        history_df["カテゴリ"]
+        .astype("string")
+        .str.strip()
+        .replace("", pd.NA)
+        .fillna("未分類")
+    )
 
     st.sidebar.header("媒体選択")
-    all_media = sorted(history_df["media"].unique())
+    all_categories = sorted(history_df["media_category"].dropna().astype(str).unique())
+    selected_categories = st.sidebar.multiselect(
+        "カテゴリ",
+        all_categories,
+        default=all_categories,
+    )
+    if not selected_categories:
+        st.stop()
+
+    history_df = history_df[
+        history_df["media_category"].isin(selected_categories)
+    ].copy()
+
+    all_media = sorted(history_df["media"].dropna().astype(str).unique())
     default_media = [
         m for m in all_media
         if "計測" not in m
@@ -1613,6 +1815,11 @@ if uploaded_file and uploaded_master:
             "定常・マジ得指標を算出できません。"
             f"{approval_exc}"
         )
+
+    try:
+        render_history_analytics(history_df)
+    except ValueError as analytics_exc:
+        st.warning(f"月度別実績を集計できません。{analytics_exc}")
 
     st.sidebar.header("📊 CPN選択")
 
@@ -1982,6 +2189,13 @@ if uploaded_file and uploaded_master:
         future_df["CPN名"] = (
             future_df["CPN名"]
             .fillna(selected_cpn)
+        )
+        future_df["月度"] = (
+            future_df["月度"]
+            .astype("string")
+            .str.strip()
+            .replace("", pd.NA)
+            .fillna("未設定")
         )
 
         future_df["line_oa_flag"] = (
