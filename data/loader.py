@@ -77,9 +77,18 @@ def _normalize_id_value(value) -> str:
 
 
 
-def load_media_master(file) -> pd.DataFrame:
-    """アップロードされた媒体名マスタを読み込む。A:SID / B:媒体名 / C:カテゴリ想定。"""
-    media_master = pd.read_excel(file, engine="openpyxl")
+def load_media_master(file, sheet_name: str = "媒体名マスタ") -> pd.DataFrame:
+    """
+    CPNマスタExcel内の媒体名マスタシートを読み込む。
+    A:SID / B:媒体名 / C:カテゴリ想定。
+    """
+    if hasattr(file, "seek"):
+        file.seek(0)
+    media_master = pd.read_excel(
+        file,
+        sheet_name=sheet_name,
+        engine="openpyxl",
+    )
 
     required_columns = {"SID", "媒体名"}
     missing = required_columns - set(media_master.columns)
