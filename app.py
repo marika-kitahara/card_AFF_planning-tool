@@ -3,8 +3,11 @@
 # MergedCell-safe version
 
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import datetime
+import base64
+import glob
 from io import BytesIO
 
 import matplotlib.pyplot as plt
@@ -1437,31 +1440,81 @@ def _figure_png_bytes(fig) -> bytes:
     return buffer.getvalue()
 
 
-def _configure_matplotlib_japanese_font() -> bool:
-    """Streamlit Cloud上で利用可能な日本語フォントを自動選択する。"""
-    preferred_tokens = (
-        "NotoSansCJK",
-        "NotoSansJP",
-        "NotoSerifCJK",
-        "IPAexGothic",
-        "IPAGothic",
-        "TakaoGothic",
-        "YuGoth",
-        "Meiryo",
-    )
-    try:
-        font_paths = font_manager.findSystemFonts(fontext="ttf") + font_manager.findSystemFonts(fontext="otf")
-        for token in preferred_tokens:
-            for path in font_paths:
-                compact = path.replace("-", "").replace("_", "")
-                if token.lower() in compact.lower():
-                    prop = font_manager.FontProperties(fname=path)
-                    plt.rcParams["font.family"] = prop.get_name()
-                    plt.rcParams["axes.unicode_minus"] = False
-                    return True
-    except Exception:
-        pass
-    return False
+def _get_japanese_font_properties():
+    """Noto CJK等の日本語フォントをファイルから直接指定する。
+
+    Streamlit CloudではMatplotlibのフォントキャッシュに新規インストール済み
+    フォントが反映されない場合があるため、family名ではなくfnameを使う。
+    """
+    candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+    ]
+    candidates.extend(glob.glob("/usr/share/fonts/**/*NotoSansCJK*", recursive=True))
+    candidates.extend(glob.glob("/usr/share/fonts/**/*NotoSansJP*", recursive=True))
+    candidates.extend(glob.glob("/usr/share/fonts/**/*IPA*Gothic*", recursive=True))
+
+    seen = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            if Path(path).is_file():
+                prop = font_manager.FontProperties(fname=path)
+                # 実際に名前を取得できることまで確認
+                _ = prop.get_name()
+                plt.rcParams["axes.unicode_minus"] = False
+                return prop
+        except Exception:
+            continue
+    return None
+
+
+def _render_png_actions(png_bytes: bytes, file_name: str, download_key: str, copy_key: str):
+    """PNG保存とクリップボードへの画像コピーを横並びで表示する。"""
+    left, right = st.columns([1, 1])
+    with left:
+        st.download_button(
+            "画像をPNG保存",
+            data=png_bytes,
+            file_name=file_name,
+            mime="image/png",
+            key=download_key,
+            use_container_width=True,
+        )
+    with right:
+        b64 = base64.b64encode(png_bytes).decode("ascii")
+        button_id = f"copy_{copy_key}".replace("-", "_")
+        html = f"""
+        <div style="width:100%;">
+          <button id="{button_id}" style="
+            width:100%; height:38px; border:1px solid rgba(49,51,63,.2);
+            border-radius:8px; background:white; cursor:pointer; font-size:14px;
+          ">画像をコピー</button>
+          <div id="{button_id}_msg" style="font-size:12px; margin-top:3px; min-height:16px;"></div>
+        </div>
+        <script>
+        const btn = document.getElementById('{button_id}');
+        const msg = document.getElementById('{button_id}_msg');
+        btn.addEventListener('click', async () => {{
+          try {{
+            const response = await fetch('data:image/png;base64,{b64}');
+            const blob = await response.blob();
+            if (!navigator.clipboard || typeof ClipboardItem === 'undefined') {{
+              throw new Error('clipboard_api_unavailable');
+            }}
+            await navigator.clipboard.write([new ClipboardItem({{'image/png': blob}})]);
+            msg.textContent = 'コピーしました';
+          }} catch (e) {{
+            msg.textContent = 'ブラウザの権限でコピーできませんでした';
+          }}
+        }});
+        </script>
+        """
+        components.html(html, height=62)
 
 
 def _chart_month_label(value) -> str:
@@ -1499,44 +1552,44 @@ def render_history_analytics(history_df: pd.DataFrame):
     ])
 
     with tab_issue:
-        has_japanese_font = _configure_matplotlib_japanese_font()
+        jp_font = _get_japanese_font_properties()
         x = range(len(monthly))
         labels_raw = monthly["月度"].astype(str).tolist()
-        labels = labels_raw if has_japanese_font else [_chart_month_label(v) for v in labels_raw]
+        labels = labels_raw if jp_font else [_chart_month_label(v) for v in labels_raw]
 
         fig_count, ax_count = plt.subplots(figsize=(12, 5))
         ax_count.bar(x, monthly["発行数"])
-        ax_count.set_title("月度別 発行数" if has_japanese_font else "Issued count by month")
-        ax_count.set_ylabel("発行数" if has_japanese_font else "Issued count")
+        ax_count.set_title("月度別 発行数" if jp_font else "Issued count by month", fontproperties=jp_font)
+        ax_count.set_ylabel("発行数" if jp_font else "Issued count", fontproperties=jp_font)
         ax_count.set_xticks(list(x))
-        ax_count.set_xticklabels(labels, rotation=45, ha="right")
+        ax_count.set_xticklabels(labels, rotation=45, ha="right", fontproperties=jp_font)
         ax_count.grid(axis="y", alpha=0.25)
         fig_count.tight_layout()
         st.pyplot(fig_count, use_container_width=True)
-        st.download_button(
-            "月度別 発行数グラフをPNG保存",
-            data=_figure_png_bytes(fig_count),
-            file_name="月度別_発行数.png",
-            mime="image/png",
-            key="download_monthly_issue_count",
+        count_png = _figure_png_bytes(fig_count)
+        _render_png_actions(
+            count_png,
+            "月度別_発行数.png",
+            "download_monthly_issue_count",
+            "copy_monthly_issue_count",
         )
         plt.close(fig_count)
 
         fig_cpa, ax_cpa = plt.subplots(figsize=(12, 5))
         ax_cpa.plot(x, monthly["発行CPA"], marker="o")
-        ax_cpa.set_title("月度別 発行CPA" if has_japanese_font else "Issued CPA by month")
-        ax_cpa.set_ylabel("発行CPA（円）" if has_japanese_font else "Issued CPA (JPY)")
+        ax_cpa.set_title("月度別 発行CPA" if jp_font else "Issued CPA by month", fontproperties=jp_font)
+        ax_cpa.set_ylabel("発行CPA（円）" if jp_font else "Issued CPA (JPY)", fontproperties=jp_font)
         ax_cpa.set_xticks(list(x))
-        ax_cpa.set_xticklabels(labels, rotation=45, ha="right")
+        ax_cpa.set_xticklabels(labels, rotation=45, ha="right", fontproperties=jp_font)
         ax_cpa.grid(axis="y", alpha=0.25)
         fig_cpa.tight_layout()
         st.pyplot(fig_cpa, use_container_width=True)
-        st.download_button(
-            "月度別 発行CPAグラフをPNG保存",
-            data=_figure_png_bytes(fig_cpa),
-            file_name="月度別_発行CPA.png",
-            mime="image/png",
-            key="download_monthly_issue_cpa",
+        cpa_png = _figure_png_bytes(fig_cpa)
+        _render_png_actions(
+            cpa_png,
+            "月度別_発行CPA.png",
+            "download_monthly_issue_cpa",
+            "copy_monthly_issue_cpa",
         )
         plt.close(fig_cpa)
 
@@ -1566,34 +1619,41 @@ def render_history_analytics(history_df: pd.DataFrame):
         if band_matrix.empty:
             st.info("単価帯グラフを作成できる実績がありません。")
         else:
-            has_japanese_font = _configure_matplotlib_japanese_font()
+            jp_font = _get_japanese_font_properties()
             plot_matrix = band_matrix.copy()
-            if not has_japanese_font:
+            if not jp_font:
                 plot_matrix.index = [_chart_month_label(v) for v in plot_matrix.index]
             fig_band, ax_band = plt.subplots(figsize=(12, 6))
             plot_matrix.plot(kind="bar", stacked=True, ax=ax_band, width=0.8)
             ax_band.set_title(
                 f"月度別 単価帯構成（{int(band_step):,}円刻み / {band_metric}）"
-                if has_japanese_font
-                else f"Unit price bands by month ({int(band_step):,} JPY step)"
+                if jp_font
+                else f"Unit price bands by month ({int(band_step):,} JPY step)",
+                fontproperties=jp_font,
             )
-            ax_band.set_xlabel("月度" if has_japanese_font else "Month")
-            ax_band.set_ylabel(band_metric if has_japanese_font else ("Issued count" if band_metric == "発行数" else "Conversions"))
+            ax_band.set_xlabel("月度" if jp_font else "Month", fontproperties=jp_font)
+            ax_band.set_ylabel(band_metric if jp_font else ("Issued count" if band_metric == "発行数" else "Conversions"), fontproperties=jp_font)
             ax_band.tick_params(axis="x", rotation=45)
-            ax_band.legend(
-                title="単価帯" if has_japanese_font else "Unit price band",
+            if jp_font:
+                for tick in ax_band.get_xticklabels():
+                    tick.set_fontproperties(jp_font)
+            legend = ax_band.legend(
+                title="単価帯" if jp_font else "Unit price band",
                 bbox_to_anchor=(1.02, 1),
                 loc="upper left",
+                prop=jp_font,
             )
+            if jp_font and legend is not None:
+                legend.get_title().set_fontproperties(jp_font)
             ax_band.grid(axis="y", alpha=0.25)
             fig_band.tight_layout()
             st.pyplot(fig_band, use_container_width=True)
-            st.download_button(
-                "単価帯グラフをPNG保存",
-                data=_figure_png_bytes(fig_band),
-                file_name=f"月度別_単価帯_{int(band_step)}円刻み.png",
-                mime="image/png",
-                key="download_unit_price_band",
+            band_png = _figure_png_bytes(fig_band)
+            _render_png_actions(
+                band_png,
+                f"月度別_単価帯_{int(band_step)}円刻み.png",
+                "download_unit_price_band",
+                "copy_unit_price_band",
             )
             plt.close(fig_band)
 
