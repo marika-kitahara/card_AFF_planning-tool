@@ -8,6 +8,7 @@ import datetime
 from io import BytesIO
 
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 from pathlib import Path
 from copy import copy
 
@@ -1436,6 +1437,43 @@ def _figure_png_bytes(fig) -> bytes:
     return buffer.getvalue()
 
 
+def _configure_matplotlib_japanese_font() -> bool:
+    """Streamlit Cloud上で利用可能な日本語フォントを自動選択する。"""
+    preferred_tokens = (
+        "NotoSansCJK",
+        "NotoSansJP",
+        "NotoSerifCJK",
+        "IPAexGothic",
+        "IPAGothic",
+        "TakaoGothic",
+        "YuGoth",
+        "Meiryo",
+    )
+    try:
+        font_paths = font_manager.findSystemFonts(fontext="ttf") + font_manager.findSystemFonts(fontext="otf")
+        for token in preferred_tokens:
+            for path in font_paths:
+                compact = path.replace("-", "").replace("_", "")
+                if token.lower() in compact.lower():
+                    prop = font_manager.FontProperties(fname=path)
+                    plt.rcParams["font.family"] = prop.get_name()
+                    plt.rcParams["axes.unicode_minus"] = False
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _chart_month_label(value) -> str:
+    """日本語フォントが無い場合にも文字化けしない月度ラベルへ変換する。"""
+    text = str(value).strip()
+    import re
+    match = re.search(r"(\d{4})年\s*(\d{1,2})月度?", text)
+    if match:
+        return f"{match.group(1)}/{int(match.group(2)):02d}"
+    return text
+
+
 def render_history_analytics(history_df: pd.DataFrame):
     st.subheader("📈 月度別 過去実績分析")
     st.caption(
@@ -1461,13 +1499,15 @@ def render_history_analytics(history_df: pd.DataFrame):
     ])
 
     with tab_issue:
+        has_japanese_font = _configure_matplotlib_japanese_font()
         x = range(len(monthly))
-        labels = monthly["月度"].astype(str).tolist()
+        labels_raw = monthly["月度"].astype(str).tolist()
+        labels = labels_raw if has_japanese_font else [_chart_month_label(v) for v in labels_raw]
 
         fig_count, ax_count = plt.subplots(figsize=(12, 5))
         ax_count.bar(x, monthly["発行数"])
-        ax_count.set_title("月度別 発行数")
-        ax_count.set_ylabel("発行数")
+        ax_count.set_title("月度別 発行数" if has_japanese_font else "Issued count by month")
+        ax_count.set_ylabel("発行数" if has_japanese_font else "Issued count")
         ax_count.set_xticks(list(x))
         ax_count.set_xticklabels(labels, rotation=45, ha="right")
         ax_count.grid(axis="y", alpha=0.25)
@@ -1484,8 +1524,8 @@ def render_history_analytics(history_df: pd.DataFrame):
 
         fig_cpa, ax_cpa = plt.subplots(figsize=(12, 5))
         ax_cpa.plot(x, monthly["発行CPA"], marker="o")
-        ax_cpa.set_title("月度別 発行CPA")
-        ax_cpa.set_ylabel("発行CPA（円）")
+        ax_cpa.set_title("月度別 発行CPA" if has_japanese_font else "Issued CPA by month")
+        ax_cpa.set_ylabel("発行CPA（円）" if has_japanese_font else "Issued CPA (JPY)")
         ax_cpa.set_xticks(list(x))
         ax_cpa.set_xticklabels(labels, rotation=45, ha="right")
         ax_cpa.grid(axis="y", alpha=0.25)
@@ -1526,16 +1566,22 @@ def render_history_analytics(history_df: pd.DataFrame):
         if band_matrix.empty:
             st.info("単価帯グラフを作成できる実績がありません。")
         else:
+            has_japanese_font = _configure_matplotlib_japanese_font()
+            plot_matrix = band_matrix.copy()
+            if not has_japanese_font:
+                plot_matrix.index = [_chart_month_label(v) for v in plot_matrix.index]
             fig_band, ax_band = plt.subplots(figsize=(12, 6))
-            band_matrix.plot(kind="bar", stacked=True, ax=ax_band, width=0.8)
+            plot_matrix.plot(kind="bar", stacked=True, ax=ax_band, width=0.8)
             ax_band.set_title(
                 f"月度別 単価帯構成（{int(band_step):,}円刻み / {band_metric}）"
+                if has_japanese_font
+                else f"Unit price bands by month ({int(band_step):,} JPY step)"
             )
-            ax_band.set_xlabel("月度")
-            ax_band.set_ylabel(band_metric)
+            ax_band.set_xlabel("月度" if has_japanese_font else "Month")
+            ax_band.set_ylabel(band_metric if has_japanese_font else ("Issued count" if band_metric == "発行数" else "Conversions"))
             ax_band.tick_params(axis="x", rotation=45)
             ax_band.legend(
-                title="単価帯",
+                title="単価帯" if has_japanese_font else "Unit price band",
                 bbox_to_anchor=(1.02, 1),
                 loc="upper left",
             )
@@ -2176,6 +2222,7 @@ if uploaded_file and uploaded_master and uploaded_media_master:
                 [
                     "日付",
                     "CPN名",
+                    "月度",
                     "line_oa_flag",
                     "magitoku_after_flag",
                 ]
