@@ -8,7 +8,6 @@ import datetime
 from io import BytesIO
 
 import matplotlib.pyplot as plt
-import japanize_matplotlib  # noqa: F401
 from pathlib import Path
 from copy import copy
 
