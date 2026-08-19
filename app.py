@@ -1534,7 +1534,28 @@ def render_history_analytics(history_df: pd.DataFrame):
         "発行数 = 成果承認フラグYの件数、発行CPA = コスト ÷ 発行数です。"
     )
 
-    monthly = prepare_monthly_performance(history_df)
+    analysis_scope = st.radio(
+        "集計対象",
+        ["全期間", "マジ得期間のみ"],
+        horizontal=True,
+        key="history_analytics_scope",
+    )
+
+    analytics_df = history_df
+    scope_suffix = "全期間"
+    if analysis_scope == "マジ得期間のみ":
+        if "CPN名" not in history_df.columns:
+            st.warning("CPN名が付与されていないため、マジ得期間のみの集計ができません。")
+            return
+        analytics_df = history_df.loc[
+            history_df["CPN名"].astype(str).str.strip().eq("マジ得")
+        ].copy()
+        scope_suffix = "マジ得期間のみ"
+        if analytics_df.empty:
+            st.info("マジ得期間に該当する過去実績がありません。")
+            return
+
+    monthly = prepare_monthly_performance(analytics_df)
     if monthly.empty:
         st.info("月度が付与された過去実績がないため、月度別グラフを表示できません。")
         return
@@ -1559,7 +1580,10 @@ def render_history_analytics(history_df: pd.DataFrame):
 
         fig_count, ax_count = plt.subplots(figsize=(12, 5))
         ax_count.bar(x, monthly["発行数"])
-        ax_count.set_title("月度別 発行数" if jp_font else "Issued count by month", fontproperties=jp_font)
+        ax_count.set_title(
+            f"月度別 発行数（{scope_suffix}）" if jp_font else f"Issued count by month ({scope_suffix})",
+            fontproperties=jp_font,
+        )
         ax_count.set_ylabel("発行数" if jp_font else "Issued count", fontproperties=jp_font)
         ax_count.set_xticks(list(x))
         ax_count.set_xticklabels(labels, rotation=45, ha="right", fontproperties=jp_font)
@@ -1569,15 +1593,18 @@ def render_history_analytics(history_df: pd.DataFrame):
         count_png = _figure_png_bytes(fig_count)
         _render_png_actions(
             count_png,
-            "月度別_発行数.png",
-            "download_monthly_issue_count",
-            "copy_monthly_issue_count",
+            f"月度別_発行数_{scope_suffix}.png",
+            f"download_monthly_issue_count_{analysis_scope}",
+            f"copy_monthly_issue_count_{analysis_scope}",
         )
         plt.close(fig_count)
 
         fig_cpa, ax_cpa = plt.subplots(figsize=(12, 5))
         ax_cpa.plot(x, monthly["発行CPA"], marker="o")
-        ax_cpa.set_title("月度別 発行CPA" if jp_font else "Issued CPA by month", fontproperties=jp_font)
+        ax_cpa.set_title(
+            f"月度別 発行CPA（{scope_suffix}）" if jp_font else f"Issued CPA by month ({scope_suffix})",
+            fontproperties=jp_font,
+        )
         ax_cpa.set_ylabel("発行CPA（円）" if jp_font else "Issued CPA (JPY)", fontproperties=jp_font)
         ax_cpa.set_xticks(list(x))
         ax_cpa.set_xticklabels(labels, rotation=45, ha="right", fontproperties=jp_font)
@@ -1587,9 +1614,9 @@ def render_history_analytics(history_df: pd.DataFrame):
         cpa_png = _figure_png_bytes(fig_cpa)
         _render_png_actions(
             cpa_png,
-            "月度別_発行CPA.png",
-            "download_monthly_issue_cpa",
-            "copy_monthly_issue_cpa",
+            f"月度別_発行CPA_{scope_suffix}.png",
+            f"download_monthly_issue_cpa_{analysis_scope}",
+            f"copy_monthly_issue_cpa_{analysis_scope}",
         )
         plt.close(fig_cpa)
 
@@ -1611,7 +1638,7 @@ def render_history_analytics(history_df: pd.DataFrame):
             )
 
         band_matrix = prepare_unit_price_band_matrix(
-            history_df,
+            analytics_df,
             band_step=int(band_step),
             value_metric=band_metric,
         )
@@ -1626,7 +1653,7 @@ def render_history_analytics(history_df: pd.DataFrame):
             fig_band, ax_band = plt.subplots(figsize=(12, 6))
             plot_matrix.plot(kind="bar", stacked=True, ax=ax_band, width=0.8)
             ax_band.set_title(
-                f"月度別 単価帯構成（{int(band_step):,}円刻み / {band_metric}）"
+                f"月度別 単価帯構成（{scope_suffix} / {int(band_step):,}円刻み / {band_metric}）"
                 if jp_font
                 else f"Unit price bands by month ({int(band_step):,} JPY step)",
                 fontproperties=jp_font,
@@ -1651,9 +1678,9 @@ def render_history_analytics(history_df: pd.DataFrame):
             band_png = _figure_png_bytes(fig_band)
             _render_png_actions(
                 band_png,
-                f"月度別_単価帯_{int(band_step)}円刻み.png",
-                "download_unit_price_band",
-                "copy_unit_price_band",
+                f"月度別_単価帯_{int(band_step)}円刻み_{scope_suffix}.png",
+                f"download_unit_price_band_{analysis_scope}",
+                f"copy_unit_price_band_{analysis_scope}",
             )
             plt.close(fig_band)
 
