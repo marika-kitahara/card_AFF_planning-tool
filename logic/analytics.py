@@ -61,6 +61,7 @@ def prepare_unit_price_band_matrix(
     history_df: pd.DataFrame,
     band_step: int = 4000,
     value_metric: str = "発行数",
+    max_bands: int = 40,
 ) -> pd.DataFrame:
     """
     月度×単価帯の積み上げグラフ用データを返す。
@@ -111,10 +112,32 @@ def prepare_unit_price_band_matrix(
     work["band_lower"] = (
         np.floor(work["unit_price"] / band_step).astype(int) * band_step
     )
+
+    # 刻み幅を細かくした時に単価帯が数百～数千系列へ増えて
+    # Matplotlib/Streamlit Cloudのメモリを圧迫しないよう上限を設ける。
+    # 上限を超えた高単価側は「○円以上」にまとめるが、件数は全て保持する。
+    max_bands = max(int(max_bands), 2)
+    unique_lowers = np.sort(work["band_lower"].dropna().unique())
+    overflow_lower = None
+    if len(unique_lowers) > max_bands:
+        overflow_lower = int(unique_lowers[max_bands - 1])
+        work.loc[work["band_lower"] >= overflow_lower, "band_lower"] = overflow_lower
+
     work["band_upper"] = work["band_lower"] + band_step - 1
-    work["単価帯"] = work.apply(
-        lambda r: f"¥{int(r['band_lower']):,}–¥{int(r['band_upper']):,}", axis=1
-    )
+
+    if overflow_lower is None:
+        work["単価帯"] = work.apply(
+            lambda r: f"¥{int(r['band_lower']):,}–¥{int(r['band_upper']):,}", axis=1
+        )
+    else:
+        work["単価帯"] = work.apply(
+            lambda r: (
+                f"¥{overflow_lower:,}以上"
+                if int(r["band_lower"]) == overflow_lower
+                else f"¥{int(r['band_lower']):,}–¥{int(r['band_upper']):,}"
+            ),
+            axis=1,
+        )
 
     month_order = (
         work.groupby("月度", as_index=False)
