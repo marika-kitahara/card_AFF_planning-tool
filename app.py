@@ -1433,9 +1433,9 @@ def _normalize_sid(value) -> str:
     return text
 
 
-def _figure_png_bytes(fig) -> bytes:
+def _figure_png_bytes(fig, dpi: int = 180) -> bytes:
     buffer = BytesIO()
-    fig.savefig(buffer, format="png", dpi=180, bbox_inches="tight")
+    fig.savefig(buffer, format="png", dpi=dpi, bbox_inches="tight")
     buffer.seek(0)
     return buffer.getvalue()
 
@@ -1637,10 +1637,13 @@ def render_history_analytics(history_df: pd.DataFrame):
                 index=0,
             )
 
+        # 1,000円刻み等で単価帯が大量発生してもクラッシュしないよう、
+        # 表示系列数は最大40帯に制御。超過分は高単価側を「○円以上」に集約する。
         band_matrix = prepare_unit_price_band_matrix(
             analytics_df,
             band_step=int(band_step),
             value_metric=band_metric,
+            max_bands=40,
         )
 
         if band_matrix.empty:
@@ -1664,18 +1667,26 @@ def render_history_analytics(history_df: pd.DataFrame):
             if jp_font:
                 for tick in ax_band.get_xticklabels():
                     tick.set_fontproperties(jp_font)
+            # 凡例の縦長化でPNGが巨大化しないよう、系列数に応じて複数列化。
+            legend_cols = max(1, min(4, (len(plot_matrix.columns) + 14) // 15))
+            legend_prop = jp_font.copy() if jp_font is not None else None
+            if legend_prop is not None:
+                legend_prop.set_size(8)
             legend = ax_band.legend(
                 title="単価帯" if jp_font else "Unit price band",
                 bbox_to_anchor=(1.02, 1),
                 loc="upper left",
-                prop=jp_font,
+                ncol=legend_cols,
+                fontsize=8,
+                prop=legend_prop,
             )
             if jp_font and legend is not None:
                 legend.get_title().set_fontproperties(jp_font)
             ax_band.grid(axis="y", alpha=0.25)
             fig_band.tight_layout()
             st.pyplot(fig_band, width="stretch")
-            band_png = _figure_png_bytes(fig_band)
+            # 積み上げグラフは系列数が多いため、PNG生成時のメモリ使用量も抑える。
+            band_png = _figure_png_bytes(fig_band, dpi=140)
             _render_png_actions(
                 band_png,
                 f"月度別_単価帯_{int(band_step)}円刻み_{scope_suffix}.png",
