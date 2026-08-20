@@ -634,7 +634,7 @@ def render_manual_settings(
     edited = st.data_editor(
         current,
         key=widget_key,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         num_rows="fixed",
         disabled=[
@@ -717,7 +717,7 @@ def render_manual_settings(
     with st.expander("自動計算結果を確認"):
         st.dataframe(
             derived,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "媒体名": st.column_config.TextColumn("媒体名"),
@@ -1398,7 +1398,7 @@ def _submission_download_body(
         ),
         on_click="ignore",
         type="primary",
-        use_container_width=True,
+        width="stretch",
     )
 
 
@@ -1483,7 +1483,7 @@ def _render_png_actions(png_bytes: bytes, file_name: str, download_key: str, cop
             file_name=file_name,
             mime="image/png",
             key=download_key,
-            use_container_width=True,
+            width="stretch",
         )
     with right:
         b64 = base64.b64encode(png_bytes).decode("ascii")
@@ -1589,7 +1589,7 @@ def render_history_analytics(history_df: pd.DataFrame):
         ax_count.set_xticklabels(labels, rotation=45, ha="right", fontproperties=jp_font)
         ax_count.grid(axis="y", alpha=0.25)
         fig_count.tight_layout()
-        st.pyplot(fig_count, use_container_width=True)
+        st.pyplot(fig_count, width="stretch")
         count_png = _figure_png_bytes(fig_count)
         _render_png_actions(
             count_png,
@@ -1610,7 +1610,7 @@ def render_history_analytics(history_df: pd.DataFrame):
         ax_cpa.set_xticklabels(labels, rotation=45, ha="right", fontproperties=jp_font)
         ax_cpa.grid(axis="y", alpha=0.25)
         fig_cpa.tight_layout()
-        st.pyplot(fig_cpa, use_container_width=True)
+        st.pyplot(fig_cpa, width="stretch")
         cpa_png = _figure_png_bytes(fig_cpa)
         _render_png_actions(
             cpa_png,
@@ -1674,7 +1674,7 @@ def render_history_analytics(history_df: pd.DataFrame):
                 legend.get_title().set_fontproperties(jp_font)
             ax_band.grid(axis="y", alpha=0.25)
             fig_band.tight_layout()
-            st.pyplot(fig_band, use_container_width=True)
+            st.pyplot(fig_band, width="stretch")
             band_png = _figure_png_bytes(fig_band)
             _render_png_actions(
                 band_png,
@@ -1685,7 +1685,7 @@ def render_history_analytics(history_df: pd.DataFrame):
             plt.close(fig_band)
 
     with tab_table:
-        st.dataframe(preview, use_container_width=True, hide_index=True)
+        st.dataframe(preview, width="stretch", hide_index=True)
 
 
 def _daily_pair_average(df: pd.DataFrame) -> pd.DataFrame:
@@ -1940,7 +1940,7 @@ if uploaded_file and uploaded_master:
             )
             st.dataframe(
                 approval_preview,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -2062,7 +2062,7 @@ if uploaded_file and uploaded_master:
 
         st.dataframe(
             normal_display,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -2162,7 +2162,7 @@ if uploaded_file and uploaded_master:
 
         st.dataframe(
             cpn_display,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -2205,21 +2205,21 @@ if uploaded_file and uploaded_master:
     with tab1:
         st.dataframe(
             factor_tables["weekday"].round(3),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
     with tab2:
         st.dataframe(
             factor_tables["month_edge"].round(3),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
     with tab3:
         st.dataframe(
             factor_tables["season"].round(3),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -2232,7 +2232,7 @@ if uploaded_file and uploaded_master:
         else:
             st.dataframe(
                 factor_tables["line_oa"].round(3),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -2463,20 +2463,20 @@ if uploaded_file and uploaded_master:
 
         st.dataframe(
             forecast_df[available_factor_cols],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
     st.subheader("📊 松竹梅")
     st.dataframe(
         sim_report_table,
-        use_container_width=True,
+        width="stretch",
     )
 
     st.subheader("🚀 最適プラン")
     st.dataframe(
         opt_report_table,
-        use_container_width=True,
+        width="stretch",
     )
 
     st.subheader("✍️ 手動設定")
