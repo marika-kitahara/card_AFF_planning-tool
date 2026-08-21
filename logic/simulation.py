@@ -27,13 +27,19 @@ def simulate_plan(df):
             cpa = new_cost / new_cv if new_cv != 0 else 0
 
             # ✅ ←ここが超重要！！
-            results.append({
-                "date": row["date"],   # 追加
+            result = {
+                "date": row["date"],
                 "media": row["media"],
                 "plan": label,
                 "cv": new_cv,
                 "cost": new_cost,
-                "cpa": cpa
-            })
+                "cpa": cpa,
+            }
+            # 複合施策時に、どの施策由来の予測かを後工程まで保持する。
+            if "CPN名" in row.index:
+                result["CPN名"] = row["CPN名"]
+            if "planning_segment" in row.index:
+                result["planning_segment"] = row["planning_segment"]
+            results.append(result)
 
     return pd.DataFrame(results)

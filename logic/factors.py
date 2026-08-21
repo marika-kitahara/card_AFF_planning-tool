@@ -199,3 +199,50 @@ def enforce_premium_media_cost(df: pd.DataFrame) -> pd.DataFrame:
     floor = float(small_media_cost.max()) + 1.0
     out.loc[is_premium, "cost"] = out.loc[is_premium, "cost"].clip(lower=floor)
     return out
+
+
+def calculate_normal_month_base(
+    history_df: pd.DataFrame,
+    selected_months: list[str],
+) -> pd.DataFrame:
+    """
+    選択月度の「定常/通常」実績から媒体×商品IDの日平均を返す。
+
+    base_cv = 選択月度内の定常CV合計 / 選択月度内の定常日数
+    cost    = 選択月度内の定常Yコスト合計 / 選択月度内の定常日数
+
+    月ごとの日平均を単純平均せず、選択した定常日の総数で加重する。
+    """
+    columns = ["media", "商品ID", "base_cv", "cost"]
+    if not selected_months:
+        return pd.DataFrame(columns=columns)
+
+    required = {"date", "media", "商品ID", "月度", "CPN名", "cv", "cost"}
+    missing = required - set(history_df.columns)
+    if missing:
+        raise ValueError("定常月度学習に必要な列がありません: " + ", ".join(sorted(missing)))
+
+    work = history_df.copy()
+    work["date"] = pd.to_datetime(work["date"], errors="coerce").dt.normalize()
+    work["月度"] = work["月度"].astype("string").str.strip()
+    work["CPN名"] = work["CPN名"].astype("string").str.strip()
+
+    selected = work[
+        work["月度"].isin([str(x).strip() for x in selected_months])
+        & work["CPN名"].isin(["通常", "定常"])
+    ].copy()
+    if selected.empty:
+        return pd.DataFrame(columns=columns)
+
+    # 実績が存在する「定常日」を分母にする。媒体ごとではなく期間共通の日数。
+    total_days = selected["date"].dropna().nunique()
+    if total_days <= 0:
+        return pd.DataFrame(columns=columns)
+
+    result = (
+        selected.groupby(["media", "商品ID"], as_index=False)
+        .agg(total_cv=("cv", "sum"), total_cost=("cost", "sum"))
+    )
+    result["base_cv"] = result["total_cv"] / float(total_days)
+    result["cost"] = result["total_cost"] / float(total_days)
+    return result[columns]
