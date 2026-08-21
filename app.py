@@ -1693,8 +1693,8 @@ def render_history_analytics(history_df: pd.DataFrame, current_plan_df: pd.DataF
                         all_cols.append(label)
                 band_matrix = band_matrix.reindex(columns=all_cols, fill_value=0.0)
                 band_matrix.loc["今回"] = 0.0
-                for r in current.itertuples():
-                    band_matrix.loc["今回", current_labels[int(r.band_lower)]] = float(getattr(r, metric_col))
+                for _, r in current.iterrows():
+                    band_matrix.loc["今回", current_labels[int(r["band_lower"])]] = float(r[metric_col])
 
         # 今回分を足した結果も最大40帯に制御し、細かい刻みでのメモリ急増を防ぐ。
         if not band_matrix.empty and len(band_matrix.columns) > 40:
@@ -1775,6 +1775,52 @@ def _daily_pair_average(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _calculate_normal_month_base(
+    history_df: pd.DataFrame,
+    selected_months: list[str],
+) -> pd.DataFrame:
+    """選択した月度の定常/通常実績から媒体×商品IDの日平均を返す。
+
+    この処理はapp.py内に置き、logic.factorsの更新タイミング差による
+    ImportErrorでアプリ全体が起動不能になるのを防ぐ。
+    """
+    columns = ["media", "商品ID", "base_cv", "cost"]
+    if not selected_months:
+        return pd.DataFrame(columns=columns)
+
+    required = {"date", "media", "商品ID", "月度", "CPN名", "cv", "cost"}
+    missing = required - set(history_df.columns)
+    if missing:
+        raise ValueError(
+            "定常月度学習に必要な列がありません: " + ", ".join(sorted(missing))
+        )
+
+    work = history_df.copy()
+    work["date"] = pd.to_datetime(work["date"], errors="coerce").dt.normalize()
+    work["月度"] = work["月度"].astype("string").str.strip()
+    work["CPN名"] = work["CPN名"].astype("string").str.strip()
+
+    selected_month_set = {str(x).strip() for x in selected_months}
+    selected = work[
+        work["月度"].isin(selected_month_set)
+        & work["CPN名"].isin(["通常", "定常"])
+    ].copy()
+    if selected.empty:
+        return pd.DataFrame(columns=columns)
+
+    total_days = selected["date"].dropna().nunique()
+    if total_days <= 0:
+        return pd.DataFrame(columns=columns)
+
+    result = (
+        selected.groupby(["media", "商品ID"], as_index=False)
+        .agg(total_cv=("cv", "sum"), total_cost=("cost", "sum"))
+    )
+    result["base_cv"] = result["total_cv"] / float(total_days)
+    result["cost"] = result["total_cost"] / float(total_days)
+    return result[columns]
+
+
 # -----------------------
 # ✅ UI
 # -----------------------
@@ -1811,7 +1857,6 @@ if uploaded_file and uploaded_master:
         from logic.factors import (
             calculate_dynamic_factor_tables,
             calculate_selected_cpn_base,
-            calculate_normal_month_base,
             get_cpn_reference_periods,
             enforce_premium_media_cost,
         )
@@ -2163,7 +2208,7 @@ if uploaded_file and uploaded_master:
     for seg_idx, seg in enumerate(planning_segments, start=1):
         selected_cpn = seg["cpn"]
         if selected_cpn in normal_labels:
-            base_pair_seg = calculate_normal_month_base(
+            base_pair_seg = _calculate_normal_month_base(
                 history_df,
                 selected_learning_months,
             )
