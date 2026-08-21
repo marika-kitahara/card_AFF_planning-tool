@@ -1541,7 +1541,11 @@ def _chart_month_label(value) -> str:
     return text
 
 
-def render_history_analytics(history_df: pd.DataFrame, current_plan_df: pd.DataFrame | None = None):
+def render_history_analytics(
+    history_df: pd.DataFrame,
+    current_plan_df: pd.DataFrame | None = None,
+    current_plan_magitoku_df: pd.DataFrame | None = None,
+):
     st.subheader("📈 月度別 過去実績分析")
     st.caption(
         "月度はCPNマスタの『月度』を正として集計。"
@@ -1556,6 +1560,7 @@ def render_history_analytics(history_df: pd.DataFrame, current_plan_df: pd.DataF
     )
 
     analytics_df = history_df
+    current_chart_plan = current_plan_df
     scope_suffix = "全期間"
     if analysis_scope == "マジ得期間のみ":
         if "CPN名" not in history_df.columns:
@@ -1564,6 +1569,7 @@ def render_history_analytics(history_df: pd.DataFrame, current_plan_df: pd.DataF
         analytics_df = history_df.loc[
             history_df["CPN名"].astype(str).str.strip().eq("マジ得")
         ].copy()
+        current_chart_plan = current_plan_magitoku_df
         scope_suffix = "マジ得期間のみ"
         if analytics_df.empty:
             st.info("マジ得期間に該当する過去実績がありません。")
@@ -1661,8 +1667,8 @@ def render_history_analytics(history_df: pd.DataFrame, current_plan_df: pd.DataF
         )
 
         # 今回プラン（手動設定後）を同じ単価帯グラフへ追加。
-        if current_plan_df is not None and not current_plan_df.empty:
-            cp = _normalize_manual_settings(current_plan_df)
+        if current_chart_plan is not None and not current_chart_plan.empty:
+            cp = _normalize_manual_settings(current_chart_plan)
             cp["unit_price"] = pd.to_numeric(
                 cp["今回プラン採用グロス単価"], errors="coerce"
             ).fillna(0.0)
@@ -1999,10 +2005,18 @@ if uploaded_file and uploaded_master:
     all_product_ids = sorted(
         [x for x in history_df["商品ID"].dropna().astype(str).unique() if str(x).strip() != ""]
     )
+    product_id_one = next(
+        (pid for pid in all_product_ids if str(pid).strip() == "1"),
+        next(
+            (pid for pid in all_product_ids if pd.to_numeric(pid, errors="coerce") == 1),
+            None,
+        ),
+    )
+    default_product_ids = [product_id_one] if product_id_one is not None else all_product_ids[:1]
     selected_product_ids = st.sidebar.multiselect(
         "商品ID",
         all_product_ids,
-        default=all_product_ids,
+        default=default_product_ids,
     )
     if not selected_product_ids:
         st.stop()
@@ -2043,6 +2057,11 @@ if uploaded_file and uploaded_master:
     history_df = history_df[
         history_df["media"].isin(selected_media)
     ].copy()
+
+    # 月度別過去実績分析はUI上部へ表示する。
+    # 今回プランは後段で確定するため、ここでは表示位置だけ確保し、
+    # 手動設定取得後にこのプレースホルダーへ描画する。
+    history_analytics_placeholder = st.empty()
 
     # 定常 / マジ得の承認率を画面でも確認。
     try:
@@ -2616,13 +2635,54 @@ if uploaded_file and uploaded_master:
             ),
         )
     )
-    try:
-        render_history_analytics(
-            history_df,
-            current_plan_df=current_manual_for_chart,
+
+    # 「マジ得期間のみ」では、今回プランもマジ得指定期間分だけを表示する。
+    # 手動設定値は最終版として維持し、媒体ごとの採用件数だけ
+    # 今回予測に占めるマジ得CV比率で按分する。
+    current_manual_magitoku_for_chart = pd.DataFrame()
+    if (
+        not current_manual_for_chart.empty
+        and "CPN名" in opt_summary.columns
+        and (opt_summary["CPN名"].astype(str).str.strip() == "マジ得").any()
+    ):
+        mix = opt_summary.copy()
+        mix["media"] = mix["media"].astype(str)
+        mix["cv"] = pd.to_numeric(mix["cv"], errors="coerce").fillna(0.0)
+        mix["CPN名"] = mix["CPN名"].astype(str).str.strip()
+        total_cv = mix.groupby("media")["cv"].sum()
+        magi_cv = mix.loc[mix["CPN名"].eq("マジ得")].groupby("media")["cv"].sum()
+        magi_ratio = (magi_cv / total_cv.replace(0, pd.NA)).fillna(0.0).clip(0, 1)
+
+        current_manual_magitoku_for_chart = current_manual_for_chart.copy()
+        current_manual_magitoku_for_chart["_magi_ratio"] = (
+            current_manual_magitoku_for_chart["媒体名"].astype(str).map(magi_ratio).fillna(0.0)
         )
+        current_manual_magitoku_for_chart["今回採用件数"] = (
+            pd.to_numeric(
+                current_manual_magitoku_for_chart["今回採用件数"], errors="coerce"
+            ).fillna(0.0)
+            * current_manual_magitoku_for_chart["_magi_ratio"]
+        )
+        current_manual_magitoku_for_chart = current_manual_magitoku_for_chart.drop(
+            columns=["_magi_ratio"]
+        )
+        current_manual_magitoku_for_chart = _normalize_manual_settings(
+            current_manual_magitoku_for_chart
+        )
+        current_manual_magitoku_for_chart = current_manual_magitoku_for_chart.loc[
+            current_manual_magitoku_for_chart["今回採用件数"] > 0
+        ].copy()
+
+    try:
+        with history_analytics_placeholder.container():
+            render_history_analytics(
+                history_df,
+                current_plan_df=current_manual_for_chart,
+                current_plan_magitoku_df=current_manual_magitoku_for_chart,
+            )
     except ValueError as analytics_exc:
-        st.warning(f"月度別実績を集計できません。{analytics_exc}")
+        with history_analytics_placeholder.container():
+            st.warning(f"月度別実績を集計できません。{analytics_exc}")
 
     submission_filename = (
         f"【提出用】楽天カード"
