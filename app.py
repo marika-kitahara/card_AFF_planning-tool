@@ -457,22 +457,35 @@ def _build_manual_settings_defaults(
         media = str(r.media)
         opt_unit = float(r.opt_unit or 0)
 
-        if selected_cpn == "マジ得":
-            rate = period["magi_rate"].get(
-                media,
-                period["magi_rate_all"],
-            )
-            gross_unit = period["magi_unit"].get(
-                media,
-                period["magi_unit_all"],
-            )
+        # 複合施策時は、施策別予測CVを重みにして承認率・グロス単価をブレンドする。
+        media_plan = plan[plan["media"].eq(media)].copy()
+        if "CPN名" in media_plan.columns and not media_plan.empty:
+            mix = media_plan.groupby("CPN名", as_index=False)["cv"].sum()
+            weighted_rate = 0.0
+            weighted_gross = 0.0
+            weight_total = float(mix["cv"].sum())
+            for mix_row in mix.itertuples():
+                cpn_name = str(mix_row.CPN名).strip()
+                weight = float(mix_row.cv or 0)
+                if cpn_name == "マジ得":
+                    cpn_rate = period["magi_rate"].get(media, period["magi_rate_all"])
+                    cpn_gross = period["magi_unit"].get(media, period["magi_unit_all"])
+                    if cpn_gross <= 0:
+                        cpn_gross = opt_unit
+                else:
+                    cpn_rate = period["normal_rate"].get(media, period["normal_rate_all"])
+                    cpn_gross = opt_unit
+                weighted_rate += weight * float(cpn_rate or 0)
+                weighted_gross += weight * float(cpn_gross or 0)
+            rate = weighted_rate / weight_total if weight_total else 0.0
+            gross_unit = weighted_gross / weight_total if weight_total else opt_unit
+        elif selected_cpn == "マジ得":
+            rate = period["magi_rate"].get(media, period["magi_rate_all"])
+            gross_unit = period["magi_unit"].get(media, period["magi_unit_all"])
             if gross_unit <= 0:
                 gross_unit = opt_unit
         else:
-            rate = period["normal_rate"].get(
-                media,
-                period["normal_rate_all"],
-            )
+            rate = period["normal_rate"].get(media, period["normal_rate_all"])
             gross_unit = opt_unit
 
         adopted_count = float(r.plan_cv or 0)
@@ -756,9 +769,10 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
     plan["cv"] = pd.to_numeric(plan["cv"], errors="coerce").fillna(0)
     plan["cost"] = pd.to_numeric(plan["cost"], errors="coerce").fillna(0)
 
-    dates = list(pd.date_range(pd.Timestamp(start_date), pd.Timestamp(end_date), freq="D"))
+    # 複合施策では「開始～終了の連続日」ではなく、実際に予測した対象日だけを出力する。
+    dates = sorted(pd.Timestamp(x).normalize() for x in plan["date"].dropna().unique())
     if len(dates) > 33:
-        raise ValueError("提出用テンプレートは最大33日分です。予測期間を33日以内にしてください。")
+        raise ValueError("提出用テンプレートは最大33日分です。施策①+施策②の対象日数を33日以内にしてください。")
 
     daily = (
         plan.groupby(["date", "media"], as_index=False)
@@ -879,14 +893,14 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
     magi_unit_map = period_metrics["magi_unit"]
     magi_unit_all = period_metrics["magi_unit_all"]
 
-    # 未来日ごとのCPN区分。
+    # 未来日ごとのCPN区分。複合施策時はUI選択を保持したplan側を最優先。
     future_cpn_map = {}
-    if cpn_master is not None and not cpn_master.empty:
+    if "CPN名" in plan.columns:
+        fm = plan[["date", "CPN名"]].dropna(subset=["date"]).drop_duplicates(subset=["date"], keep="last")
+        future_cpn_map = dict(zip(fm["date"], fm["CPN名"]))
+    elif cpn_master is not None and not cpn_master.empty:
         fm = cpn_master[["日付", "CPN名"]].copy()
-        fm["日付"] = pd.to_datetime(
-            fm["日付"],
-            errors="coerce",
-        ).dt.normalize()
+        fm["日付"] = pd.to_datetime(fm["日付"], errors="coerce").dt.normalize()
         fm = fm.dropna(subset=["日付"])
         future_cpn_map = dict(zip(fm["日付"], fm["CPN名"]))
 
@@ -1527,7 +1541,7 @@ def _chart_month_label(value) -> str:
     return text
 
 
-def render_history_analytics(history_df: pd.DataFrame):
+def render_history_analytics(history_df: pd.DataFrame, current_plan_df: pd.DataFrame | None = None):
     st.subheader("📈 月度別 過去実績分析")
     st.caption(
         "月度はCPNマスタの『月度』を正として集計。"
@@ -1646,6 +1660,57 @@ def render_history_analytics(history_df: pd.DataFrame):
             max_bands=40,
         )
 
+        # 今回プラン（手動設定後）を同じ単価帯グラフへ追加。
+        if current_plan_df is not None and not current_plan_df.empty:
+            cp = _normalize_manual_settings(current_plan_df)
+            cp["unit_price"] = pd.to_numeric(
+                cp["今回プラン採用グロス単価"], errors="coerce"
+            ).fillna(0.0)
+            metric_col = "承認件数" if band_metric == "発行数" else "今回採用件数"
+            cp[metric_col] = pd.to_numeric(cp[metric_col], errors="coerce").fillna(0.0)
+            cp = cp[(cp["unit_price"] >= 0) & (cp[metric_col] > 0)].copy()
+            if not cp.empty:
+                cp["band_lower"] = (
+                    (cp["unit_price"] // int(band_step)).astype(int) * int(band_step)
+                )
+                current = (
+                    cp.groupby("band_lower", as_index=False)[metric_col]
+                    .sum()
+                )
+                current_labels = {}
+                for r in current.itertuples():
+                    lower = int(r.band_lower)
+                    upper = lower + int(band_step) - 1
+                    current_labels[lower] = f"¥{lower:,}–¥{upper:,}"
+
+                # 既存履歴側の帯と今回帯を和集合にする。
+                if band_matrix.empty:
+                    band_matrix = pd.DataFrame(index=["今回"])
+                    band_matrix.index.name = "月度"
+                all_cols = list(band_matrix.columns)
+                for label in current_labels.values():
+                    if label not in all_cols:
+                        all_cols.append(label)
+                band_matrix = band_matrix.reindex(columns=all_cols, fill_value=0.0)
+                band_matrix.loc["今回"] = 0.0
+                for r in current.itertuples():
+                    band_matrix.loc["今回", current_labels[int(r.band_lower)]] = float(getattr(r, metric_col))
+
+        # 今回分を足した結果も最大40帯に制御し、細かい刻みでのメモリ急増を防ぐ。
+        if not band_matrix.empty and len(band_matrix.columns) > 40:
+            import re
+            def _band_lower_from_label(label):
+                nums = re.findall(r"[\d,]+", str(label))
+                return int(nums[0].replace(",", "")) if nums else 0
+            ordered_cols = sorted(band_matrix.columns, key=_band_lower_from_label)
+            keep_cols = ordered_cols[:39]
+            overflow_cols = ordered_cols[39:]
+            overflow_lower = _band_lower_from_label(overflow_cols[0])
+            overflow_label = f"¥{overflow_lower:,}以上"
+            overflow_values = band_matrix[overflow_cols].sum(axis=1)
+            band_matrix = band_matrix[keep_cols].copy()
+            band_matrix[overflow_label] = overflow_values
+
         if band_matrix.empty:
             st.info("単価帯グラフを作成できる実績がありません。")
         else:
@@ -1734,17 +1799,25 @@ with col2:
     )
 
 if uploaded_file and uploaded_master:
+    st.sidebar.header("⚙️ 実績データ条件")
+    exclude_compensation = st.sidebar.toggle(
+        "補填を除外",
+        value=True,
+        help="ON: 実績データP列に文字列が入っている補填対象行を除外します。",
+    )
+
     try:
         from data.loader import add_business_edge_flags
         from logic.factors import (
             calculate_dynamic_factor_tables,
             calculate_selected_cpn_base,
+            calculate_normal_month_base,
             get_cpn_reference_periods,
             enforce_premium_media_cost,
         )
         from config.constants import RECENT_NORMAL_DAYS
 
-        history_df = load_data(uploaded_file)
+        history_df = load_data(uploaded_file, exclude_compensation=exclude_compensation)
         history_df["date"] = pd.to_datetime(
             history_df["date"],
             errors="coerce",
@@ -1877,6 +1950,22 @@ if uploaded_file and uploaded_master:
         .fillna("未分類")
     )
 
+    st.sidebar.header("商品ID選択")
+    all_product_ids = sorted(
+        [x for x in history_df["商品ID"].dropna().astype(str).unique() if str(x).strip() != ""]
+    )
+    selected_product_ids = st.sidebar.multiselect(
+        "商品ID",
+        all_product_ids,
+        default=all_product_ids,
+    )
+    if not selected_product_ids:
+        st.stop()
+
+    history_df = history_df[
+        history_df["商品ID"].astype(str).isin(selected_product_ids)
+    ].copy()
+
     st.sidebar.header("媒体選択")
     all_categories = sorted(history_df["media_category"].dropna().astype(str).unique())
     selected_categories = st.sidebar.multiselect(
@@ -1961,12 +2050,7 @@ if uploaded_file and uploaded_master:
             f"{approval_exc}"
         )
 
-    try:
-        render_history_analytics(history_df)
-    except ValueError as analytics_exc:
-        st.warning(f"月度別実績を集計できません。{analytics_exc}")
-
-    st.sidebar.header("📊 CPN選択")
+    st.sidebar.header("📊 対象期間・施策")
 
     cpn_list = sorted(
         cpn_master["CPN名"]
@@ -1974,208 +2058,196 @@ if uploaded_file and uploaded_master:
         .astype(str)
         .unique()
     )
-
-    default_cpn_index = (
-        cpn_list.index("マジ得")
-        if "マジ得" in cpn_list
-        else 0
-    )
-
-    selected_cpn = st.sidebar.selectbox(
-        "CPN",
-        cpn_list,
-        index=default_cpn_index,
-    )
-
-    today = datetime.date.today()
-
-    start_date = st.sidebar.date_input(
-        "予測開始",
-        today,
-    )
-
-    end_date = st.sidebar.date_input(
-        "予測終了",
-        today + datetime.timedelta(days=7),
-    )
-
-    if start_date > end_date:
-        st.error(
-            "予測期間の開始日は終了日以前にしてください。"
-        )
+    if not cpn_list:
+        st.error("CPNマスタに選択可能な施策がありません。")
         st.stop()
 
     normal_labels = {"通常", "定常"}
-    is_normal_selected = selected_cpn in normal_labels
+    default_primary = next((x for x in ["定常", "通常"] if x in cpn_list), cpn_list[0])
+    today = datetime.date.today()
 
-    if is_normal_selected:
-        # 定常は予測期間を365日前へそのままずらした同期間を参照する。
-        normal_reference_start = (
-            pd.Timestamp(start_date).normalize()
-            - pd.Timedelta(days=365)
+    selected_cpn_1 = st.sidebar.selectbox(
+        "施策①",
+        cpn_list,
+        index=cpn_list.index(default_primary),
+        key="planning_cpn_1",
+    )
+    start_date_1 = st.sidebar.date_input(
+        "施策① 開始",
+        today,
+        key="planning_start_1",
+    )
+    end_date_1 = st.sidebar.date_input(
+        "施策① 終了",
+        today + datetime.timedelta(days=7),
+        key="planning_end_1",
+    )
+
+    use_second_period = st.sidebar.toggle(
+        "施策②を追加",
+        value=False,
+        key="planning_use_second",
+    )
+
+    selected_cpn_2 = None
+    start_date_2 = None
+    end_date_2 = None
+    if use_second_period:
+        default_second = "マジ得" if "マジ得" in cpn_list else cpn_list[0]
+        selected_cpn_2 = st.sidebar.selectbox(
+            "施策②",
+            cpn_list,
+            index=cpn_list.index(default_second),
+            key="planning_cpn_2",
         )
-        normal_reference_end = (
-            pd.Timestamp(end_date).normalize()
-            - pd.Timedelta(days=365)
+        start_date_2 = st.sidebar.date_input(
+            "施策② 開始",
+            end_date_1 + datetime.timedelta(days=1),
+            key="planning_start_2",
+        )
+        end_date_2 = st.sidebar.date_input(
+            "施策② 終了",
+            end_date_1 + datetime.timedelta(days=7),
+            key="planning_end_2",
         )
 
-        normal_reference = history_df[
-            history_df["date"].between(
-                normal_reference_start,
-                normal_reference_end,
-            )
-            & history_df["CPN名"].isin(normal_labels)
-        ].copy()
+    planning_segments = [
+        {"label": "施策①", "cpn": selected_cpn_1, "start": start_date_1, "end": end_date_1}
+    ]
+    if use_second_period:
+        planning_segments.append(
+            {"label": "施策②", "cpn": selected_cpn_2, "start": start_date_2, "end": end_date_2}
+        )
 
-        base_pair = _daily_pair_average(normal_reference)
-        base_pair = base_pair[
-            base_pair["media"].isin(selected_media)
-        ]
-
-        if base_pair.empty:
-            st.error(
-                "365日前の同期間に定常実績がありません。"
-                "実績CSVとCPNマスタの『定常／通常』登録を確認してください。"
-            )
+    for seg in planning_segments:
+        if seg["start"] > seg["end"]:
+            st.error(f"{seg['label']}の開始日は終了日以前にしてください。")
             st.stop()
 
-        st.subheader("📈 前年同期間の定常実績")
-        st.caption(
-            f"参照期間: "
-            f"{normal_reference_start.date()} ～ "
-            f"{normal_reference_end.date()}"
-            "（予測期間の365日前）"
-        )
-
-        normal_display = (
-            normal_reference.groupby(
-                ["date", "media"],
-                as_index=False,
-            )["cv"]
-            .sum()
-            .groupby(
-                "media",
-                as_index=False,
-            )["cv"]
-            .mean()
-            .rename(
-                columns={
-                    "media": "媒体",
-                    "cv": "前年同期間の定常CV/日",
-                }
-            )
-        )
-
-        normal_display["前年同期間の定常CV/日"] = (
-            normal_display["前年同期間の定常CV/日"]
-            .round(2)
-        )
-
-        st.dataframe(
-            normal_display,
-            width="stretch",
-            hide_index=True,
-        )
-
-    else:
-        # 実績内に存在する同一CPNの連続期間を候補化し、複数選択できるようにする。
-        available_periods = get_cpn_reference_periods(
-            history_df,
-            selected_cpn,
-        )
-
-        if not available_periods:
-            st.error(
-                f"実績内に『{selected_cpn}』のキャンペーン期間がありません。"
-            )
+    if use_second_period:
+        r1 = pd.date_range(start_date_1, end_date_1)
+        r2 = pd.date_range(start_date_2, end_date_2)
+        if len(r1.intersection(r2)) > 0:
+            st.error("施策①と施策②の期間が重複しています。期間が重ならないように設定してください。")
             st.stop()
 
-        period_options = {
-            f"{start.strftime('%Y/%m/%d')} ～ "
-            f"{end.strftime('%Y/%m/%d')}": (start, end)
-            for start, end in available_periods
-        }
-
-        selected_period_labels = st.sidebar.multiselect(
-            "CPN参照期間（複数選択可）",
-            options=list(period_options.keys()),
-            default=list(period_options.keys()),
+    # 定常の基礎値は、選択月度の定常実績の日平均から算出する。
+    needs_normal_learning = any(seg["cpn"] in normal_labels for seg in planning_segments)
+    selected_learning_months = []
+    if needs_normal_learning:
+        normal_month_source = history_df[
+            history_df["CPN名"].isin(normal_labels)
+            & history_df["月度"].astype(str).ne("未設定")
+        ][["date", "月度"]].copy()
+        normal_month_order = (
+            normal_month_source.groupby("月度", as_index=False)
+            .agg(last_date=("date", "max"))
+            .sort_values(["last_date", "月度"], kind="stable")
         )
+        month_options = normal_month_order["月度"].astype(str).tolist()
+        default_months = month_options[-6:] if len(month_options) > 6 else month_options
 
-        if not selected_period_labels:
-            st.warning(
-                "CPN参照期間を1つ以上選択してください。"
-            )
+        selected_learning_months = st.sidebar.multiselect(
+            "定常 学習月度（複数選択）",
+            options=month_options,
+            default=default_months,
+            help="デフォルトは実績で読めた直近6月度。選択月度内の定常CV合計÷定常日数を基礎日平均にします。",
+        )
+        if not selected_learning_months:
+            st.warning("定常を使う場合は学習月度を1つ以上選択してください。")
             st.stop()
 
-        selected_periods = [
-            period_options[label]
-            for label in selected_period_labels
-        ]
+    segment_bases = []
+    reference_descriptions = []
 
-        base_pair = calculate_selected_cpn_base(
-            history_df,
-            selected_cpn,
-            selected_periods,
-        )
-
-        base_pair = base_pair[
-            base_pair["media"].isin(selected_media)
-        ]
-
-        if base_pair.empty:
-            st.error(
-                "選択したCPN参照期間に対象媒体の実績がありません。"
+    for seg_idx, seg in enumerate(planning_segments, start=1):
+        selected_cpn = seg["cpn"]
+        if selected_cpn in normal_labels:
+            base_pair_seg = calculate_normal_month_base(
+                history_df,
+                selected_learning_months,
             )
+            if base_pair_seg.empty:
+                st.error("選択した月度に定常実績がありません。")
+                st.stop()
+            reference_key_seg = ("normal_months", tuple(selected_learning_months))
+            reference_descriptions.append(
+                f"{seg['label']} {selected_cpn}: 定常学習月度 " + ", ".join(selected_learning_months)
+            )
+        else:
+            available_periods = get_cpn_reference_periods(history_df, selected_cpn)
+            if not available_periods:
+                st.error(f"実績内に『{selected_cpn}』のキャンペーン期間がありません。")
+                st.stop()
+
+            period_options = {
+                f"{p_start.strftime('%Y/%m/%d')} ～ {p_end.strftime('%Y/%m/%d')}": (p_start, p_end)
+                for p_start, p_end in available_periods
+            }
+            selected_period_labels = st.sidebar.multiselect(
+                f"{seg['label']} {selected_cpn} 参照期間",
+                options=list(period_options.keys()),
+                default=list(period_options.keys()),
+                key=f"cpn_reference_periods_{seg_idx}",
+            )
+            if not selected_period_labels:
+                st.warning(f"{seg['label']}の参照期間を1つ以上選択してください。")
+                st.stop()
+            selected_periods = [period_options[label] for label in selected_period_labels]
+            base_pair_seg = calculate_selected_cpn_base(
+                history_df,
+                selected_cpn,
+                selected_periods,
+            )
+            if base_pair_seg.empty:
+                st.error(f"{seg['label']}の選択参照期間に対象媒体の実績がありません。")
+                st.stop()
+            reference_key_seg = (selected_cpn, tuple(selected_period_labels))
+            reference_descriptions.append(
+                f"{seg['label']} {selected_cpn}: " + " / ".join(selected_period_labels)
+            )
+
+        base_pair_seg = base_pair_seg[base_pair_seg["media"].isin(selected_media)].copy()
+        if base_pair_seg.empty:
+            st.error(f"{seg['label']}の学習実績に対象媒体がありません。")
             st.stop()
-
-        total_reference_days = sum(
-            (end - start).days + 1
-            for start, end in selected_periods
+        segment_bases.append(
+            {**seg, "base_pair": base_pair_seg, "reference_key": reference_key_seg}
         )
 
-        st.subheader("📈 選択CPN期間の実績")
-        st.caption(
-            f"選択期間: {len(selected_periods)}期間 / "
-            f"合計 {total_reference_days}日。"
-            " 選択期間のCV・COST合計を合計日数で割った"
-            "日平均を予測ベースに使用します。"
-        )
+    st.subheader("📈 予測ベース")
+    st.caption(
+        "定常は選択月度の定常日平均、その他施策は選択した過去CPN期間の日平均を使用します。"
+    )
+    for desc in reference_descriptions:
+        st.write(f"・{desc}")
 
-        for label in selected_period_labels:
-            st.write(f"・{label}")
-
-        cpn_display = (
-            base_pair.groupby(
-                "media",
-                as_index=False,
-            )
-            .agg(
-                **{
-                    "選択期間CV/日": ("base_cv", "sum"),
-                    "選択期間COST/日": ("cost", "sum"),
-                }
-            )
-            .rename(
-                columns={"media": "媒体"}
-            )
+    base_preview_rows = []
+    for seg in segment_bases:
+        tmp = (
+            seg["base_pair"].groupby("media", as_index=False)
+            .agg(base_cv=("base_cv", "sum"), cost=("cost", "sum"))
         )
+        tmp["施策"] = seg["label"] + "：" + seg["cpn"]
+        base_preview_rows.append(tmp)
+    base_preview = pd.concat(base_preview_rows, ignore_index=True)
+    base_preview = base_preview.rename(
+        columns={"media": "媒体", "base_cv": "基礎CV/日", "cost": "基礎COST/日"}
+    )
+    base_preview["基礎CV/日"] = base_preview["基礎CV/日"].round(2)
+    base_preview["基礎COST/日"] = base_preview["基礎COST/日"].round(0)
+    st.dataframe(
+        base_preview[["施策", "媒体", "基礎CV/日", "基礎COST/日"]],
+        width="stretch",
+        hide_index=True,
+    )
 
-        cpn_display["選択期間CV/日"] = (
-            cpn_display["選択期間CV/日"]
-            .round(2)
-        )
-
-        cpn_display["選択期間COST/日"] = (
-            cpn_display["選択期間COST/日"]
-            .round(0)
-        )
-
-        st.dataframe(
-            cpn_display,
-            width="stretch",
-            hide_index=True,
-        )
+    # 既存関数との互換用。提出用の代表施策は施策①とするが、
+    # 日別施策はfuture_df側へ保持して複合期間を正しく予測する。
+    selected_cpn = selected_cpn_1
+    start_date = min(seg["start"] for seg in planning_segments)
+    end_date = max(seg["end"] for seg in planning_segments)
+    base_pair = pd.concat([seg["base_pair"] for seg in segment_bases], ignore_index=True)
 
     st.sidebar.header("🎯 最適化ロジック")
 
@@ -2191,6 +2263,8 @@ if uploaded_file and uploaded_master:
     # ---------------------------------------------------------
     factor_cache_key = (
         tuple(selected_media),
+        tuple(selected_product_ids),
+        bool(exclude_compensation),
         len(history_df),
         str(history_df["date"].min()),
         str(history_df["date"].max()),
@@ -2252,19 +2326,21 @@ if uploaded_file and uploaded_master:
     # Streamlitのボタン押下ではスクリプト全体が再実行されるが、
     # 入力条件が同じならここでは再計算しない。
     # ---------------------------------------------------------
-    if is_normal_selected:
-        reference_key = (
-            str(normal_reference_start),
-            str(normal_reference_end),
+    reference_key = tuple(
+        (
+            seg["label"],
+            seg["cpn"],
+            str(seg["start"]),
+            str(seg["end"]),
+            seg["reference_key"],
         )
-    else:
-        reference_key = tuple(selected_period_labels)
+        for seg in segment_bases
+    )
 
     calc_key = (
         tuple(selected_media),
-        selected_cpn,
-        str(start_date),
-        str(end_date),
+        tuple(selected_product_ids),
+        bool(exclude_compensation),
         reference_key,
         opt_mode,
         len(base_pair),
@@ -2287,7 +2363,6 @@ if uploaded_file and uploaded_master:
         sim_report_table = cached_calc.get("sim_report_table")
         opt_report_table = cached_calc.get("opt_report_table")
 
-        # 旧キャッシュに表示用テーブルがない場合だけ1回作る。
         if sim_report_table is None:
             sim_report_table = create_report_table(sim_summary)
             cached_calc["sim_report_table"] = sim_report_table
@@ -2297,72 +2372,47 @@ if uploaded_file and uploaded_master:
             cached_calc["opt_report_table"] = opt_report_table
 
     else:
-        future_dates = pd.date_range(
-            start=start_date,
-            end=end_date,
-        )
+        future_parts = []
+        for seg in segment_bases:
+            future_dates = pd.date_range(start=seg["start"], end=seg["end"])
+            part = pd.DataFrame({"date": future_dates}).merge(
+                seg["base_pair"],
+                how="cross",
+            )
+            part["weekday"] = part["date"].dt.day_name()
+            part = add_business_edge_flags(part)
 
-        future_df = pd.DataFrame(
-            {"date": future_dates}
-        ).merge(
-            base_pair,
-            how="cross",
-        )
+            # CPNマスタからは月度・特殊日フラグだけ取得。
+            # 施策名そのものはUI選択を正とする。
+            part = part.merge(
+                cpn_master[
+                    [
+                        "日付",
+                        "月度",
+                        "line_oa_flag",
+                        "magitoku_after_flag",
+                    ]
+                ],
+                left_on="date",
+                right_on="日付",
+                how="left",
+            )
+            part["CPN名"] = seg["cpn"]
+            part["planning_segment"] = seg["label"]
+            part["月度"] = (
+                part["月度"]
+                .astype("string")
+                .str.strip()
+                .replace("", pd.NA)
+                .fillna(pd.Series(part["date"].dt.strftime("%Y年%m月度"), index=part.index))
+            )
+            part["line_oa_flag"] = part["line_oa_flag"].fillna(0).astype(int)
+            part["magitoku_after_flag"] = part["magitoku_after_flag"].fillna(0).astype(int)
+            part["cpn_factor"] = 1.0
+            future_parts.append(part)
 
-        future_df["weekday"] = (
-            future_df["date"].dt.day_name()
-        )
-
-        future_df = add_business_edge_flags(
-            future_df
-        )
-
-        future_df = future_df.merge(
-            cpn_master[
-                [
-                    "日付",
-                    "CPN名",
-                    "月度",
-                    "line_oa_flag",
-                    "magitoku_after_flag",
-                ]
-            ],
-            left_on="date",
-            right_on="日付",
-            how="left",
-        )
-
-        future_df["CPN名"] = (
-            future_df["CPN名"]
-            .fillna(selected_cpn)
-        )
-        future_df["月度"] = (
-            future_df["月度"]
-            .astype("string")
-            .str.strip()
-            .replace("", pd.NA)
-            .fillna("未設定")
-        )
-
-        future_df["line_oa_flag"] = (
-            future_df["line_oa_flag"]
-            .fillna(0)
-            .astype(int)
-        )
-
-        future_df["magitoku_after_flag"] = (
-            future_df["magitoku_after_flag"]
-            .fillna(0)
-            .astype(int)
-        )
-
-        # キャンペーン平均をbase_cvとして直接使用するため、CPN倍率は掛けない。
-        future_df["cpn_factor"] = 1.0
-
-        forecast_df = forecast_cv(
-            future_df,
-            factor_tables,
-        )
+        future_df = pd.concat(future_parts, ignore_index=True)
+        forecast_df = forecast_cv(future_df, factor_tables)
 
         forecast_df = enforce_premium_media_cost(
             forecast_df
@@ -2378,9 +2428,12 @@ if uploaded_file and uploaded_master:
             forecast_df
         )
 
+        sim_group_cols = ["date", "media", "plan"]
+        if "CPN名" in sim_df.columns:
+            sim_group_cols.append("CPN名")
         sim_summary = (
             sim_df.groupby(
-                ["date", "media", "plan"],
+                sim_group_cols,
                 as_index=False,
             )
             .agg(
@@ -2407,9 +2460,12 @@ if uploaded_file and uploaded_master:
             opt_mode,
         )
 
+        opt_group_cols = ["date", "media", "plan"]
+        if "CPN名" in opt_df.columns:
+            opt_group_cols.append("CPN名")
         opt_summary = (
             opt_df.groupby(
-                ["date", "media", "plan"],
+                opt_group_cols,
                 as_index=False,
             )
             .agg(
@@ -2503,6 +2559,25 @@ if uploaded_file and uploaded_master:
         selected_cpn=selected_cpn,
         calc_key=calc_key,
     )
+
+    # 過去実績分析には、手動設定後の今回プランを「今回」として単価帯グラフへ追加する。
+    current_manual_for_chart = _normalize_manual_settings(
+        st.session_state.get(
+            "_manual_settings",
+            _build_manual_settings_defaults(
+                opt_summary=opt_summary,
+                history_df=history_df,
+                selected_cpn=selected_cpn,
+            ),
+        )
+    )
+    try:
+        render_history_analytics(
+            history_df,
+            current_plan_df=current_manual_for_chart,
+        )
+    except ValueError as analytics_exc:
+        st.warning(f"月度別実績を集計できません。{analytics_exc}")
 
     submission_filename = (
         f"【提出用】楽天カード"
