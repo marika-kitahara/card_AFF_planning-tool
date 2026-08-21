@@ -65,7 +65,6 @@ def _read_csv_with_fallback(file) -> pd.DataFrame:
 
 
 def _normalize_id_value(value) -> str:
-    """Excel/CSV由来のIDを 12345.0 ではなく 12345 のように安定して文字列化する。"""
     if pd.isna(value):
         return ""
     if isinstance(value, float) and value.is_integer():
@@ -76,209 +75,106 @@ def _normalize_id_value(value) -> str:
     return text
 
 
-
 def load_media_master(file, sheet_name: str = "媒体名マスタ") -> pd.DataFrame:
-    """
-    CPNマスタExcel内の媒体名マスタシートを読み込む。
-    A:SID / B:媒体名 / C:カテゴリ想定。
-    """
+    """CPNマスタExcel内の媒体名マスタを読み込む。A:SID / B:媒体名 / C:カテゴリ。"""
     if hasattr(file, "seek"):
         file.seek(0)
-    media_master = pd.read_excel(
-        file,
-        sheet_name=sheet_name,
-        engine="openpyxl",
-    )
+    media_master = pd.read_excel(file, sheet_name=sheet_name, engine="openpyxl")
 
     required_columns = {"SID", "媒体名"}
     missing = required_columns - set(media_master.columns)
     if missing:
-        raise ValueError(
-            "媒体名マスタに必要な列がありません: "
-            + ", ".join(sorted(missing))
-        )
+        raise ValueError("媒体名マスタに必要な列がありません: " + ", ".join(sorted(missing)))
 
     media_master = media_master.copy()
     media_master["SID"] = media_master["SID"].map(_normalize_id_value)
-    media_master["媒体名"] = (
-        media_master["媒体名"].astype("string").str.strip()
-    )
+    media_master["媒体名"] = media_master["媒体名"].astype("string").str.strip()
 
     if "カテゴリ" not in media_master.columns:
         media_master["カテゴリ"] = "未分類"
 
     media_master["カテゴリ"] = (
-        media_master["カテゴリ"]
-        .astype("string")
-        .str.strip()
-        .replace("", pd.NA)
-        .fillna("未分類")
+        media_master["カテゴリ"].astype("string").str.strip().replace("", pd.NA).fillna("未分類")
     )
-
     media_master = media_master[media_master["SID"].ne("")].copy()
     media_master = media_master.drop_duplicates(subset=["SID"], keep="last")
-
     return media_master[["SID", "媒体名", "カテゴリ"]]
 
-def _normalize_flag_text(value) -> str:
-    if pd.isna(value):
-        return ""
-    return str(value).strip().lower()
 
-
-def _find_approval_column(df: pd.DataFrame):
+def load_data(file, exclude_compensation: bool = True) -> pd.DataFrame:
     """
-    実績CSVから承認判定列を自動検出する。
+    実績CSVをプランニング用の日次データへ整形する。
 
-    優先:
-      承認フラグ / 承認状況 / 承認ステータス / 承認 / 成果承認フラグ
+    位置指定ルール（ユーザー仕様）:
+      A列: 成果フラグ Y / D / N。Nは完全除外。
+      C列: 商品ID（列名『商品ID』も必須）。
+      F列: SID。
+      P列: 補填情報。文字列が入っている行は補填対象。
+      W列: グロス。0円は成果対象外として完全除外。
 
-    上記が無い場合は、列名に「承認」を含み、
-    値に Y/N・1/0・承認/否認 等が含まれる列を探す。
+    集計ルール:
+      発生件数(cv): Y + D（ただしN・グロス0・補填除外行は対象外）
+      発行数(approved_cv): Yのみ
+      コスト(cost): Yのみ
+      承認率分母(approval_base_cv): Y + D の発生件数
     """
-    exact_candidates = [
-        "承認フラグ",
-        "成果承認フラグ",
-        "承認状況",
-        "承認ステータス",
-        "承認",
-    ]
-
-    for col in exact_candidates:
-        if col in df.columns:
-            return col
-
-    positive = {
-        "y", "yes", "1", "1.0", "true",
-        "○", "〇", "承認", "approved", "確定", "有効",
-    }
-    negative = {
-        "n", "no", "0", "0.0", "false",
-        "×", "x", "否認", "非承認", "却下", "rejected", "無効",
-    }
-
-    for col in df.columns:
-        if "承認" not in str(col):
-            continue
-
-        sample = (
-            df[col]
-            .dropna()
-            .head(500)
-            .map(_normalize_flag_text)
-        )
-        values = set(sample.unique())
-
-        if values & positive or values & negative:
-            return col
-
-    return None
-
-
-def _approval_mask(series: pd.Series) -> pd.Series:
-    """承認列を True / False / NA に変換する。"""
-    positive = {
-        "y", "yes", "1", "1.0", "true",
-        "○", "〇", "承認", "approved", "確定", "有効",
-    }
-    negative = {
-        "n", "no", "0", "0.0", "false",
-        "×", "x", "否認", "非承認", "却下", "rejected", "無効",
-    }
-
-    normalized = series.map(_normalize_flag_text)
-
-    result = pd.Series(pd.NA, index=series.index, dtype="boolean")
-    result.loc[normalized.isin(positive)] = True
-    result.loc[normalized.isin(negative)] = False
-    return result
-
-
-def load_data(file) -> pd.DataFrame:
     df = _read_csv_with_fallback(file)
 
     missing = REQUIRED_HISTORY_COLUMNS - set(df.columns)
     if missing:
+        raise ValueError(f"実績CSVに必要な列がありません: {', '.join(sorted(missing))}")
+
+    if df.shape[1] < 23:
         raise ValueError(
-            f"実績CSVに必要な列がありません: {', '.join(sorted(missing))}"
+            "実績CSVは少なくともW列まで必要です。"
+            "A列=成果フラグ、F列=SID、P列=補填、W列=グロスを使用します。"
         )
 
     df = df.copy()
 
-    if df.shape[1] < 6:
-        raise ValueError(
-            "実績CSVにF列がありません。"
-            "SIDは実績データのF列から取得します。"
-        )
+    # 位置指定列を先に保持。列名変更の影響を受けないようにする。
+    result_flag = df.iloc[:, 0].astype("string").fillna("").str.strip().str.upper()
+    compensation_raw = df.iloc[:, 15]
+    gross_raw = pd.to_numeric(df.iloc[:, 22], errors="coerce").fillna(0.0)
 
-    # SIDはユーザー仕様どおり「実績データのF列」を正とする。
     df["SID"] = df.iloc[:, 5].map(_normalize_id_value)
-
-    df["media"] = (
-        df["パートナーサイト名"]
-        .astype(str)
-        .str.strip()
-    )
-    df["cv"] = pd.to_numeric(
-        df["件数"],
-        errors="coerce",
-    )
-    df["cost"] = pd.to_numeric(
-        df["報酬額"],
-        errors="coerce",
-    )
+    df["media"] = df["パートナーサイト名"].astype(str).str.strip()
+    df["cv"] = pd.to_numeric(df["件数"], errors="coerce")
+    raw_cost = pd.to_numeric(df["報酬額"], errors="coerce").fillna(0.0)
     df["商品ID"] = df["商品ID"].map(_normalize_id_value)
 
-    # ---------------------------------------------------------
-    # 発行実績を保持
-    # ユーザー仕様:
-    #   成果承認フラグ == "Y" の件数が「発行数」
-    #
-    # approval_rate = 発行数 / 全件数
-    # future_issue  = Forecast × approval_rate
-    # ---------------------------------------------------------
-    approval_col = "成果承認フラグ"
+    # 補填判定: P列に「空白以外の文字列」が入っている行。
+    comp_text = compensation_raw.astype("string").fillna("").str.strip()
+    df["is_compensation"] = comp_text.ne("")
 
-    if approval_col not in df.columns:
-        raise ValueError(
-            "実績CSVに『成果承認フラグ』列がありません。"
-            "発行数は『成果承認フラグ = Y』の件数から算出します。"
-        )
+    # Nは常に対象外。W列グロス0も成果対象外。
+    valid_mask = result_flag.isin(["Y", "D"]) & gross_raw.ne(0)
+    if exclude_compensation:
+        valid_mask &= ~df["is_compensation"]
+    df = df.loc[valid_mask].copy()
+    result_flag = result_flag.loc[df.index]
+    raw_cost = raw_cost.loc[df.index]
 
-    approval_flag = (
-        df[approval_col]
-        .astype(str)
-        .str.strip()
-        .str.upper()
-    )
-
-    # Yの件数だけが発行数
+    # Yのみ発行数・コスト対象。Dは発生件数のみに残す。
+    y_mask = result_flag.eq("Y")
     df["approved_cv"] = 0.0
-    df.loc[approval_flag.eq("Y"), "approved_cv"] = (
-        df.loc[approval_flag.eq("Y"), "cv"]
-    )
-
-    # 承認率の分母は全発生件数
+    df.loc[y_mask, "approved_cv"] = df.loc[y_mask, "cv"]
     df["approval_base_cv"] = df["cv"]
-    df["approval_source_column"] = approval_col
+    df["cost"] = 0.0
+    df.loc[y_mask, "cost"] = raw_cost.loc[y_mask]
+    df["approval_source_column"] = "A列成果フラグ"
 
     df = add_flags(df)
-
-    df = df.dropna(
-        subset=["date", "cv", "cost"]
-    )
+    df = df.dropna(subset=["date", "cv", "cost"])
 
     if df.empty:
         raise ValueError(
             "有効な実績データがありません。"
-            "日付・件数・報酬額を確認してください。"
+            "N除外・グロス0除外・補填除外後の日付/件数/報酬額を確認してください。"
         )
 
     grouped = (
-        df.groupby(
-            ["date", "media", "SID", "商品ID"],
-            dropna=False,
-        )
+        df.groupby(["date", "media", "SID", "商品ID"], dropna=False)
         .agg(
             cv=("cv", "sum"),
             cost=("cost", "sum"),
@@ -291,10 +187,4 @@ def load_data(file) -> pd.DataFrame:
         )
         .reset_index()
     )
-
-    # 承認列未検出時、groupby(sum)で0扱いにならないよう戻す。
-    if approval_col is None:
-        grouped["approved_cv"] = pd.NA
-        grouped["approval_base_cv"] = pd.NA
-
     return grouped
