@@ -20,27 +20,11 @@ from openpyxl.cell.cell import MergedCell
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from data.loader import load_data, load_media_master
+from data.loader import load_data, load_master_workbook
 from logic.forecast import forecast_cv
 from logic.simulation import simulate_plan
 from logic.optimize import optimize_budget
 from logic.analytics import prepare_monthly_performance, prepare_unit_price_band_matrix
-
-
-@st.cache_data(show_spinner=False, max_entries=3)
-def _load_history_cached(file_bytes: bytes, exclude_compensation: bool) -> pd.DataFrame:
-    """アップロードCSVの再読込を防ぎ、Streamlit再実行時のメモリ急増を抑える。"""
-    return load_data(BytesIO(file_bytes), exclude_compensation=exclude_compensation)
-
-
-@st.cache_data(show_spinner=False, max_entries=3)
-def _load_master_cached(file_bytes: bytes):
-    """CPNマスタ/媒体名マスタを同じExcelから一度だけ読み込む。"""
-    buf = BytesIO(file_bytes)
-    cpn = pd.read_excel(buf, sheet_name="CPNマスタ", engine="openpyxl")
-    buf.seek(0)
-    media = load_media_master(buf, sheet_name="媒体名マスタ")
-    return cpn, media
 
 
 # -----------------------
@@ -571,9 +555,9 @@ def _normalize_manual_settings(df: pd.DataFrame) -> pd.DataFrame:
         * out["今回プラン採用承認率"]
     )
 
-    issue_denominator = out["承認件数"].where(out["承認件数"].ne(0))
     out["発行CPA"] = (
-        out["費用"] / issue_denominator
+        out["費用"]
+        / out["承認件数"].replace(0, pd.NA)
     ).fillna(0)
 
     out["今回採用件数"] = out["今回採用件数"].round(0)
@@ -1884,23 +1868,15 @@ if uploaded_file and uploaded_master:
         )
         from config.constants import RECENT_NORMAL_DAYS
 
-        # Streamlitはウィジェット操作のたびにスクリプト全体を再実行する。
-        # 60MB級CSVをその都度pd.read_csvすると瞬間的にメモリを大きく消費するため、
-        # ファイル内容をキーに整形済みDataFrameをキャッシュする。
-        history_bytes = uploaded_file.getvalue()
-        master_bytes = uploaded_master.getvalue()
-
-        history_df = _load_history_cached(
-            history_bytes,
-            exclude_compensation=exclude_compensation,
-        )
+        history_df = load_data(uploaded_file, exclude_compensation=exclude_compensation)
         history_df["date"] = pd.to_datetime(
             history_df["date"],
             errors="coerce",
         ).dt.normalize()
 
-        # CPNマスタ/媒体名マスタも再実行のたびにopenpyxlで読み直さない。
-        cpn_master, media_master = _load_master_cached(master_bytes)
+        # 同一Excel内の「CPNマスタ」「媒体名マスタ」を1回だけ読み込み、
+        # rerun時はキャッシュされた結果を再利用する。
+        cpn_master, media_master = load_master_workbook(uploaded_master)
 
         required_master_columns = {"日付", "CPN名", "月度"}
         missing_master = required_master_columns - set(cpn_master.columns)
@@ -1956,7 +1932,6 @@ if uploaded_file and uploaded_master:
             else 0
         )
 
-        # 媒体名マスタは上のキャッシュ読込で取得済み。
 
     except Exception as exc:
         st.error(f"ファイルの読み込みに失敗しました: {exc}")
