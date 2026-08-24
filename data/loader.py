@@ -1,4 +1,7 @@
+from io import BytesIO
+
 import pandas as pd
+import streamlit as st
 
 try:
     import jpholiday
@@ -13,6 +16,10 @@ REQUIRED_HISTORY_COLUMNS = {
     "報酬額",
     "商品ID",
 }
+
+# load_data() で位置指定して使う列。
+# A=0 / C=2 / F=5 / P=15 / W=22
+REQUIRED_HISTORY_POSITIONS = {0, 2, 5, 15, 22}
 
 
 def is_business_day(ts: pd.Timestamp) -> bool:
@@ -51,17 +58,60 @@ def add_flags(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _read_csv_with_fallback(file) -> pd.DataFrame:
+def _file_to_bytes(file) -> bytes:
+    """UploadedFile / BytesIO / 通常のfile-likeをbytesへ統一する。"""
+    if isinstance(file, bytes):
+        return file
+    if isinstance(file, bytearray):
+        return bytes(file)
+    if hasattr(file, "getvalue"):
+        return file.getvalue()
+    if hasattr(file, "seek"):
+        file.seek(0)
+    data = file.read()
+    if hasattr(file, "seek"):
+        file.seek(0)
+    return data
+
+
+def _read_csv_selected_columns(raw_bytes: bytes, encoding: str) -> pd.DataFrame:
+    """必要列だけ読むことで巨大CSVのピークメモリを抑える。"""
+    header = pd.read_csv(BytesIO(raw_bytes), encoding=encoding, nrows=0)
+
+    if len(header.columns) < 23:
+        raise ValueError(
+            "実績CSVは少なくともW列まで必要です。"
+            "A列=成果フラグ、F列=SID、P列=補填、W列=グロスを使用します。"
+        )
+
+    missing = REQUIRED_HISTORY_COLUMNS - set(header.columns)
+    if missing:
+        raise ValueError(f"実績CSVに必要な列がありません: {', '.join(sorted(missing))}")
+
+    named_positions = {header.columns.get_loc(name) for name in REQUIRED_HISTORY_COLUMNS}
+    usecols = sorted(REQUIRED_HISTORY_POSITIONS | named_positions)
+
+    return pd.read_csv(
+        BytesIO(raw_bytes),
+        encoding=encoding,
+        usecols=usecols,
+        low_memory=False,
+    )
+
+
+def _read_csv_with_fallback(raw_bytes: bytes) -> pd.DataFrame:
+    last_unicode_error = None
     for encoding in ("utf-8-sig", "cp932", "utf-8"):
         try:
-            file.seek(0)
-            return pd.read_csv(file, encoding=encoding)
-        except UnicodeDecodeError:
+            return _read_csv_selected_columns(raw_bytes, encoding)
+        except UnicodeDecodeError as exc:
+            last_unicode_error = exc
             continue
+
     raise ValueError(
         "CSVの文字コードを判定できませんでした。"
         "UTF-8またはShift-JISで保存してください。"
-    )
+    ) from last_unicode_error
 
 
 def _normalize_id_value(value) -> str:
@@ -75,12 +125,7 @@ def _normalize_id_value(value) -> str:
     return text
 
 
-def load_media_master(file, sheet_name: str = "媒体名マスタ") -> pd.DataFrame:
-    """CPNマスタExcel内の媒体名マスタを読み込む。A:SID / B:媒体名 / C:カテゴリ。"""
-    if hasattr(file, "seek"):
-        file.seek(0)
-    media_master = pd.read_excel(file, sheet_name=sheet_name, engine="openpyxl")
-
+def _normalize_media_master(media_master: pd.DataFrame) -> pd.DataFrame:
     required_columns = {"SID", "媒体名"}
     missing = required_columns - set(media_master.columns)
     if missing:
@@ -101,61 +146,79 @@ def load_media_master(file, sheet_name: str = "媒体名マスタ") -> pd.DataFr
     return media_master[["SID", "媒体名", "カテゴリ"]]
 
 
-def load_data(file, exclude_compensation: bool = True) -> pd.DataFrame:
-    """
-    実績CSVをプランニング用の日次データへ整形する。
+@st.cache_data(show_spinner=False, max_entries=2)
+def _load_master_workbook_cached(raw_bytes: bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """CPNマスタExcelを1回だけ開き、2シートをまとめてキャッシュする。"""
+    sheets = pd.read_excel(
+        BytesIO(raw_bytes),
+        sheet_name=["CPNマスタ", "媒体名マスタ"],
+        engine="openpyxl",
+    )
+    return sheets["CPNマスタ"], _normalize_media_master(sheets["媒体名マスタ"])
 
-    位置指定ルール（ユーザー仕様）:
-      A列: 成果フラグ Y / D / N。Nは完全除外。
-      C列: 商品ID（列名『商品ID』も必須）。
-      F列: SID。
-      P列: 補填情報。文字列が入っている行は補填対象。
-      W列: グロス。0円は成果対象外として完全除外。
 
-    集計ルール:
-      発生件数(cv): Y + D（ただしN・グロス0・補填除外行は対象外）
-      発行数(approved_cv): Yのみ
-      コスト(cost): Yのみ
-      承認率分母(approval_base_cv): Y + D の発生件数
-    """
-    df = _read_csv_with_fallback(file)
+def load_master_workbook(file) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """CPNマスタと媒体名マスタを同一Excelからまとめて読み込む。"""
+    raw_bytes = _file_to_bytes(file)
+    cpn_master, media_master = _load_master_workbook_cached(raw_bytes)
+    # 呼び出し側で加工するため、キャッシュ本体を直接変更しないようcopyして返す。
+    return cpn_master.copy(), media_master.copy()
 
-    missing = REQUIRED_HISTORY_COLUMNS - set(df.columns)
-    if missing:
-        raise ValueError(f"実績CSVに必要な列がありません: {', '.join(sorted(missing))}")
 
-    if df.shape[1] < 23:
-        raise ValueError(
-            "実績CSVは少なくともW列まで必要です。"
-            "A列=成果フラグ、F列=SID、P列=補填、W列=グロスを使用します。"
-        )
+def load_media_master(file, sheet_name: str = "媒体名マスタ") -> pd.DataFrame:
+    """後方互換用。通常は load_master_workbook() を使用する。"""
+    if sheet_name == "媒体名マスタ":
+        _, media_master = load_master_workbook(file)
+        return media_master
 
-    df = df.copy()
+    raw_bytes = _file_to_bytes(file)
+    media_master = pd.read_excel(BytesIO(raw_bytes), sheet_name=sheet_name, engine="openpyxl")
+    return _normalize_media_master(media_master)
 
-    # 位置指定列を先に保持。列名変更の影響を受けないようにする。
-    result_flag = df.iloc[:, 0].astype("string").fillna("").str.strip().str.upper()
-    compensation_raw = df.iloc[:, 15]
-    gross_raw = pd.to_numeric(df.iloc[:, 22], errors="coerce").fillna(0.0)
 
-    df["SID"] = df.iloc[:, 5].map(_normalize_id_value)
+@st.cache_data(show_spinner=False, max_entries=2)
+def _load_data_cached(raw_bytes: bytes, exclude_compensation: bool = True) -> pd.DataFrame:
+    """巨大CSVの読込～日次集計をキャッシュし、rerun時の再読込を防ぐ。"""
+    df = _read_csv_with_fallback(raw_bytes)
+
+    # usecolsで列数が減っているため、位置指定は元CSVの列名から取得する。
+    # ヘッダーを再度軽量に読み、A/F/P/Wの元列名を確定する。
+    header = None
+    for encoding in ("utf-8-sig", "cp932", "utf-8"):
+        try:
+            header = pd.read_csv(BytesIO(raw_bytes), encoding=encoding, nrows=0)
+            break
+        except UnicodeDecodeError:
+            continue
+    if header is None:
+        raise ValueError("CSVの文字コードを判定できませんでした。")
+
+    result_flag_col = header.columns[0]
+    sid_col = header.columns[5]
+    compensation_col = header.columns[15]
+    gross_col = header.columns[22]
+
+    result_flag = df[result_flag_col].astype("string").fillna("").str.strip().str.upper()
+    compensation_raw = df[compensation_col]
+    gross_raw = pd.to_numeric(df[gross_col], errors="coerce").fillna(0.0)
+
+    df["SID"] = df[sid_col].map(_normalize_id_value)
     df["media"] = df["パートナーサイト名"].astype(str).str.strip()
     df["cv"] = pd.to_numeric(df["件数"], errors="coerce")
     raw_cost = pd.to_numeric(df["報酬額"], errors="coerce").fillna(0.0)
     df["商品ID"] = df["商品ID"].map(_normalize_id_value)
 
-    # 補填判定: P列に「空白以外の文字列」が入っている行。
     comp_text = compensation_raw.astype("string").fillna("").str.strip()
     df["is_compensation"] = comp_text.ne("")
 
-    # Nは常に対象外。W列グロス0も成果対象外。
     valid_mask = result_flag.isin(["Y", "D"]) & gross_raw.ne(0)
     if exclude_compensation:
         valid_mask &= ~df["is_compensation"]
+
     df = df.loc[valid_mask].copy()
     result_flag = result_flag.loc[df.index]
     raw_cost = raw_cost.loc[df.index]
 
-    # Yのみ発行数・コスト対象。Dは発生件数のみに残す。
     y_mask = result_flag.eq("Y")
     df["approved_cv"] = 0.0
     df.loc[y_mask, "approved_cv"] = df.loc[y_mask, "cv"]
@@ -188,3 +251,28 @@ def load_data(file, exclude_compensation: bool = True) -> pd.DataFrame:
         .reset_index()
     )
     return grouped
+
+
+def load_data(file, exclude_compensation: bool = True) -> pd.DataFrame:
+    """
+    実績CSVをプランニング用の日次データへ整形する。
+
+    位置指定ルール（ユーザー仕様）:
+      A列: 成果フラグ Y / D / N。Nは完全除外。
+      C列: 商品ID（列名『商品ID』も必須）。
+      F列: SID。
+      P列: 補填情報。文字列が入っている行は補填対象。
+      W列: グロス。0円は成果対象外として完全除外。
+
+    集計ルール:
+      発生件数(cv): Y + D（ただしN・グロス0・補填除外行は対象外）
+      発行数(approved_cv): Yのみ
+      コスト(cost): Yのみ
+      承認率分母(approval_base_cv): Y + D の発生件数
+
+    メモリ対策:
+      - 必要列だけCSVから読み込む。
+      - 同じファイル・同じ補填条件なら日次集計結果を再利用する。
+    """
+    raw_bytes = _file_to_bytes(file)
+    return _load_data_cached(raw_bytes, exclude_compensation=exclude_compensation).copy()
