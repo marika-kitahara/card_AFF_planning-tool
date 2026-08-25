@@ -2117,6 +2117,16 @@ st.caption(
     "CPNマスタ内の『CPNマスタ』『媒体名マスタ』シートを使用します。"
     "ファイルはGitHubには保存されません。"
 )
+uploaded_file = st.file_uploader(
+    "① TG計測 実績CSV",
+    type=["csv"],
+    help="従来どおりのTG計測実績です。未アップロードでもAF計測実績があれば起動できます。",
+)
+
+st.markdown(
+    "📎 過去の成果データは[こちら](https://rak.box.com/s/90f38ar5w8lzijpbe1h2090fubwa0etw)"
+    "からDL、マージしてご使用ください。"
+)
 
 col1, col2 = st.columns(2)
 
