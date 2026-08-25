@@ -302,33 +302,58 @@ def _normalize_af_code(value) -> str:
 
 @st.cache_data(show_spinner=False, max_entries=4)
 def _load_af_data_cached(raw_bytes: bytes, filename: str, metric_name: str, valid_codes: tuple[str, ...]) -> pd.DataFrame:
-    """AF計測データを対象AFコードだけに絞り、日次件数へ集計する。"""
+    """AF横持ち実績を対象AFコード列だけ合計し、日次件数へ集計する。"""
     df = _read_tabular_with_fallback(raw_bytes, filename=filename)
     if df.empty:
         raise ValueError(f"{metric_name}実績データが空です。")
-    if "AFコード" not in df.columns:
-        raise ValueError(f"{metric_name}実績データに『AFコード』列がありません。")
-    if len(df.columns) < 1:
-        raise ValueError(f"{metric_name}実績データに日付列がありません。")
+    if len(df.columns) < 2:
+        raise ValueError(
+            f"{metric_name}実績データは、A列=日付、B列以降=AFコードの横持ち形式である必要があります。"
+        )
 
     date_col = df.columns[0]
-    work = df[[date_col, "AFコード"]].copy()
-    work["AFコード"] = work["AFコード"].map(_normalize_af_code)
     valid_code_set = set(valid_codes)
-    work = work[work["AFコード"].isin(valid_code_set)].copy()
+
+    # B列以降のヘッダーがAFコード。AFコードマスタA列と一致する列だけ集計対象にする。
+    # pandasが重複ヘッダーへ付ける '.1' 等は、元コード判定時だけ除去する。
+    matched_columns = []
+    for col in df.columns[1:]:
+        normalized_col = _normalize_af_code(col)
+        base_col = normalized_col.rsplit(".", 1)[0] if normalized_col.rsplit(".", 1)[-1].isdigit() else normalized_col
+        if normalized_col in valid_code_set or base_col in valid_code_set:
+            matched_columns.append(col)
+
+    if not matched_columns:
+        # 対象AFコード列がゼロの場合もエラーにはせず、日付だけ保持して0件として返す。
+        # AFコードの追加・削除で列構成が変動してもアプリ全体を止めないため。
+        raw_date = df[date_col].astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
+        parsed_yyyymmdd = pd.to_datetime(raw_date, format="%Y%m%d", errors="coerce")
+        parsed_fallback = pd.to_datetime(df[date_col], errors="coerce")
+        dates = parsed_yyyymmdd.fillna(parsed_fallback).dt.normalize()
+        result = pd.DataFrame({"date": dates}).dropna(subset=["date"])
+        result[metric_name] = 0
+        return result.groupby("date", as_index=False)[metric_name].sum()
+
+    work = df[[date_col] + matched_columns].copy()
 
     # A列の日付は 20260101 のような8桁数値/文字列を想定。
     raw_date = work[date_col].astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
     parsed_yyyymmdd = pd.to_datetime(raw_date, format="%Y%m%d", errors="coerce")
     parsed_fallback = pd.to_datetime(work[date_col], errors="coerce")
     work["date"] = parsed_yyyymmdd.fillna(parsed_fallback).dt.normalize()
+
+    # 各AFコード列のセル値が件数。文字列や空欄は0として扱い、行方向に合計する。
+    numeric_counts = work[matched_columns].apply(pd.to_numeric, errors="coerce").fillna(0)
+    work[metric_name] = numeric_counts.sum(axis=1)
     work = work.dropna(subset=["date"])
 
     if work.empty:
         return pd.DataFrame(columns=["date", metric_name])
 
-    result = work.groupby("date", as_index=False).size().rename(columns={"size": metric_name})
-    result[metric_name] = pd.to_numeric(result[metric_name], errors="coerce").fillna(0).astype(int)
+    result = work.groupby("date", as_index=False)[metric_name].sum()
+    # 件数は整数想定だが、元データに小数が混ざっても情報を落とさない。
+    if (result[metric_name] % 1 == 0).all():
+        result[metric_name] = result[metric_name].astype(int)
     return result
 
 
@@ -336,9 +361,10 @@ def load_af_data(file, af_code_master: pd.DataFrame, metric_name: str) -> pd.Dat
     """
     AF計測データを読み込む。
 
-    - 1列目(A列): 日付。20260101形式を日付へ変換
-    - 『AFコード』列: AFコードマスタA列と一致する行のみ対象
-    - 対象行1行を1件として日次集計
+    - A列: 日付。20260101形式を日付へ変換
+    - B列以降の1行目: AFコード
+    - AFコードマスタA列と一致するAFコード列だけを集計対象にする
+    - 各セルの数値が件数。対象列を行方向に合計して日次件数を作る
     """
     if af_code_master is None or af_code_master.empty:
         raise ValueError("CPNマスタの『AFコードマスタ』シートにAFコードがありません。")
