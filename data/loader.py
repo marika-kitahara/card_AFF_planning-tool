@@ -276,3 +276,107 @@ def load_data(file, exclude_compensation: bool = True) -> pd.DataFrame:
     """
     raw_bytes = _file_to_bytes(file)
     return _load_data_cached(raw_bytes, exclude_compensation=exclude_compensation).copy()
+
+
+def _read_tabular_with_fallback(raw_bytes: bytes, filename: str = "") -> pd.DataFrame:
+    """AF実績用。CSV/Excelのどちらでも全列を読み込む。"""
+    lower_name = str(filename or "").lower()
+    if lower_name.endswith((".xlsx", ".xlsm", ".xls")):
+        return pd.read_excel(BytesIO(raw_bytes), engine="openpyxl")
+
+    last_unicode_error = None
+    for encoding in ("utf-8-sig", "cp932", "utf-8"):
+        try:
+            return pd.read_csv(BytesIO(raw_bytes), encoding=encoding, low_memory=False)
+        except UnicodeDecodeError as exc:
+            last_unicode_error = exc
+            continue
+    raise ValueError(
+        "AF実績ファイルの文字コードを判定できませんでした。UTF-8またはShift-JISで保存してください。"
+    ) from last_unicode_error
+
+
+def _normalize_af_code(value) -> str:
+    return _normalize_id_value(value)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _load_af_data_cached(raw_bytes: bytes, filename: str, metric_name: str, valid_codes: tuple[str, ...]) -> pd.DataFrame:
+    """AF計測データを対象AFコードだけに絞り、日次件数へ集計する。"""
+    df = _read_tabular_with_fallback(raw_bytes, filename=filename)
+    if df.empty:
+        raise ValueError(f"{metric_name}実績データが空です。")
+    if "AFコード" not in df.columns:
+        raise ValueError(f"{metric_name}実績データに『AFコード』列がありません。")
+    if len(df.columns) < 1:
+        raise ValueError(f"{metric_name}実績データに日付列がありません。")
+
+    date_col = df.columns[0]
+    work = df[[date_col, "AFコード"]].copy()
+    work["AFコード"] = work["AFコード"].map(_normalize_af_code)
+    valid_code_set = set(valid_codes)
+    work = work[work["AFコード"].isin(valid_code_set)].copy()
+
+    # A列の日付は 20260101 のような8桁数値/文字列を想定。
+    raw_date = work[date_col].astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
+    parsed_yyyymmdd = pd.to_datetime(raw_date, format="%Y%m%d", errors="coerce")
+    parsed_fallback = pd.to_datetime(work[date_col], errors="coerce")
+    work["date"] = parsed_yyyymmdd.fillna(parsed_fallback).dt.normalize()
+    work = work.dropna(subset=["date"])
+
+    if work.empty:
+        return pd.DataFrame(columns=["date", metric_name])
+
+    result = work.groupby("date", as_index=False).size().rename(columns={"size": metric_name})
+    result[metric_name] = pd.to_numeric(result[metric_name], errors="coerce").fillna(0).astype(int)
+    return result
+
+
+def load_af_data(file, af_code_master: pd.DataFrame, metric_name: str) -> pd.DataFrame:
+    """
+    AF計測データを読み込む。
+
+    - 1列目(A列): 日付。20260101形式を日付へ変換
+    - 『AFコード』列: AFコードマスタA列と一致する行のみ対象
+    - 対象行1行を1件として日次集計
+    """
+    if af_code_master is None or af_code_master.empty:
+        raise ValueError("CPNマスタの『AFコードマスタ』シートにAFコードがありません。")
+    code_col = af_code_master.columns[0]
+    valid_codes = tuple(
+        sorted({
+            _normalize_af_code(v)
+            for v in af_code_master[code_col].tolist()
+            if _normalize_af_code(v) != ""
+        })
+    )
+    if not valid_codes:
+        raise ValueError("CPNマスタの『AFコードマスタ』A列に有効なAFコードがありません。")
+    raw_bytes = _file_to_bytes(file)
+    filename = getattr(file, "name", "")
+    return _load_af_data_cached(raw_bytes, filename, metric_name, valid_codes).copy()
+
+
+@st.cache_data(show_spinner=False, max_entries=2)
+def _load_master_workbook_with_af_cached(raw_bytes: bytes) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """CPN/媒体/AFコードの3シートをまとめて読み込む。AFコードマスタは任意。"""
+    book = pd.ExcelFile(BytesIO(raw_bytes), engine="openpyxl")
+    required = {"CPNマスタ", "媒体名マスタ"}
+    missing = required - set(book.sheet_names)
+    if missing:
+        raise ValueError("CPNマスタExcelに必要なシートがありません: " + ", ".join(sorted(missing)))
+
+    cpn_master = pd.read_excel(book, sheet_name="CPNマスタ")
+    media_master = _normalize_media_master(pd.read_excel(book, sheet_name="媒体名マスタ"))
+    af_code_master = (
+        pd.read_excel(book, sheet_name="AFコードマスタ")
+        if "AFコードマスタ" in book.sheet_names
+        else pd.DataFrame(columns=["AFコード"])
+    )
+    return cpn_master, media_master, af_code_master
+
+
+def load_master_workbook_with_af(file) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    raw_bytes = _file_to_bytes(file)
+    cpn_master, media_master, af_code_master = _load_master_workbook_with_af_cached(raw_bytes)
+    return cpn_master.copy(), media_master.copy(), af_code_master.copy()
