@@ -1973,7 +1973,21 @@ def _render_measurement_tabs(tg_df=None, af_df=None, af_code_df=None, key_prefix
                 tg_f.groupby("月度", as_index=False)[["TG申込", "TG発行"]].sum()
                 if "月度" in tg_f.columns else tg_f[["TG申込", "TG発行"]].sum().to_frame().T
             )
-            st.dataframe(monthly, width="stretch", hide_index=True)
+            monthly["承認率"] = (
+                monthly["TG発行"]
+                / monthly["TG申込"].replace(0, pd.NA)
+            ).fillna(0) * 100
+            st.dataframe(
+                monthly,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "承認率": st.column_config.NumberColumn(
+                        "承認率",
+                        format="%.1f%%",
+                    ),
+                },
+            )
             st.caption(f"期間合計：TG申込 {tg_f['TG申込'].sum():,.0f}件 / TG発行 {tg_f['TG発行'].sum():,.0f}件")
 
     if not af.empty:
@@ -1983,7 +1997,21 @@ def _render_measurement_tabs(tg_df=None, af_df=None, af_code_df=None, key_prefix
                 af_f.groupby("月度", as_index=False)[["AF申込", "AF発行"]].sum()
                 if "月度" in af_f.columns else af_f[["AF申込", "AF発行"]].sum().to_frame().T
             )
-            st.dataframe(monthly, width="stretch", hide_index=True)
+            monthly["承認率"] = (
+                monthly["AF発行"]
+                / monthly["AF申込"].replace(0, pd.NA)
+            ).fillna(0) * 100
+            st.dataframe(
+                monthly,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "承認率": st.column_config.NumberColumn(
+                        "承認率",
+                        format="%.1f%%",
+                    ),
+                },
+            )
             st.caption(f"期間合計：AF申込 {af_f['AF申込'].sum():,.0f}件 / AF発行 {af_f['AF発行'].sum():,.0f}件")
 
             if not af_code_f.empty:
