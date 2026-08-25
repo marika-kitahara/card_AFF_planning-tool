@@ -20,7 +20,7 @@ from openpyxl.cell.cell import MergedCell
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from data.loader import load_data, load_master_workbook
+from data.loader import load_data, load_master_workbook_with_af, load_af_data
 from logic.forecast import forecast_cv
 from logic.simulation import simulate_plan
 from logic.optimize import optimize_budget
@@ -1827,6 +1827,145 @@ def _calculate_normal_month_base(
     return result[columns]
 
 
+
+def _prepare_af_history(uploaded_af_apply, uploaded_af_issue, af_code_master, cpn_master):
+    """AF申込/発行を日次で結合し、CPN名・月度をTGと同じ日付基準で付与する。"""
+    frames = []
+    if uploaded_af_apply is not None:
+        frames.append(load_af_data(uploaded_af_apply, af_code_master, "AF申込"))
+    if uploaded_af_issue is not None:
+        frames.append(load_af_data(uploaded_af_issue, af_code_master, "AF発行"))
+    if not frames:
+        return pd.DataFrame(columns=["date", "AF申込", "AF発行", "CPN名", "月度"])
+
+    af = frames[0].copy()
+    for frame in frames[1:]:
+        af = af.merge(frame, on="date", how="outer")
+    for col in ["AF申込", "AF発行"]:
+        if col not in af.columns:
+            af[col] = 0
+        af[col] = pd.to_numeric(af[col], errors="coerce").fillna(0).astype(int)
+    af["date"] = pd.to_datetime(af["date"], errors="coerce").dt.normalize()
+
+    master_cols = [c for c in ["日付", "CPN名", "月度"] if c in cpn_master.columns]
+    master_for_merge = cpn_master[master_cols].copy()
+    master_for_merge["日付"] = pd.to_datetime(master_for_merge["日付"], errors="coerce").dt.normalize()
+    master_for_merge = master_for_merge.drop_duplicates(subset=["日付"], keep="last")
+    af = af.merge(master_for_merge, left_on="date", right_on="日付", how="left")
+    af["CPN名"] = af.get("CPN名", pd.Series(index=af.index, dtype="object")).fillna("通常")
+    af["月度"] = (
+        af.get("月度", pd.Series(index=af.index, dtype="object"))
+        .astype("string").str.strip().replace("", pd.NA).fillna("未設定")
+    )
+    return af.drop(columns=["日付"], errors="ignore").sort_values("date").reset_index(drop=True)
+
+
+def _tg_daily_measurement(history_df):
+    if history_df is None or history_df.empty:
+        return pd.DataFrame(columns=["date", "TG申込", "TG発行", "CPN名", "月度"])
+    work = history_df.copy()
+    agg = (
+        work.groupby("date", as_index=False)
+        .agg(TG申込=("cv", "sum"), TG発行=("approved_cv", "sum"))
+    )
+    meta_cols = [c for c in ["date", "CPN名", "月度"] if c in work.columns]
+    if len(meta_cols) > 1:
+        meta = work[meta_cols].drop_duplicates(subset=["date"], keep="last")
+        agg = agg.merge(meta, on="date", how="left")
+    return agg
+
+
+def _render_measurement_tabs(tg_df=None, af_df=None, key_prefix="measurement"):
+    """TG/AF単独表示と差分を、共通の期間・月度フィルタで表示する。"""
+    tg = _tg_daily_measurement(tg_df) if tg_df is not None else pd.DataFrame()
+    af = af_df.copy() if af_df is not None else pd.DataFrame()
+    if tg.empty and af.empty:
+        return
+
+    date_candidates = []
+    for df in (tg, af):
+        if not df.empty and "date" in df:
+            d = pd.to_datetime(df["date"], errors="coerce").dropna()
+            if not d.empty:
+                date_candidates.extend([d.min().date(), d.max().date()])
+    if not date_candidates:
+        return
+
+    st.sidebar.header("🔎 計測結果表示条件")
+    min_date, max_date = min(date_candidates), max(date_candidates)
+    filter_start = st.sidebar.date_input(
+        "実績表示 開始", min_date, min_value=min_date, max_value=max_date,
+        key=f"{key_prefix}_start",
+    )
+    filter_end = st.sidebar.date_input(
+        "実績表示 終了", max_date, min_value=min_date, max_value=max_date,
+        key=f"{key_prefix}_end",
+    )
+    month_values = sorted({
+        str(v) for df in (tg, af) if not df.empty and "月度" in df
+        for v in df["月度"].dropna().astype(str).tolist() if str(v).strip() and str(v) != "未設定"
+    })
+    selected_months = st.sidebar.multiselect(
+        "実績表示 月度", month_values, default=month_values, key=f"{key_prefix}_months"
+    ) if month_values else []
+
+    def apply_filters(df):
+        if df.empty:
+            return df.copy()
+        out = df.copy()
+        out["date"] = pd.to_datetime(out["date"], errors="coerce")
+        out = out[out["date"].dt.date.between(filter_start, filter_end)].copy()
+        if selected_months and "月度" in out.columns:
+            out = out[out["月度"].astype(str).isin(selected_months)].copy()
+        return out
+
+    tg_f = apply_filters(tg)
+    af_f = apply_filters(af)
+    tab_labels = []
+    if not tg.empty:
+        tab_labels.append("TG計測")
+    if not af.empty:
+        tab_labels.append("AF計測")
+    if not tg.empty and not af.empty:
+        tab_labels.append("TG・AF差分")
+    tabs = st.tabs(tab_labels)
+    idx = 0
+
+    if not tg.empty:
+        with tabs[idx]:
+            idx += 1
+            monthly = (
+                tg_f.groupby("月度", as_index=False)[["TG申込", "TG発行"]].sum()
+                if "月度" in tg_f.columns else tg_f[["TG申込", "TG発行"]].sum().to_frame().T
+            )
+            st.dataframe(monthly, width="stretch", hide_index=True)
+            st.caption(f"期間合計：TG申込 {tg_f['TG申込'].sum():,.0f}件 / TG発行 {tg_f['TG発行'].sum():,.0f}件")
+
+    if not af.empty:
+        with tabs[idx]:
+            idx += 1
+            monthly = (
+                af_f.groupby("月度", as_index=False)[["AF申込", "AF発行"]].sum()
+                if "月度" in af_f.columns else af_f[["AF申込", "AF発行"]].sum().to_frame().T
+            )
+            st.dataframe(monthly, width="stretch", hide_index=True)
+            st.caption(f"期間合計：AF申込 {af_f['AF申込'].sum():,.0f}件 / AF発行 {af_f['AF発行'].sum():,.0f}件")
+
+    if not tg.empty and not af.empty:
+        with tabs[idx]:
+            tg_month = tg_f.groupby("月度", as_index=False)[["TG申込", "TG発行"]].sum()
+            af_month = af_f.groupby("月度", as_index=False)[["AF申込", "AF発行"]].sum()
+            diff = tg_month.merge(af_month, on="月度", how="outer").fillna(0)
+            diff["申込差分(TG-AF)"] = diff["TG申込"] - diff["AF申込"]
+            diff["発行差分(TG-AF)"] = diff["TG発行"] - diff["AF発行"]
+            diff["申込差分率"] = (diff["申込差分(TG-AF)"] / diff["AF申込"].replace(0, pd.NA)).fillna(0)
+            diff["発行差分率"] = (diff["発行差分(TG-AF)"] / diff["AF発行"].replace(0, pd.NA)).fillna(0)
+            display = diff.copy()
+            display["申込差分率"] = display["申込差分率"].map(lambda x: f"{x:+.1%}")
+            display["発行差分率"] = display["発行差分率"].map(lambda x: f"{x:+.1%}")
+            st.dataframe(display, width="stretch", hide_index=True)
+            st.caption("差分は TG − AF。プラスならTG計測の方が多く、マイナスならAF計測の方が多い値です。")
+
 # -----------------------
 # ✅ UI
 # -----------------------
@@ -1841,22 +1980,41 @@ st.caption(
 col1, col2 = st.columns(2)
 
 with col1:
-    uploaded_file = st.file_uploader("① 実績CSV", type=["csv"])
+    uploaded_file = st.file_uploader(
+        "① TG計測 実績CSV",
+        type=["csv"],
+        help="従来どおりのTG計測実績です。未アップロードでもAF計測実績があれば起動できます。",
+    )
+    uploaded_af_apply = st.file_uploader(
+        "③ AF計測 申込実績",
+        type=["csv", "xlsx", "xlsm"],
+        help="A列=日付、ヘッダーに『AFコード』列を含むAF申込実績。",
+    )
 
 with col2:
     uploaded_master = st.file_uploader(
         "② CPNマスタ",
         type=["xlsx", "xlsm"],
-        help="『CPNマスタ』『媒体名マスタ』の2シートを含むExcelをアップロードしてください。",
+        help="『CPNマスタ』『媒体名マスタ』に加え、AF計測利用時は『AFコードマスタ』シートを使用します。",
+    )
+    uploaded_af_issue = st.file_uploader(
+        "④ AF計測 発行実績",
+        type=["csv", "xlsx", "xlsm"],
+        help="A列=日付、ヘッダーに『AFコード』列を含むAF発行実績。",
     )
 
-if uploaded_file and uploaded_master:
-    st.sidebar.header("⚙️ 実績データ条件")
-    exclude_compensation = st.sidebar.toggle(
-        "補填を除外",
-        value=True,
-        help="ON: 実績データP列に文字列が入っている補填対象行を除外します。",
-    )
+has_af_data = uploaded_af_apply is not None or uploaded_af_issue is not None
+has_any_actual = uploaded_file is not None or has_af_data
+
+if uploaded_master and has_any_actual:
+    exclude_compensation = True
+    if uploaded_file is not None:
+        st.sidebar.header("⚙️ 実績データ条件")
+        exclude_compensation = st.sidebar.toggle(
+            "補填を除外",
+            value=True,
+            help="ON: TG実績データP列に文字列が入っている補填対象行を除外します。",
+        )
 
     try:
         from data.loader import add_business_edge_flags
@@ -1868,15 +2026,17 @@ if uploaded_file and uploaded_master:
         )
         from config.constants import RECENT_NORMAL_DAYS
 
-        history_df = load_data(uploaded_file, exclude_compensation=exclude_compensation)
-        history_df["date"] = pd.to_datetime(
-            history_df["date"],
-            errors="coerce",
-        ).dt.normalize()
+        history_df = pd.DataFrame()
+        if uploaded_file is not None:
+            history_df = load_data(uploaded_file, exclude_compensation=exclude_compensation)
+            history_df["date"] = pd.to_datetime(
+                history_df["date"],
+                errors="coerce",
+            ).dt.normalize()
 
         # 同一Excel内の「CPNマスタ」「媒体名マスタ」を1回だけ読み込み、
         # rerun時はキャッシュされた結果を再利用する。
-        cpn_master, media_master = load_master_workbook(uploaded_master)
+        cpn_master, media_master, af_code_master = load_master_workbook_with_af(uploaded_master)
 
         required_master_columns = {"日付", "CPN名", "月度"}
         missing_master = required_master_columns - set(cpn_master.columns)
@@ -1932,9 +2092,19 @@ if uploaded_file and uploaded_master:
             else 0
         )
 
+        af_history_df = _prepare_af_history(
+            uploaded_af_apply, uploaded_af_issue, af_code_master, cpn_master
+        ) if has_af_data else pd.DataFrame()
+
 
     except Exception as exc:
         st.error(f"ファイルの読み込みに失敗しました: {exc}")
+        st.stop()
+
+    if uploaded_file is None:
+        st.subheader("📊 計測結果")
+        _render_measurement_tabs(tg_df=None, af_df=af_history_df, key_prefix="af_only")
+        st.info("AF計測実績のみを読み込みました。TG実績がないため、従来の媒体別予測・最適化・提出用Excel生成は表示していません。")
         st.stop()
 
     history_df = history_df.merge(
@@ -1990,6 +2160,13 @@ if uploaded_file and uploaded_master:
         .str.strip()
         .replace("", pd.NA)
         .fillna("未分類")
+    )
+
+    st.subheader("📊 計測結果")
+    _render_measurement_tabs(
+        tg_df=history_df,
+        af_df=af_history_df if has_af_data else None,
+        key_prefix="measurement_compare",
     )
 
     st.sidebar.header("商品ID選択")
