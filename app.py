@@ -1935,10 +1935,31 @@ def _render_measurement_tabs(tg_df=None, af_df=None, af_code_df=None, key_prefix
         "実績表示 終了", max_date, min_value=min_date, max_value=max_date,
         key=f"{key_prefix}_end",
     )
+    # 月度は文字列順ではなく、年月として時系列順に並べる。
+    # 例: 2025年3月度 → 2025年4月度 → ... → 2025年12月度
+    import re
+
+    def _month_sort_key(value):
+        text = str(value).strip()
+        match = re.search(r"(\d{4})年\s*(\d{1,2})月度?", text)
+        if match:
+            return (int(match.group(1)), int(match.group(2)), text)
+        # 想定外の表記は最後に回す
+        return (9999, 99, text)
+
     month_values = sorted({
         str(v) for df in (tg, af) if not df.empty and "月度" in df
         for v in df["月度"].dropna().astype(str).tolist() if str(v).strip() and str(v) != "未設定"
-    })
+    }, key=_month_sort_key)
+
+    def _sort_monthly_rows(df):
+        """月度列を yyyy年m月度 の実年月順で並べる。"""
+        if df.empty or "月度" not in df.columns:
+            return df
+        out = df.copy()
+        out["_month_sort_key"] = out["月度"].map(_month_sort_key)
+        out = out.sort_values("_month_sort_key", kind="stable").drop(columns="_month_sort_key")
+        return out.reset_index(drop=True)
     selected_months = st.sidebar.multiselect(
         "実績表示 月度", month_values, default=month_values, key=f"{key_prefix}_months"
     ) if month_values else []
@@ -1973,6 +1994,7 @@ def _render_measurement_tabs(tg_df=None, af_df=None, af_code_df=None, key_prefix
                 tg_f.groupby("月度", as_index=False)[["TG申込", "TG発行"]].sum()
                 if "月度" in tg_f.columns else tg_f[["TG申込", "TG発行"]].sum().to_frame().T
             )
+            monthly = _sort_monthly_rows(monthly)
             monthly["承認率"] = (
                 monthly["TG発行"]
                 / monthly["TG申込"].replace(0, pd.NA)
@@ -1997,6 +2019,7 @@ def _render_measurement_tabs(tg_df=None, af_df=None, af_code_df=None, key_prefix
                 af_f.groupby("月度", as_index=False)[["AF申込", "AF発行"]].sum()
                 if "月度" in af_f.columns else af_f[["AF申込", "AF発行"]].sum().to_frame().T
             )
+            monthly = _sort_monthly_rows(monthly)
             monthly["承認率"] = (
                 monthly["AF発行"]
                 / monthly["AF申込"].replace(0, pd.NA)
@@ -2042,6 +2065,7 @@ def _render_measurement_tabs(tg_df=None, af_df=None, af_code_df=None, key_prefix
                     pivot = pivot.reindex(sorted(pivot.columns.astype(str)), axis=1)
                     pivot = pivot.reset_index()
                     pivot.columns.name = None
+                    pivot = _sort_monthly_rows(pivot)
 
                     value_cols = [c for c in pivot.columns if c != "月度"]
                     for col in value_cols:
@@ -2062,6 +2086,7 @@ def _render_measurement_tabs(tg_df=None, af_df=None, af_code_df=None, key_prefix
             tg_month = tg_f.groupby("月度", as_index=False)[["TG申込", "TG発行"]].sum()
             af_month = af_f.groupby("月度", as_index=False)[["AF申込", "AF発行"]].sum()
             diff = tg_month.merge(af_month, on="月度", how="outer").fillna(0)
+            diff = _sort_monthly_rows(diff)
             diff["申込差分(TG-AF)"] = diff["TG申込"] - diff["AF申込"]
             diff["発行差分(TG-AF)"] = diff["TG発行"] - diff["AF発行"]
             diff["TG承認率"] = (
