@@ -2064,9 +2064,19 @@ def _render_measurement_tabs(tg_df=None, af_df=None, af_code_df=None, key_prefix
             diff = tg_month.merge(af_month, on="月度", how="outer").fillna(0)
             diff["申込差分(TG-AF)"] = diff["TG申込"] - diff["AF申込"]
             diff["発行差分(TG-AF)"] = diff["TG発行"] - diff["AF発行"]
+            diff["TG承認率"] = (
+                diff["TG発行"] / diff["TG申込"].replace(0, pd.NA)
+            ).fillna(0)
+            diff["AF承認率"] = (
+                diff["AF発行"] / diff["AF申込"].replace(0, pd.NA)
+            ).fillna(0)
+            diff["承認率差分(TG-AF)"] = diff["TG承認率"] - diff["AF承認率"]
             diff["申込差分率"] = (diff["申込差分(TG-AF)"] / diff["AF申込"].replace(0, pd.NA)).fillna(0)
             diff["発行差分率"] = (diff["発行差分(TG-AF)"] / diff["AF発行"].replace(0, pd.NA)).fillna(0)
             display = diff.copy()
+            display["TG承認率"] = display["TG承認率"].map(lambda x: f"{x:.1%}")
+            display["AF承認率"] = display["AF承認率"].map(lambda x: f"{x:.1%}")
+            display["承認率差分(TG-AF)"] = display["承認率差分(TG-AF)"].map(lambda x: f"{x:+.1%}")
             display["申込差分率"] = display["申込差分率"].map(lambda x: f"{x:+.1%}")
             display["発行差分率"] = display["発行差分率"].map(lambda x: f"{x:+.1%}")
             st.dataframe(display, width="stretch", hide_index=True)
