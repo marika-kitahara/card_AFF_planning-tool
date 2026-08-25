@@ -1987,17 +1987,47 @@ def _render_measurement_tabs(tg_df=None, af_df=None, af_code_df=None, key_prefix
             st.caption(f"期間合計：AF申込 {af_f['AF申込'].sum():,.0f}件 / AF発行 {af_f['AF発行'].sum():,.0f}件")
 
             if not af_code_f.empty:
-                st.subheader("AFコード別集計")
-                code_summary = (
-                    af_code_f.groupby("AFコード", as_index=False)[["AF申込", "AF発行"]]
-                    .sum()
-                    .sort_values(["AF申込", "AF発行"], ascending=False, kind="stable")
-                    .reset_index(drop=True)
-                )
-                for col in ["AF申込", "AF発行"]:
-                    if (code_summary[col] % 1 == 0).all():
-                        code_summary[col] = code_summary[col].astype(int)
-                st.dataframe(code_summary, width="stretch", hide_index=True)
+                st.subheader("AFコード別 月度集計")
+
+                def _render_af_code_monthly_pivot(metric_name: str):
+                    if metric_name not in af_code_f.columns:
+                        return
+
+                    source = af_code_f[["月度", "AFコード", metric_name]].copy()
+                    source[metric_name] = pd.to_numeric(source[metric_name], errors="coerce").fillna(0)
+                    source = source[
+                        source["AFコード"].astype("string").fillna("").str.strip().ne("")
+                    ].copy()
+                    if source.empty:
+                        return
+
+                    pivot = source.pivot_table(
+                        index="月度",
+                        columns="AFコード",
+                        values=metric_name,
+                        aggfunc="sum",
+                        fill_value=0,
+                    )
+
+                    # 月度はCPNマスタに付与された値をそのまま表示し、
+                    # AFコード列はマスタ/実績側の並びに依存せず見やすく固定する。
+                    pivot = pivot.reindex(sorted(pivot.columns.astype(str)), axis=1)
+                    pivot = pivot.reset_index()
+                    pivot.columns.name = None
+
+                    value_cols = [c for c in pivot.columns if c != "月度"]
+                    for col in value_cols:
+                        numeric = pd.to_numeric(pivot[col], errors="coerce").fillna(0)
+                        if (numeric % 1 == 0).all():
+                            pivot[col] = numeric.astype(int)
+                        else:
+                            pivot[col] = numeric
+
+                    st.markdown(f"**{metric_name}**")
+                    st.dataframe(pivot, width="stretch", hide_index=True)
+
+                _render_af_code_monthly_pivot("AF申込")
+                _render_af_code_monthly_pivot("AF発行")
 
     if not tg.empty and not af.empty:
         with tabs[idx]:
