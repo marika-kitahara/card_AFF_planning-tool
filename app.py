@@ -2117,6 +2117,10 @@ st.caption(
     "CPNマスタ内の『CPNマスタ』『媒体名マスタ』シートを使用します。"
     "ファイルはGitHubには保存されません。"
 )
+st.markdown(
+    "📎 過去の成果データは[こちら](https://rak.box.com/s/90f38ar5w8lzijpbe1h2090fubwa0etw)"
+    "からDL、マージしてご使用ください。"
+)
 
 col1, col2 = st.columns(2)
 
