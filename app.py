@@ -1988,7 +1988,7 @@ with col1:
     uploaded_af_apply = st.file_uploader(
         "③ AF計測 申込実績",
         type=["csv", "xlsx", "xlsm"],
-        help="A列=日付、ヘッダーに『AFコード』列を含むAF申込実績。",
+        help="A列=日付（YYYYMMDD）、B列以降の1行目=AFコード、各セル=件数のAF申込実績。",
     )
 
 with col2:
@@ -2000,7 +2000,7 @@ with col2:
     uploaded_af_issue = st.file_uploader(
         "④ AF計測 発行実績",
         type=["csv", "xlsx", "xlsm"],
-        help="A列=日付、ヘッダーに『AFコード』列を含むAF発行実績。",
+        help="A列=日付（YYYYMMDD）、B列以降の1行目=AFコード、各セル=件数のAF発行実績。",
     )
 
 has_af_data = uploaded_af_apply is not None or uploaded_af_issue is not None
