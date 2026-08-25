@@ -20,7 +20,7 @@ from openpyxl.cell.cell import MergedCell
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from data.loader import load_data, load_master_workbook_with_af, load_af_data
+from data.loader import load_data, load_master_workbook_with_af, load_af_data, load_af_code_data
 from logic.forecast import forecast_cv
 from logic.simulation import simulate_plan
 from logic.optimize import optimize_budget
@@ -1860,6 +1860,39 @@ def _prepare_af_history(uploaded_af_apply, uploaded_af_issue, af_code_master, cp
     return af.drop(columns=["日付"], errors="ignore").sort_values("date").reset_index(drop=True)
 
 
+def _prepare_af_code_history(uploaded_af_apply, uploaded_af_issue, af_code_master, cpn_master):
+    """AF申込/発行を日付×AFコード単位で結合し、月度を付与する。"""
+    frames = []
+    if uploaded_af_apply is not None:
+        frames.append(load_af_code_data(uploaded_af_apply, af_code_master, "AF申込"))
+    if uploaded_af_issue is not None:
+        frames.append(load_af_code_data(uploaded_af_issue, af_code_master, "AF発行"))
+    if not frames:
+        return pd.DataFrame(columns=["date", "AFコード", "AF申込", "AF発行", "月度"])
+
+    af = frames[0].copy()
+    for frame in frames[1:]:
+        af = af.merge(frame, on=["date", "AFコード"], how="outer")
+    for col in ["AF申込", "AF発行"]:
+        if col not in af.columns:
+            af[col] = 0
+        af[col] = pd.to_numeric(af[col], errors="coerce").fillna(0)
+
+    af["date"] = pd.to_datetime(af["date"], errors="coerce").dt.normalize()
+    master_cols = [c for c in ["日付", "月度"] if c in cpn_master.columns]
+    if "日付" in master_cols:
+        master = cpn_master[master_cols].copy()
+        master["日付"] = pd.to_datetime(master["日付"], errors="coerce").dt.normalize()
+        master = master.drop_duplicates(subset=["日付"], keep="last")
+        af = af.merge(master, left_on="date", right_on="日付", how="left")
+        af = af.drop(columns=["日付"], errors="ignore")
+    if "月度" not in af.columns:
+        af["月度"] = "未設定"
+    else:
+        af["月度"] = af["月度"].astype("string").str.strip().replace("", pd.NA).fillna("未設定")
+    return af.sort_values(["date", "AFコード"]).reset_index(drop=True)
+
+
 def _tg_daily_measurement(history_df):
     if history_df is None or history_df.empty:
         return pd.DataFrame(columns=["date", "TG申込", "TG発行", "CPN名", "月度"])
@@ -1875,10 +1908,11 @@ def _tg_daily_measurement(history_df):
     return agg
 
 
-def _render_measurement_tabs(tg_df=None, af_df=None, key_prefix="measurement"):
+def _render_measurement_tabs(tg_df=None, af_df=None, af_code_df=None, key_prefix="measurement"):
     """TG/AF単独表示と差分を、共通の期間・月度フィルタで表示する。"""
     tg = _tg_daily_measurement(tg_df) if tg_df is not None else pd.DataFrame()
     af = af_df.copy() if af_df is not None else pd.DataFrame()
+    af_code = af_code_df.copy() if af_code_df is not None else pd.DataFrame()
     if tg.empty and af.empty:
         return
 
@@ -1921,6 +1955,7 @@ def _render_measurement_tabs(tg_df=None, af_df=None, key_prefix="measurement"):
 
     tg_f = apply_filters(tg)
     af_f = apply_filters(af)
+    af_code_f = apply_filters(af_code)
     tab_labels = []
     if not tg.empty:
         tab_labels.append("TG計測")
@@ -1950,6 +1985,19 @@ def _render_measurement_tabs(tg_df=None, af_df=None, key_prefix="measurement"):
             )
             st.dataframe(monthly, width="stretch", hide_index=True)
             st.caption(f"期間合計：AF申込 {af_f['AF申込'].sum():,.0f}件 / AF発行 {af_f['AF発行'].sum():,.0f}件")
+
+            if not af_code_f.empty:
+                st.subheader("AFコード別集計")
+                code_summary = (
+                    af_code_f.groupby("AFコード", as_index=False)[["AF申込", "AF発行"]]
+                    .sum()
+                    .sort_values(["AF申込", "AF発行"], ascending=False, kind="stable")
+                    .reset_index(drop=True)
+                )
+                for col in ["AF申込", "AF発行"]:
+                    if (code_summary[col] % 1 == 0).all():
+                        code_summary[col] = code_summary[col].astype(int)
+                st.dataframe(code_summary, width="stretch", hide_index=True)
 
     if not tg.empty and not af.empty:
         with tabs[idx]:
@@ -2095,6 +2143,9 @@ if uploaded_master and has_any_actual:
         af_history_df = _prepare_af_history(
             uploaded_af_apply, uploaded_af_issue, af_code_master, cpn_master
         ) if has_af_data else pd.DataFrame()
+        af_code_history_df = _prepare_af_code_history(
+            uploaded_af_apply, uploaded_af_issue, af_code_master, cpn_master
+        ) if has_af_data else pd.DataFrame()
 
 
     except Exception as exc:
@@ -2103,7 +2154,7 @@ if uploaded_master and has_any_actual:
 
     if uploaded_file is None:
         st.subheader("📊 計測結果")
-        _render_measurement_tabs(tg_df=None, af_df=af_history_df, key_prefix="af_only")
+        _render_measurement_tabs(tg_df=None, af_df=af_history_df, af_code_df=af_code_history_df, key_prefix="af_only")
         st.info("AF計測実績のみを読み込みました。TG実績がないため、従来の媒体別予測・最適化・提出用Excel生成は表示していません。")
         st.stop()
 
@@ -2166,6 +2217,7 @@ if uploaded_master and has_any_actual:
     _render_measurement_tabs(
         tg_df=history_df,
         af_df=af_history_df if has_af_data else None,
+        af_code_df=af_code_history_df if has_af_data else None,
         key_prefix="measurement_compare",
     )
 
