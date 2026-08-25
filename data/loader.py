@@ -383,6 +383,72 @@ def load_af_data(file, af_code_master: pd.DataFrame, metric_name: str) -> pd.Dat
     return _load_af_data_cached(raw_bytes, filename, metric_name, valid_codes).copy()
 
 
+@st.cache_data(show_spinner=False, max_entries=4)
+def _load_af_code_data_cached(raw_bytes: bytes, filename: str, metric_name: str, valid_codes: tuple[str, ...]) -> pd.DataFrame:
+    """AF横持ち実績をAFコード別の日次件数へ縦持ち変換する。"""
+    df = _read_tabular_with_fallback(raw_bytes, filename=filename)
+    if df.empty:
+        raise ValueError(f"{metric_name}実績データが空です。")
+    if len(df.columns) < 2:
+        raise ValueError(
+            f"{metric_name}実績データは、A列=日付、B列以降=AFコードの横持ち形式である必要があります。"
+        )
+
+    date_col = df.columns[0]
+    valid_code_set = set(valid_codes)
+    matched = []
+    for col in df.columns[1:]:
+        normalized_col = _normalize_af_code(col)
+        parts = normalized_col.rsplit(".", 1)
+        base_col = parts[0] if len(parts) == 2 and parts[1].isdigit() else normalized_col
+        if normalized_col in valid_code_set:
+            matched.append((col, normalized_col))
+        elif base_col in valid_code_set:
+            matched.append((col, base_col))
+
+    if not matched:
+        return pd.DataFrame(columns=["date", "AFコード", metric_name])
+
+    work = df[[date_col] + [col for col, _ in matched]].copy()
+    raw_date = work[date_col].astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
+    parsed_yyyymmdd = pd.to_datetime(raw_date, format="%Y%m%d", errors="coerce")
+    parsed_fallback = pd.to_datetime(work[date_col], errors="coerce")
+    work["date"] = parsed_yyyymmdd.fillna(parsed_fallback).dt.normalize()
+    work = work.dropna(subset=["date"])
+
+    frames = []
+    for col, af_code in matched:
+        part = work[["date", col]].copy()
+        part[metric_name] = pd.to_numeric(part[col], errors="coerce").fillna(0)
+        part["AFコード"] = af_code
+        frames.append(part[["date", "AFコード", metric_name]])
+
+    result = pd.concat(frames, ignore_index=True)
+    result = result.groupby(["date", "AFコード"], as_index=False)[metric_name].sum()
+    if not result.empty and (result[metric_name] % 1 == 0).all():
+        result[metric_name] = result[metric_name].astype(int)
+    return result
+
+
+def load_af_code_data(file, af_code_master: pd.DataFrame, metric_name: str) -> pd.DataFrame:
+    """AF横持ち実績を、日付×AFコード単位の件数へ変換して返す。"""
+    if af_code_master is None or af_code_master.empty:
+        raise ValueError("CPNマスタの『AFコードマスタ』シートにAFコードがありません。")
+    code_col = af_code_master.columns[0]
+    valid_codes = tuple(
+        sorted({
+            _normalize_af_code(v)
+            for v in af_code_master[code_col].tolist()
+            if _normalize_af_code(v) != ""
+        })
+    )
+    if not valid_codes:
+        raise ValueError("CPNマスタの『AFコードマスタ』A列に有効なAFコードがありません。")
+    raw_bytes = _file_to_bytes(file)
+    filename = getattr(file, "name", "")
+    return _load_af_code_data_cached(raw_bytes, filename, metric_name, valid_codes).copy()
+
+
 @st.cache_data(show_spinner=False, max_entries=2)
 def _load_master_workbook_with_af_cached(raw_bytes: bytes) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """CPN/媒体/AFコードの3シートをまとめて読み込む。AFコードマスタは任意。"""
