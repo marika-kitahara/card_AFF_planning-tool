@@ -1794,11 +1794,119 @@ def _calculate_normal_month_base(
 
 
 
+
+def _cpn_month_sort_key(label: str):
+    """CPNマスタの月度ラベルを日付範囲ではなくラベル自体で時系列化する。"""
+    import re
+    text = str(label).strip()
+    m = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月度", text)
+    if m:
+        return (int(m.group(1)), int(m.group(2)), text)
+    m = re.search(r"(\d{4})[-/](\d{1,2})", text)
+    if m:
+        return (int(m.group(1)), int(m.group(2)), text)
+    return (9999, 99, text)
+
+
+def _get_cpn_normal_months(cpn_master: pd.DataFrame) -> list[str]:
+    """CPNマスタ上の定常月度を、CPN月度ラベル順で返す。"""
+    normal_labels = {"通常", "定常"}
+    master = cpn_master.copy()
+    master["月度"] = master["月度"].astype("string").str.strip()
+    master["CPN名"] = master["CPN名"].astype("string").str.strip()
+    labels = (
+        master.loc[
+            master["CPN名"].isin(normal_labels)
+            & master["月度"].notna()
+            & master["月度"].astype(str).ne("未設定"),
+            "月度",
+        ]
+        .astype(str)
+        .drop_duplicates()
+        .tolist()
+    )
+    return sorted(labels, key=_cpn_month_sort_key)
+
+
+def _candidate_learning_counts(available_prior: int) -> list[int]:
+    """ユーザー操作ではなく、内部バックテストで比較する候補。"""
+    base = [2, 3, 4, 6, 9, 12]
+    candidates = [n for n in base if n <= available_prior]
+    if not candidates and available_prior >= 1:
+        candidates = [available_prior]
+    return candidates
+
+
+def _select_learning_month_count(
+    history_df: pd.DataFrame,
+    cpn_master: pd.DataFrame,
+    target_month: str,
+) -> tuple[int, pd.DataFrame]:
+    """対象月より前の月度だけを使い、過去バックテストから学習期間を自動選択する。"""
+    month_labels = _get_cpn_normal_months(cpn_master)
+    if str(target_month) not in month_labels:
+        raise ValueError(f"CPNマスタに {target_month} の定常月度がありません。")
+    target_idx = month_labels.index(str(target_month))
+    candidates = _candidate_learning_counts(target_idx)
+    if not candidates:
+        raise ValueError("バックテスト対象月より前の学習月度がありません。")
+
+    # 対象月の直前から最大3月度を検証。各検証月度の実績はその予測には使わない。
+    validation_months = month_labels[max(0, target_idx - 3):target_idx]
+    rows = []
+    for n in candidates:
+        scores = []
+        wapes = []
+        tested = []
+        for vm in validation_months:
+            vm_idx = month_labels.index(vm)
+            if vm_idx < n:
+                continue
+            try:
+                r = _run_normal_backtest(
+                    history_df,
+                    cpn_master,
+                    vm,
+                    learning_month_count=n,
+                    auto_select_learning=False,
+                )
+            except Exception:
+                continue
+            if pd.notna(r.get("total_error_rate")):
+                scores.append(abs(float(r["total_error_rate"])))
+                tested.append(vm)
+            if pd.notna(r.get("wape")):
+                wapes.append(float(r["wape"]))
+        if scores:
+            rows.append({
+                "学習月度数": n,
+                "平均総量誤差率": float(np.mean(scores)),
+                "平均日次WAPE": float(np.mean(wapes)) if wapes else np.nan,
+                "検証月度数": len(scores),
+                "検証月度": "、".join(tested),
+            })
+
+    score_df = pd.DataFrame(rows)
+    if score_df.empty:
+        # 十分な過去検証ができない初期月度は、最大6月度までを安全な既定値にする。
+        fallback = min(6, max(candidates))
+        return fallback, score_df
+
+    score_df = score_df.sort_values(
+        ["平均総量誤差率", "平均日次WAPE", "学習月度数"],
+        ascending=[True, True, True],
+        na_position="last",
+        kind="stable",
+    ).reset_index(drop=True)
+    return int(score_df.iloc[0]["学習月度数"]), score_df
+
+
 def _run_normal_backtest(
     history_df: pd.DataFrame,
     cpn_master: pd.DataFrame,
     target_month: str,
-    learning_month_count: int = 6,
+    learning_month_count: int | None = None,
+    auto_select_learning: bool = True,
 ) -> dict:
     """指定月を未来扱いし、それ以前の実績だけで定常予測を再現する。"""
     from logic.factors import calculate_dynamic_factor_tables, calculate_normal_month_base, calculate_normal_media_diagnostics, calculate_unit_price_response_table
@@ -1814,30 +1922,36 @@ def _run_normal_backtest(
     master["日付"] = pd.to_datetime(master["日付"], errors="coerce").dt.normalize()
     master["月度"] = master["月度"].astype("string").str.strip()
     master["CPN名"] = master["CPN名"].astype("string").str.strip()
-    normal_master = master.loc[
-        master["CPN名"].isin(normal_labels)
-        & master["月度"].astype(str).ne("未設定")
-        & master["日付"].notna(),
-        ["月度", "日付"],
-    ].drop_duplicates()
-    month_order = (
-        normal_master.groupby("月度", as_index=False)
-        .agg(first_date=("日付", "min"), last_date=("日付", "max"))
-        .sort_values(["first_date", "月度"], kind="stable")
-        .reset_index(drop=True)
-    )
-    target_row = month_order.loc[month_order["月度"].astype(str).eq(str(target_month))]
-    if target_row.empty:
-        raise ValueError(f"CPNマスタに {target_month} の定常期間がありません。")
-
-    target_start = pd.Timestamp(target_row.iloc[0]["first_date"]).normalize()
-    target_end = pd.Timestamp(target_row.iloc[0]["last_date"]).normalize()
-    prior_months = month_order.loc[month_order["last_date"].lt(target_start), "月度"].astype(str).tolist()
+    # 月度の順番は対象日のmin/maxではなく、CPNマスタの月度ラベルを正とする。
+    month_labels = _get_cpn_normal_months(master)
+    if str(target_month) not in month_labels:
+        raise ValueError(f"CPNマスタに {target_month} の定常月度がありません。")
+    target_idx = month_labels.index(str(target_month))
+    prior_months = month_labels[:target_idx]
     if not prior_months:
         raise ValueError("バックテスト対象月より前の定常実績がありません。")
 
-    learning_month_count = max(1, int(learning_month_count))
+    target_calendar = master.loc[
+        master["月度"].astype(str).eq(str(target_month)) & master["CPN名"].isin(normal_labels),
+        ["日付", "月度", "line_oa_flag", "magitoku_after_flag"],
+    ].drop_duplicates("日付")
+    if target_calendar.empty:
+        raise ValueError(f"CPNマスタに {target_month} の定常日がありません。")
+    target_dates = pd.to_datetime(target_calendar["日付"], errors="coerce").dropna().dt.normalize()
+    target_start = pd.Timestamp(target_dates.min()).normalize()
+    target_end = pd.Timestamp(target_dates.max()).normalize()
+
+    learning_score_table = pd.DataFrame()
+    if auto_select_learning and learning_month_count is None:
+        learning_month_count, learning_score_table = _select_learning_month_count(
+            history_df, cpn_master, str(target_month)
+        )
+    elif learning_month_count is None:
+        learning_month_count = min(6, len(prior_months))
+    learning_month_count = max(1, min(int(learning_month_count), len(prior_months)))
     learning_months = prior_months[-learning_month_count:]
+
+    # 対象月度の最初のCPN対象日より前だけを学習に使う。
     training = work.loc[work["date"].lt(target_start)].copy()
 
     base_pair = calculate_normal_month_base(training, learning_months)
@@ -1845,14 +1959,7 @@ def _run_normal_backtest(
         raise ValueError("バックテスト学習期間に定常実績がありません。")
     factor_tables = calculate_dynamic_factor_tables(training, learning_months)
 
-    # 対象月のカレンダー条件はCPNマスタだけから取得し、実績CVは予測計算へ渡さない。
-    target_calendar = master.loc[
-        master["月度"].astype(str).eq(str(target_month)) & master["CPN名"].isin(normal_labels),
-        ["日付", "月度", "line_oa_flag", "magitoku_after_flag"],
-    ].drop_duplicates("日付")
-    if target_calendar.empty:
-        raise ValueError(f"CPNマスタに {target_month} の定常日がありません。")
-
+    # 対象月のカレンダー条件は上でCPNマスタから確定済み。
     future = pd.DataFrame({"date": sorted(target_calendar["日付"].dropna().unique())}).merge(base_pair, how="cross")
     future["date"] = pd.to_datetime(future["date"]).dt.normalize()
     future["weekday"] = future["date"].dt.day_name()
@@ -2005,9 +2112,12 @@ def _run_normal_backtest(
     return {
         "target_month": str(target_month),
         "learning_months": learning_months,
+        "learning_month_count": learning_month_count,
+        "learning_score_table": learning_score_table,
         "cutoff_date": target_start - pd.Timedelta(days=1),
         "target_start": target_start,
         "target_end": target_end,
+        "target_day_count": int(target_dates.nunique()),
         "total_forecast": total_forecast,
         "total_actual": total_actual,
         "total_diff": total_diff,
@@ -2949,19 +3059,7 @@ if uploaded_master and has_any_actual:
     bt_master["日付"] = pd.to_datetime(bt_master["日付"], errors="coerce").dt.normalize()
     bt_master["月度"] = bt_master["月度"].astype("string").str.strip()
     bt_master["CPN名"] = bt_master["CPN名"].astype("string").str.strip()
-    bt_month_order = (
-        bt_master.loc[
-            bt_master["CPN名"].isin(normal_labels)
-            & bt_master["月度"].astype(str).ne("未設定")
-            & bt_master["日付"].notna(),
-            ["月度", "日付"],
-        ]
-        .drop_duplicates()
-        .groupby("月度", as_index=False)
-        .agg(first_date=("日付", "min"), last_date=("日付", "max"))
-        .sort_values(["first_date", "月度"], kind="stable")
-        .reset_index(drop=True)
-    )
+    bt_month_labels = _get_cpn_normal_months(bt_master)
     # 実績比較ができる月度だけ選択肢に出す。期間定義そのものはCPNマスタ準拠。
     history_months = set(
         history_df.loc[
@@ -2970,47 +3068,31 @@ if uploaded_master and has_any_actual:
             "月度",
         ].astype(str)
     )
-    bt_options = [m for m in bt_month_order["月度"].astype(str).tolist()[1:] if m in history_months]
+    bt_options = [m for m in bt_month_labels[1:] if m in history_months]
 
     if not bt_options:
         st.info("バックテストには2月度以上の定常実績が必要です。")
     else:
-        bt_c1, bt_c2 = st.columns([2, 1])
-        with bt_c1:
-            bt_target_month = st.selectbox(
-                "検証する月度",
-                options=bt_options,
-                index=len(bt_options) - 1,
-                key="normal_backtest_target_month",
-                help="月度はCPNマスタ基準です。選択月度の開始日前までの実績だけで、そのCPN期間を予測します。",
-            )
-        target_pos = bt_month_order.index[
-            bt_month_order["月度"].astype(str).eq(str(bt_target_month))
-        ][0]
-        target_order_pos = bt_month_order.index.get_loc(target_pos)
-        max_bt_months = max(1, target_order_pos)
-        default_bt_months = min(6, max_bt_months)
-        with bt_c2:
-            bt_learning_months = st.number_input(
-                "学習月度数",
-                min_value=1,
-                max_value=max_bt_months,
-                value=default_bt_months,
-                step=1,
-                key="normal_backtest_learning_months",
-            )
+        bt_target_month = st.selectbox(
+            "検証する月度",
+            options=bt_options,
+            index=len(bt_options) - 1,
+            key="normal_backtest_target_month",
+            help="月度はCPNマスタ基準です。対象月度のCPNマスタ登録日だけを予測・実績比較します。",
+        )
 
         try:
             bt_result = _run_normal_backtest(
                 history_df,
                 cpn_master,
                 bt_target_month,
-                int(bt_learning_months),
+                learning_month_count=None,
+                auto_select_learning=True,
             )
             st.caption(
-                f"対象期間（CPNマスタ）: {bt_result['target_start'].strftime('%Y/%m/%d')}〜{bt_result['target_end'].strftime('%Y/%m/%d')} ／ "
-                f"予測時点: {bt_result['cutoff_date'].strftime('%Y/%m/%d')} ／ "
-                f"学習月度: {', '.join(bt_result['learning_months'])}"
+                f"検証対象: CPNマスタ {bt_result['target_month']}（定常{bt_result['target_day_count']}日） ／ "
+                f"予測基準日: {bt_result['cutoff_date'].strftime('%Y/%m/%d')} ／ "
+                f"採用学習期間: 直近{bt_result['learning_month_count']}月度（自動選択）"
             )
 
             m1, m2, m3, m4 = st.columns(4)
@@ -3072,6 +3154,14 @@ if uploaded_master and has_any_actual:
                 width="stretch",
                 hide_index=True,
             )
+
+            learning_score_table = bt_result.get("learning_score_table", pd.DataFrame())
+            if not learning_score_table.empty:
+                with st.expander("学習期間の自動選択結果（分析用）"):
+                    score_view = learning_score_table.copy()
+                    score_view["平均総量誤差率"] = score_view["平均総量誤差率"].map(lambda x: f"{x:.1%}")
+                    score_view["平均日次WAPE"] = score_view["平均日次WAPE"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "-")
+                    st.dataframe(score_view, width="stretch", hide_index=True)
 
             # ロジック検証用の詳細値は普段は隠し、必要なときだけ確認できるようにする。
             with st.expander("予測ロジック詳細（分析用）"):
