@@ -1801,7 +1801,7 @@ def _run_normal_backtest(
     learning_month_count: int = 6,
 ) -> dict:
     """指定月を未来扱いし、それ以前の実績だけで定常予測を再現する。"""
-    from logic.factors import calculate_dynamic_factor_tables, calculate_normal_month_base
+    from logic.factors import calculate_dynamic_factor_tables, calculate_normal_month_base, calculate_normal_media_diagnostics
 
     normal_labels = {"通常", "定常"}
     work = history_df.copy()
@@ -1895,6 +1895,18 @@ def _run_normal_backtest(
         media_compare["差分"] / media_compare["実績CV"],
         np.nan,
     )
+
+    # 予測の土台を監査できるよう、稼働率×稼働時CVの内訳を媒体別結果へ付与。
+    diagnostics = calculate_normal_media_diagnostics(training, learning_months)
+    if not diagnostics.empty:
+        diagnostics = diagnostics.rename(columns={
+            "activity_rate": "学習稼働率",
+            "active_daily_cv": "稼働時日平均CV",
+            "expected_daily_cv": "基礎期待CV/日",
+            "eligible_days": "学習対象日数",
+            "active_days": "稼働日数",
+        })
+        media_compare = media_compare.merge(diagnostics, on="media", how="left")
 
     total_forecast = float(daily_compare["forecast_cv"].sum())
     total_actual = float(daily_compare["actual_cv"].sum())
