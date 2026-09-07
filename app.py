@@ -1914,6 +1914,7 @@ def _run_normal_backtest(
         "media_compare": media_compare,
         "daily_compare": daily_compare,
         "excluded": factor_tables.get("excluded", pd.DataFrame()),
+        "inactive_media": factor_tables.get("inactive_media", pd.DataFrame()),
     }
 
 
@@ -2756,8 +2757,8 @@ if uploaded_master and has_any_actual:
 
     st.subheader("📐 実績から算出した変動係数")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["曜日", "月初・月末", "需要期", "LINE OA", "学習除外日"]
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["曜日", "月初・月末", "需要期", "LINE OA", "学習除外日", "休眠媒体"]
     )
 
     with tab1:
@@ -2806,6 +2807,31 @@ if uploaded_master and has_any_actual:
             st.caption("定常の基礎値・変動係数の学習から除外した媒体×日です。予測対象実績そのものは削除しません。")
             st.dataframe(
                 preview_excluded.round(3),
+                width="stretch",
+                hide_index=True,
+            )
+
+    with tab6:
+        inactive_media = factor_tables.get("inactive_media", pd.DataFrame())
+        if inactive_media.empty:
+            st.info("直近30日CVなしで休眠判定された媒体はありません。")
+        else:
+            inactive_preview = inactive_media.copy()
+            if "last_positive_date" in inactive_preview.columns:
+                inactive_preview["last_positive_date"] = pd.to_datetime(
+                    inactive_preview["last_positive_date"]
+                ).dt.strftime("%Y/%m/%d")
+            inactive_preview = inactive_preview.rename(
+                columns={
+                    "media": "媒体",
+                    "last_positive_date": "最終CV日",
+                    "recent_cv": "直近30日CV",
+                    "reason": "判定理由",
+                }
+            )
+            st.caption("過去にCV実績はあるものの、予測時点の直近30日でCVがない媒体です。定常予測の基礎値から除外します。")
+            st.dataframe(
+                inactive_preview.drop(columns=["lookback_days"], errors="ignore"),
                 width="stretch",
                 hide_index=True,
             )
@@ -2893,12 +2919,27 @@ if uploaded_master and has_any_actual:
             bt_display["誤差率"] = bt_display["誤差率"].map(
                 lambda x: f"{x:+.1%}" if pd.notna(x) else "-"
             )
-            st.dataframe(
+            bt_export = (
                 bt_display[["media", "予測CV", "実績CV", "差分", "誤差率"]]
-                .rename(columns={"media": "媒体"}),
+                .rename(columns={"media": "媒体"})
+            )
+            st.dataframe(
+                bt_export,
                 width="stretch",
                 hide_index=True,
             )
+            bt_month_filename = str(bt_target_month).replace("/", "-").replace(" ", "")
+            st.download_button(
+                "📥 媒体別バックテスト結果をCSVで保存",
+                data=bt_export.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"AFF定常予測_バックテスト_{bt_month_filename}.csv",
+                mime="text/csv",
+                key=f"download_backtest_media_{bt_month_filename}",
+            )
+
+            inactive_bt = bt_result.get("inactive_media", pd.DataFrame())
+            if not inactive_bt.empty:
+                st.caption(f"休眠判定で定常予測から除外: {len(inactive_bt):,}媒体")
 
             with st.expander("バックテスト日別明細"):
                 bt_daily = bt_result["daily_compare"].copy()
@@ -2915,6 +2956,14 @@ if uploaded_master and has_any_actual:
                     bt_daily[["日付", "媒体", "予測CV", "実績CV", "差分"]].round(2),
                     width="stretch",
                     hide_index=True,
+                )
+                bt_daily_export = bt_daily[["日付", "媒体", "予測CV", "実績CV", "差分"]].round(2)
+                st.download_button(
+                    "📥 日別明細をCSVで保存",
+                    data=bt_daily_export.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"AFF定常予測_バックテスト日別_{bt_month_filename}.csv",
+                    mime="text/csv",
+                    key=f"download_backtest_daily_{bt_month_filename}",
                 )
         except Exception as bt_exc:
             st.warning(f"バックテストを実行できませんでした: {bt_exc}")
