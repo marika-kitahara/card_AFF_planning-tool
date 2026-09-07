@@ -186,23 +186,47 @@ def _prepare_normal_learning_data(
         normal = normal.loc[~row_keys.isin(bad_keys)].copy()
 
     normal = _add_recency_weights(normal)
-    clean_daily = _daily_media(normal)
 
-    # 日次属性は元粒度から復元する。
-    if not clean_daily.empty:
-        attrs_spec = {
-            "weekday": ("weekday", "first"),
-            "is_month_start": ("is_month_start", "max"),
-            "is_month_end": ("is_month_end", "max"),
-            "recency_weight": ("recency_weight", "first"),
-        }
+    # 重要: ローデータに媒体行が存在しない日も、その媒体の0CV日として日次学習へ含める。
+    # 従来は「CVが出た/行が存在した日」だけが分母になり、断続掲載媒体の基礎CVを
+    # 過大評価していた。ここでは学習対象の定常日 × 媒体を展開し、欠損を0CVで補完する。
+    observed_daily = _daily_media(normal)
+    if not observed_daily.empty:
+        media_list = pd.DataFrame({"media": sorted(normal["media"].dropna().astype(str).unique())})
+        calendar = pd.DataFrame({"date": sorted(normal["date"].dropna().unique())})
+        calendar = _add_recency_weights(calendar)
+        calendar["weekday"] = calendar["date"].dt.day_name()
+
+        # 月初/月末・LINE OAは日付共通属性として、元データから復元する。
+        date_attrs_spec = {}
+        if "is_month_start" in normal.columns:
+            date_attrs_spec["is_month_start"] = ("is_month_start", "max")
+        if "is_month_end" in normal.columns:
+            date_attrs_spec["is_month_end"] = ("is_month_end", "max")
         if "line_oa_flag" in normal.columns:
-            attrs_spec["line_oa_flag"] = ("line_oa_flag", "max")
-        day_attrs = normal.groupby(["date", "media"], as_index=False).agg(**attrs_spec)
-        clean_daily = clean_daily.merge(day_attrs, on=["date", "media"], how="left")
-        if "line_oa_flag" not in clean_daily.columns:
-            clean_daily["line_oa_flag"] = 0
+            date_attrs_spec["line_oa_flag"] = ("line_oa_flag", "max")
+        if date_attrs_spec:
+            date_attrs = normal.groupby("date", as_index=False).agg(**date_attrs_spec)
+            calendar = calendar.merge(date_attrs, on="date", how="left")
+        for col in ["is_month_start", "is_month_end", "line_oa_flag"]:
+            if col not in calendar.columns:
+                calendar[col] = 0
+            calendar[col] = pd.to_numeric(calendar[col], errors="coerce").fillna(0).astype(int)
+
+        clean_daily = media_list.merge(calendar, how="cross").merge(
+            observed_daily, on=["date", "media"], how="left"
+        )
+        clean_daily["cv"] = pd.to_numeric(clean_daily["cv"], errors="coerce").fillna(0.0)
+        clean_daily["cost"] = pd.to_numeric(clean_daily["cost"], errors="coerce").fillna(0.0)
+
+        # 異常値として除外した媒体×日は、0CVに置換せず学習母集団そのものから外す。
+        if not outliers.empty:
+            bad_keys = pd.MultiIndex.from_frame(outliers[["date", "media"]])
+            daily_keys = pd.MultiIndex.from_frame(clean_daily[["date", "media"]])
+            clean_daily = clean_daily.loc[~daily_keys.isin(bad_keys)].copy()
         clean_daily["month"] = clean_daily["date"].dt.month
+    else:
+        clean_daily = observed_daily
 
     excluded = (
         pd.concat(excluded_parts, ignore_index=True)
@@ -556,23 +580,68 @@ def calculate_normal_month_base(
     if clean.empty:
         return pd.DataFrame(columns=columns)
 
-    # 媒体ごとに有効な学習日と重みを分母にする。
-    # 商品IDの行がない日は0件として既存仕様を維持する。
-    media_day_weights = (
-        clean[["media", "date", "recency_weight"]]
-        .drop_duplicates(["media", "date"])
-        .groupby("media")["recency_weight"]
-        .sum()
-    )
+    # 媒体ごとの「全定常日」を分母にする。行が無い日は0CV=非稼働日。
+    # base_cv = 稼働率 × 稼働時CV と同値だが、診断値も保持して説明可能にする。
+    _, full_daily, _ = _prepare_normal_learning_data(history_df, selected_months)
+    if not inactive.empty and not full_daily.empty:
+        full_daily = full_daily.loc[~full_daily["media"].isin(inactive["media"])].copy()
+    media_day_weights = full_daily.groupby("media")["recency_weight"].sum()
 
     weighted = clean.copy()
-    weighted["weighted_cv"] = pd.to_numeric(weighted["cv"], errors="coerce").fillna(0.0) * weighted["recency_weight"]
-    weighted["weighted_cost"] = pd.to_numeric(weighted["cost"], errors="coerce").fillna(0.0) * weighted["recency_weight"]
-    result = (
-        weighted.groupby(["media", "商品ID"], as_index=False)
-        .agg(weighted_cv=("weighted_cv", "sum"), weighted_cost=("weighted_cost", "sum"))
+    weighted["cv"] = pd.to_numeric(weighted["cv"], errors="coerce").fillna(0.0)
+    weighted["cost"] = pd.to_numeric(weighted["cost"], errors="coerce").fillna(0.0)
+    weighted["weighted_cv"] = weighted["cv"] * weighted["recency_weight"]
+    weighted["weighted_cost"] = weighted["cost"] * weighted["recency_weight"]
+    result = weighted.groupby(["media", "商品ID"], as_index=False).agg(
+        weighted_cv=("weighted_cv", "sum"),
+        weighted_cost=("weighted_cost", "sum"),
     )
     result["weight_days"] = result["media"].map(media_day_weights)
     result["base_cv"] = result["weighted_cv"] / result["weight_days"]
-    result["cost"] = result["weighted_cost"] / result["weight_days"]
+
+    # costは掲載日の水準を維持する（0CV日を混ぜて単価まで薄めない）。
+    active_cost = weighted.loc[weighted["cv"].gt(0)].copy()
+    if active_cost.empty:
+        result["cost"] = 0.0
+    else:
+        active_cost["cost_w"] = active_cost["cost"] * active_cost["recency_weight"]
+        cost_sum = active_cost.groupby(["media", "商品ID"])["cost_w"].sum()
+        cost_weight = active_cost.groupby(["media", "商品ID"])["recency_weight"].sum()
+        cost_mean = (cost_sum / cost_weight).replace([np.inf, -np.inf], np.nan)
+        idx = pd.MultiIndex.from_frame(result[["media", "商品ID"]])
+        result["cost"] = cost_mean.reindex(idx).to_numpy()
+        result["cost"] = pd.to_numeric(result["cost"], errors="coerce").fillna(0.0)
     return result[columns]
+
+
+def calculate_normal_media_diagnostics(
+    history_df: pd.DataFrame,
+    selected_months: list[str],
+) -> pd.DataFrame:
+    """定常予測の媒体別基礎値を、稼働率×稼働時CVに分解して返す。"""
+    columns = ["media", "activity_rate", "active_daily_cv", "expected_daily_cv", "eligible_days", "active_days"]
+    clean, daily, _ = _prepare_normal_learning_data(history_df, selected_months)
+    if daily.empty:
+        return pd.DataFrame(columns=columns)
+    inactive = identify_inactive_media(history_df, selected_months)
+    if not inactive.empty:
+        daily = daily.loc[~daily["media"].isin(inactive["media"])].copy()
+    rows = []
+    for media, g in daily.groupby("media", sort=False):
+        w = pd.to_numeric(g["recency_weight"], errors="coerce").fillna(0.0)
+        cv = pd.to_numeric(g["cv"], errors="coerce").fillna(0.0)
+        valid = w.gt(0)
+        if not valid.any():
+            continue
+        active = cv.gt(0)
+        activity_rate = float(w[active].sum() / w.sum()) if w.sum() else 0.0
+        active_daily_cv = _weighted_mean(cv[active], w[active]) if active.any() else 0.0
+        rows.append({
+            "media": media,
+            "activity_rate": activity_rate,
+            "active_daily_cv": float(active_daily_cv) if pd.notna(active_daily_cv) else 0.0,
+            "expected_daily_cv": activity_rate * (float(active_daily_cv) if pd.notna(active_daily_cv) else 0.0),
+            "eligible_days": int(g["date"].nunique()),
+            "active_days": int(g.loc[active, "date"].nunique()),
+        })
+    return pd.DataFrame(rows, columns=columns)
