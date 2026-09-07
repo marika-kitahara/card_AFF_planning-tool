@@ -287,18 +287,16 @@ def calculate_dynamic_factor_tables(
         return {"weekday": empty, "month_edge": empty, "season": empty, "line_oa": empty, "excluded": excluded}
 
     # 媒体ごとの全体基準CV。基礎値と同じく全定常日を直近加重で評価する。
-    base_by_media = daily.groupby("media").apply(
-        lambda g: _weighted_mean(g["cv"], g["recency_weight"]),
-        include_groups=False,
+    base_by_media = daily.groupby("media")[["cv", "recency_weight"]].apply(
+        lambda g: _weighted_mean(g["cv"], g["recency_weight"])
     )
     global_base = _weighted_mean(daily["cv"], daily["recency_weight"])
     all_media = pd.Index(sorted(daily["media"].unique()), name="media")
     base_by_media = base_by_media.reindex(all_media).fillna(global_base).replace(0, np.nan)
 
     # 月ごとの媒体水準を先に除去し、曜日と需要期の同じ変動を二重計上しにくくする。
-    media_month_base = daily.groupby(["media", "month"]).apply(
-        lambda g: _weighted_mean(g["cv"], g["recency_weight"]),
-        include_groups=False,
+    media_month_base = daily.groupby(["media", "month"])[["cv", "recency_weight"]].apply(
+        lambda g: _weighted_mean(g["cv"], g["recency_weight"])
     )
     daily["media_month_base"] = [media_month_base.get((m, mon), np.nan) for m, mon in zip(daily["media"], daily["month"])]
     daily["weekday_residual"] = _safe_ratio(daily["cv"], daily["media_month_base"])
@@ -358,9 +356,8 @@ def calculate_dynamic_factor_tables(
         daily["cv"],
         daily["weekday_factor_hist"] * daily["edge_factor_hist"],
     )
-    adjusted_base_by_media = daily.groupby("media").apply(
-        lambda g: _weighted_mean(g["calendar_adjusted_cv"], g["recency_weight"]),
-        include_groups=False,
+    adjusted_base_by_media = daily.groupby("media")[["calendar_adjusted_cv", "recency_weight"]].apply(
+        lambda g: _weighted_mean(g["calendar_adjusted_cv"], g["recency_weight"])
     )
 
     season_rows = []
