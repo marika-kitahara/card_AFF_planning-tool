@@ -1809,25 +1809,29 @@ def _run_normal_backtest(
     work["月度"] = work["月度"].astype("string").str.strip()
     work["CPN名"] = work["CPN名"].astype("string").str.strip()
 
+    # バックテストの「月度」は暦月ではなくCPNマスタの月度を唯一の基準にする。
+    master = cpn_master.copy()
+    master["日付"] = pd.to_datetime(master["日付"], errors="coerce").dt.normalize()
+    master["月度"] = master["月度"].astype("string").str.strip()
+    master["CPN名"] = master["CPN名"].astype("string").str.strip()
+    normal_master = master.loc[
+        master["CPN名"].isin(normal_labels)
+        & master["月度"].astype(str).ne("未設定")
+        & master["日付"].notna(),
+        ["月度", "日付"],
+    ].drop_duplicates()
     month_order = (
-        work.loc[
-            work["CPN名"].isin(normal_labels) & work["月度"].astype(str).ne("未設定"),
-            ["月度", "date"],
-        ]
-        .groupby("月度", as_index=False)
-        .agg(first_date=("date", "min"), last_date=("date", "max"))
+        normal_master.groupby("月度", as_index=False)
+        .agg(first_date=("日付", "min"), last_date=("日付", "max"))
         .sort_values(["first_date", "月度"], kind="stable")
+        .reset_index(drop=True)
     )
     target_row = month_order.loc[month_order["月度"].astype(str).eq(str(target_month))]
     if target_row.empty:
-        raise ValueError(f"{target_month} の定常実績がありません。")
+        raise ValueError(f"CPNマスタに {target_month} の定常期間がありません。")
 
-    target_dates_all = work.loc[work["月度"].astype(str).eq(str(target_month)), "date"].dropna()
-    target_start = (
-        pd.Timestamp(target_dates_all.min()).normalize()
-        if not target_dates_all.empty
-        else pd.Timestamp(target_row.iloc[0]["first_date"]).normalize()
-    )
+    target_start = pd.Timestamp(target_row.iloc[0]["first_date"]).normalize()
+    target_end = pd.Timestamp(target_row.iloc[0]["last_date"]).normalize()
     prior_months = month_order.loc[month_order["last_date"].lt(target_start), "月度"].astype(str).tolist()
     if not prior_months:
         raise ValueError("バックテスト対象月より前の定常実績がありません。")
@@ -1842,10 +1846,6 @@ def _run_normal_backtest(
     factor_tables = calculate_dynamic_factor_tables(training, learning_months)
 
     # 対象月のカレンダー条件はCPNマスタだけから取得し、実績CVは予測計算へ渡さない。
-    master = cpn_master.copy()
-    master["日付"] = pd.to_datetime(master["日付"], errors="coerce").dt.normalize()
-    master["月度"] = master["月度"].astype("string").str.strip()
-    master["CPN名"] = master["CPN名"].astype("string").str.strip()
     target_calendar = master.loc[
         master["月度"].astype(str).eq(str(target_month)) & master["CPN名"].isin(normal_labels),
         ["日付", "月度", "line_oa_flag", "magitoku_after_flag"],
@@ -1909,8 +1909,11 @@ def _run_normal_backtest(
         )
     )
 
+    target_date_set = set(pd.to_datetime(target_calendar["日付"], errors="coerce").dropna().dt.normalize())
     actual = work.loc[
-        work["月度"].astype(str).eq(str(target_month)) & work["CPN名"].isin(normal_labels)
+        work["月度"].astype(str).eq(str(target_month))
+        & work["CPN名"].isin(normal_labels)
+        & work["date"].isin(target_date_set)
     ].copy()
     actual_daily = (
         actual.groupby(["date", "media"], as_index=False)
@@ -2003,6 +2006,8 @@ def _run_normal_backtest(
         "target_month": str(target_month),
         "learning_months": learning_months,
         "cutoff_date": target_start - pd.Timedelta(days=1),
+        "target_start": target_start,
+        "target_end": target_end,
         "total_forecast": total_forecast,
         "total_actual": total_actual,
         "total_diff": total_diff,
@@ -2935,20 +2940,37 @@ if uploaded_master and has_any_actual:
 
     st.subheader("🧪 定常バックテスト")
     st.caption(
-        "対象月の実績を予測計算から隠し、前月末までのデータだけで当時の定常予測を再現します。"
+        "対象月度の実績を予測計算から隠し、CPNマスタ上の対象月度開始日前までのデータだけで当時の定常予測を再現します。"
         "対象月の実績は比較表示にだけ使用します。"
     )
 
-    bt_month_source = history_df[
-        history_df["CPN名"].isin(normal_labels)
-        & history_df["月度"].astype(str).ne("未設定")
-    ][["月度", "date"]].copy()
+    # 選択肢・月度順もローデータではなくCPNマスタを正とする。
+    bt_master = cpn_master.copy()
+    bt_master["日付"] = pd.to_datetime(bt_master["日付"], errors="coerce").dt.normalize()
+    bt_master["月度"] = bt_master["月度"].astype("string").str.strip()
+    bt_master["CPN名"] = bt_master["CPN名"].astype("string").str.strip()
     bt_month_order = (
-        bt_month_source.groupby("月度", as_index=False)
-        .agg(first_date=("date", "min"), last_date=("date", "max"))
+        bt_master.loc[
+            bt_master["CPN名"].isin(normal_labels)
+            & bt_master["月度"].astype(str).ne("未設定")
+            & bt_master["日付"].notna(),
+            ["月度", "日付"],
+        ]
+        .drop_duplicates()
+        .groupby("月度", as_index=False)
+        .agg(first_date=("日付", "min"), last_date=("日付", "max"))
         .sort_values(["first_date", "月度"], kind="stable")
+        .reset_index(drop=True)
     )
-    bt_options = bt_month_order["月度"].astype(str).tolist()[1:]
+    # 実績比較ができる月度だけ選択肢に出す。期間定義そのものはCPNマスタ準拠。
+    history_months = set(
+        history_df.loc[
+            history_df["CPN名"].isin(normal_labels)
+            & history_df["月度"].astype(str).ne("未設定"),
+            "月度",
+        ].astype(str)
+    )
+    bt_options = [m for m in bt_month_order["月度"].astype(str).tolist()[1:] if m in history_months]
 
     if not bt_options:
         st.info("バックテストには2月度以上の定常実績が必要です。")
@@ -2960,7 +2982,7 @@ if uploaded_master and has_any_actual:
                 options=bt_options,
                 index=len(bt_options) - 1,
                 key="normal_backtest_target_month",
-                help="例: 8月度を選ぶと、7月末以前の実績だけで8月度を予測します。",
+                help="月度はCPNマスタ基準です。選択月度の開始日前までの実績だけで、そのCPN期間を予測します。",
             )
         target_pos = bt_month_order.index[
             bt_month_order["月度"].astype(str).eq(str(bt_target_month))
@@ -2986,6 +3008,7 @@ if uploaded_master and has_any_actual:
                 int(bt_learning_months),
             )
             st.caption(
+                f"対象期間（CPNマスタ）: {bt_result['target_start'].strftime('%Y/%m/%d')}〜{bt_result['target_end'].strftime('%Y/%m/%d')} ／ "
                 f"予測時点: {bt_result['cutoff_date'].strftime('%Y/%m/%d')} ／ "
                 f"学習月度: {', '.join(bt_result['learning_months'])}"
             )
@@ -3040,7 +3063,7 @@ if uploaded_master and has_any_actual:
                 key=f"download_backtest_media_{bt_month_filename}",
                 type="primary",
             )
-            st.caption("※ 表右上のExportではなく、このボタンから保存すると上記の分かりやすいファイル名になります。")
+            
             st.dataframe(
                 bt_export,
                 width="stretch",
