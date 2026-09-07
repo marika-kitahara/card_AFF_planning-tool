@@ -8,6 +8,7 @@ from config.constants import (
     OUTLIER_MIN_DAYS,
     OUTLIER_MAD_Z_THRESHOLD,
     FACTOR_PRIOR_DAYS,
+    INACTIVE_MEDIA_LOOKBACK_DAYS,
 )
 
 
@@ -213,6 +214,66 @@ def _prepare_normal_learning_data(
     return normal, clean_daily, excluded
 
 
+
+def identify_inactive_media(
+    history_df: pd.DataFrame,
+    selected_months: list[str] | None = None,
+    lookback_days: int = INACTIVE_MEDIA_LOOKBACK_DAYS,
+) -> pd.DataFrame:
+    """定常学習期間内で、直近N日CV=0の媒体を休眠扱いとして返す。
+
+    過去にCV>0の実績がある媒体だけを対象にするため、単なる未稼働媒体は含めない。
+    判定基準日は、渡されたデータ内の最新定常日。バックテストでは未来月を
+    切り落としたtrainingが渡されるため、その時点の状態だけで判定できる。
+    """
+    columns = ["media", "last_positive_date", "recent_cv", "lookback_days", "reason"]
+    if history_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    work = history_df.copy()
+    work["date"] = pd.to_datetime(work["date"], errors="coerce").dt.normalize()
+    work["CPN名"] = work["CPN名"].astype("string").str.strip()
+    if "月度" in work.columns:
+        work["月度"] = work["月度"].astype("string").str.strip()
+
+    normal = work[work["CPN名"].isin(["通常", "定常"])].copy()
+    months = _normalize_selected_months(selected_months)
+    if months and "月度" in normal.columns:
+        normal = normal[normal["月度"].isin(months)].copy()
+    if normal.empty:
+        return pd.DataFrame(columns=columns)
+
+    normal["cv"] = pd.to_numeric(normal["cv"], errors="coerce").fillna(0.0)
+    ref_date = normal["date"].max()
+    if pd.isna(ref_date):
+        return pd.DataFrame(columns=columns)
+
+    lookback_days = max(int(lookback_days), 1)
+    recent_start = pd.Timestamp(ref_date).normalize() - pd.Timedelta(days=lookback_days - 1)
+    daily = _daily_media(normal)
+    historical_positive = daily[daily["cv"].gt(0)].groupby("media")["date"].max()
+    recent_cv = (
+        daily[daily["date"].ge(recent_start)]
+        .groupby("media")["cv"]
+        .sum()
+    )
+
+    rows = []
+    for media, last_date in historical_positive.items():
+        cv30 = float(recent_cv.get(media, 0.0))
+        if cv30 <= 0:
+            rows.append({
+                "media": media,
+                "last_positive_date": pd.Timestamp(last_date).normalize(),
+                "recent_cv": cv30,
+                "lookback_days": lookback_days,
+                "reason": f"直近{lookback_days}日CVなし",
+            })
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        ["last_positive_date", "media"], kind="stable"
+    ) if rows else pd.DataFrame(columns=columns)
+
+
 def get_cpn_reference_periods(
     history_df: pd.DataFrame,
     selected_cpn: str,
@@ -409,12 +470,15 @@ def calculate_dynamic_factor_tables(
         })
     line_oa = pd.DataFrame(line_rows)
 
+    inactive_media = identify_inactive_media(history_df, selected_months)
+
     return {
         "weekday": weekday_avg,
         "month_edge": month_edge,
         "season": season_avg,
         "line_oa": line_oa,
         "excluded": excluded,
+        "inactive_media": inactive_media,
     }
 
 
@@ -482,6 +546,13 @@ def calculate_normal_month_base(
         raise ValueError("定常月度学習に必要な列がありません: " + ", ".join(sorted(missing)))
 
     clean, _, _ = _prepare_normal_learning_data(history_df, selected_months)
+    if clean.empty:
+        return pd.DataFrame(columns=columns)
+
+    # 過去実績だけ残っている休眠媒体を予測対象から外す。
+    inactive = identify_inactive_media(history_df, selected_months)
+    if not inactive.empty:
+        clean = clean.loc[~clean["media"].isin(inactive["media"])].copy()
     if clean.empty:
         return pd.DataFrame(columns=columns)
 
