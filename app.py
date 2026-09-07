@@ -1941,12 +1941,10 @@ def _run_normal_backtest(
     target_start = pd.Timestamp(target_dates.min()).normalize()
     target_end = pd.Timestamp(target_dates.max()).normalize()
 
+    # 学習期間は営業操作・自動探索を行わず、直近6月度に固定する。
+    # 過去月度が6未満の場合のみ、利用可能な全月度を使う。
     learning_score_table = pd.DataFrame()
-    if auto_select_learning and learning_month_count is None:
-        learning_month_count, learning_score_table = _select_learning_month_count(
-            history_df, cpn_master, str(target_month)
-        )
-    elif learning_month_count is None:
+    if learning_month_count is None:
         learning_month_count = min(6, len(prior_months))
     learning_month_count = max(1, min(int(learning_month_count), len(prior_months)))
     learning_months = prior_months[-learning_month_count:]
@@ -3086,13 +3084,13 @@ if uploaded_master and has_any_actual:
                 history_df,
                 cpn_master,
                 bt_target_month,
-                learning_month_count=None,
-                auto_select_learning=True,
+                learning_month_count=6,
+                auto_select_learning=False,
             )
             st.caption(
                 f"検証対象: CPNマスタ {bt_result['target_month']}（定常{bt_result['target_day_count']}日） ／ "
                 f"予測基準日: {bt_result['cutoff_date'].strftime('%Y/%m/%d')} ／ "
-                f"採用学習期間: 直近{bt_result['learning_month_count']}月度（自動選択）"
+                f"学習期間: 直近{bt_result['learning_month_count']}月度（固定）"
             )
 
             m1, m2, m3, m4 = st.columns(4)
@@ -3154,14 +3152,6 @@ if uploaded_master and has_any_actual:
                 width="stretch",
                 hide_index=True,
             )
-
-            learning_score_table = bt_result.get("learning_score_table", pd.DataFrame())
-            if not learning_score_table.empty:
-                with st.expander("学習期間の自動選択結果（分析用）"):
-                    score_view = learning_score_table.copy()
-                    score_view["平均総量誤差率"] = score_view["平均総量誤差率"].map(lambda x: f"{x:.1%}")
-                    score_view["平均日次WAPE"] = score_view["平均日次WAPE"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "-")
-                    st.dataframe(score_view, width="stretch", hide_index=True)
 
             # ロジック検証用の詳細値は普段は隠し、必要なときだけ確認できるようにする。
             with st.expander("予測ロジック詳細（分析用）"):
