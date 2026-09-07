@@ -3056,19 +3056,30 @@ if uploaded_master and has_any_actual:
 
             bt_month_filename = str(bt_target_month).replace("/", "-").replace(" ", "")
             st.download_button(
-                "📥 診断付きバックテストCSVを保存",
+                "📥 バックテストCSVを保存",
                 data=bt_export.to_csv(index=False).encode("utf-8-sig"),
                 file_name=f"AFF定常予測_バックテスト_{bt_month_filename}.csv",
                 mime="text/csv",
                 key=f"download_backtest_media_{bt_month_filename}",
                 type="primary",
             )
-            
+
+            # 営業向けの評価表は、判断に必要な項目だけを表示する。
+            sales_cols = ["媒体", "予測CV", "実績CV", "差分", "誤差率"]
+            sales_cols = [c for c in sales_cols if c in bt_export.columns]
             st.dataframe(
-                bt_export,
+                bt_export[sales_cols],
                 width="stretch",
                 hide_index=True,
             )
+
+            # ロジック検証用の詳細値は普段は隠し、必要なときだけ確認できるようにする。
+            with st.expander("予測ロジック詳細（分析用）"):
+                st.dataframe(
+                    bt_export,
+                    width="stretch",
+                    hide_index=True,
+                )
 
             inactive_bt = bt_result.get("inactive_media", pd.DataFrame())
             if not inactive_bt.empty:
