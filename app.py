@@ -1801,7 +1801,7 @@ def _run_normal_backtest(
     learning_month_count: int = 6,
 ) -> dict:
     """指定月を未来扱いし、それ以前の実績だけで定常予測を再現する。"""
-    from logic.factors import calculate_dynamic_factor_tables, calculate_normal_month_base, calculate_normal_media_diagnostics
+    from logic.factors import calculate_dynamic_factor_tables, calculate_normal_month_base, calculate_normal_media_diagnostics, calculate_unit_price_response_table
 
     normal_labels = {"通常", "定常"}
     work = history_df.copy()
@@ -1874,7 +1874,8 @@ def _run_normal_backtest(
     # ここでも不足列を再構築する。最終予測式は従来と同一。
     stage_formulas = {
         "stage_base_cv": ("base_cv", "cpn_factor"),
-        "stage_weekday_cv": ("stage_base_cv", "weekday_factor"),
+        "stage_unit_price_cv": ("stage_base_cv", "unit_price_factor"),
+        "stage_weekday_cv": ("stage_unit_price_cv", "weekday_factor"),
         "stage_season_cv": ("stage_weekday_cv", "season_factor"),
         "stage_month_edge_cv": ("stage_season_cv", "month_edge_factor"),
         "stage_after_cv": ("stage_month_edge_cv", "after_factor"),
@@ -1898,6 +1899,7 @@ def _run_normal_backtest(
         forecast.groupby(["date", "media"], as_index=False)
         .agg(
             基礎CV=("stage_base_cv", "sum"),
+            単価補正後CV=("stage_unit_price_cv", "sum"),
             曜日補正後CV=("stage_weekday_cv", "sum"),
             需要期補正後CV=("stage_season_cv", "sum"),
             月初月末補正後CV=("stage_month_edge_cv", "sum"),
@@ -1923,6 +1925,7 @@ def _run_normal_backtest(
         daily_compare.groupby("media", as_index=False)
         .agg(
             基礎CV=("基礎CV", "sum"),
+            単価補正後CV=("単価補正後CV", "sum"),
             曜日補正後CV=("曜日補正後CV", "sum"),
             需要期補正後CV=("需要期補正後CV", "sum"),
             月初月末補正後CV=("月初月末補正後CV", "sum"),
@@ -1934,7 +1937,8 @@ def _run_normal_backtest(
         )
     )
     # 各補正が予測総量を何CV動かしたか。暴走地点の特定に使う。
-    media_compare["曜日影響CV"] = media_compare["曜日補正後CV"] - media_compare["基礎CV"]
+    media_compare["単価影響CV"] = media_compare["単価補正後CV"] - media_compare["基礎CV"]
+    media_compare["曜日影響CV"] = media_compare["曜日補正後CV"] - media_compare["単価補正後CV"]
     media_compare["需要期影響CV"] = media_compare["需要期補正後CV"] - media_compare["曜日補正後CV"]
     media_compare["月初月末影響CV"] = media_compare["月初月末補正後CV"] - media_compare["需要期補正後CV"]
     media_compare["マジ得後影響CV"] = media_compare["マジ得後補正後CV"] - media_compare["月初月末補正後CV"]
@@ -1957,6 +1961,37 @@ def _run_normal_backtest(
             "active_days": "稼働日数",
         })
         media_compare = media_compare.merge(diagnostics, on="media", how="left")
+
+    # 単価感応度の監査情報。予測にはtarget月実績を使わず、trainingだけから推定する。
+    price_diag = calculate_unit_price_response_table(training, learning_months)
+    if not price_diag.empty:
+        price_diag = price_diag.rename(columns={
+            "reference_unit_price": "学習基準単価",
+            "latest_unit_price": "学習直近単価",
+            "elasticity_raw": "単価感応度raw",
+            "elasticity": "単価感応度",
+            "sample_months": "単価学習月数",
+            "price_variation": "単価変動幅",
+            "fit_r2": "単価モデルR2",
+        })
+        media_compare = media_compare.merge(price_diag, on="media", how="left")
+        media_compare["予測単価補正倍率"] = np.where(
+            media_compare["基礎CV"].ne(0),
+            media_compare["単価補正後CV"] / media_compare["基礎CV"],
+            1.0,
+        )
+
+    # 対象月の実績単価は「説明用」だけに付ける。予測計算には一切利用しない。
+    if not actual.empty:
+        actual_price = actual.groupby("media", as_index=False).agg(
+            _actual_cv=("cv", "sum"), _actual_cost=("cost", "sum")
+        )
+        actual_price["対象月実績単価_診断のみ"] = (
+            actual_price["_actual_cost"] / actual_price["_actual_cv"].replace(0, pd.NA)
+        )
+        media_compare = media_compare.merge(
+            actual_price[["media", "対象月実績単価_診断のみ"]], on="media", how="left"
+        )
 
     total_forecast = float(daily_compare["forecast_cv"].sum())
     total_actual = float(daily_compare["actual_cv"].sum())
@@ -3236,6 +3271,10 @@ if uploaded_master and has_any_actual:
             "商品ID",
             "base_cv",
             "cpn_factor",
+            "unit_price_factor",
+            "unit_price_reference",
+            "unit_price_latest",
+            "unit_price_elasticity",
             "weekday_factor",
             "season_factor",
             "month_edge_factor",
