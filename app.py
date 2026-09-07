@@ -1870,7 +1870,15 @@ def _run_normal_backtest(
     forecast = forecast_cv(future, factor_tables)
     forecast_daily = (
         forecast.groupby(["date", "media"], as_index=False)
-        .agg(forecast_cv=("forecast_cv", "sum"))
+        .agg(
+            基礎CV=("stage_base_cv", "sum"),
+            曜日補正後CV=("stage_weekday_cv", "sum"),
+            需要期補正後CV=("stage_season_cv", "sum"),
+            月初月末補正後CV=("stage_month_edge_cv", "sum"),
+            マジ得後補正後CV=("stage_after_cv", "sum"),
+            LINE補正後CV=("stage_line_cv", "sum"),
+            forecast_cv=("forecast_cv", "sum"),
+        )
     )
 
     actual = work.loc[
@@ -1887,8 +1895,24 @@ def _run_normal_backtest(
 
     media_compare = (
         daily_compare.groupby("media", as_index=False)
-        .agg(予測CV=("forecast_cv", "sum"), 実績CV=("actual_cv", "sum"), 絶対誤差=("絶対誤差", "sum"))
+        .agg(
+            基礎CV=("基礎CV", "sum"),
+            曜日補正後CV=("曜日補正後CV", "sum"),
+            需要期補正後CV=("需要期補正後CV", "sum"),
+            月初月末補正後CV=("月初月末補正後CV", "sum"),
+            マジ得後補正後CV=("マジ得後補正後CV", "sum"),
+            LINE補正後CV=("LINE補正後CV", "sum"),
+            予測CV=("forecast_cv", "sum"),
+            実績CV=("actual_cv", "sum"),
+            絶対誤差=("絶対誤差", "sum"),
+        )
     )
+    # 各補正が予測総量を何CV動かしたか。暴走地点の特定に使う。
+    media_compare["曜日影響CV"] = media_compare["曜日補正後CV"] - media_compare["基礎CV"]
+    media_compare["需要期影響CV"] = media_compare["需要期補正後CV"] - media_compare["曜日補正後CV"]
+    media_compare["月初月末影響CV"] = media_compare["月初月末補正後CV"] - media_compare["需要期補正後CV"]
+    media_compare["マジ得後影響CV"] = media_compare["マジ得後補正後CV"] - media_compare["月初月末補正後CV"]
+    media_compare["LINE影響CV"] = media_compare["LINE補正後CV"] - media_compare["マジ得後補正後CV"]
     media_compare["差分"] = media_compare["予測CV"] - media_compare["実績CV"]
     media_compare["誤差率"] = np.where(
         media_compare["実績CV"].ne(0),
@@ -2931,22 +2955,35 @@ if uploaded_master and has_any_actual:
             bt_display["誤差率"] = bt_display["誤差率"].map(
                 lambda x: f"{x:+.1%}" if pd.notna(x) else "-"
             )
-            bt_export = (
-                bt_display[["media", "予測CV", "実績CV", "差分", "誤差率"]]
-                .rename(columns={"media": "媒体"})
-            )
-            st.dataframe(
-                bt_export,
-                width="stretch",
-                hide_index=True,
-            )
+            diagnostic_cols = [
+                "media", "学習稼働率", "稼働時日平均CV", "基礎期待CV/日", "学習対象日数", "稼働日数",
+                "基礎CV", "曜日補正後CV", "曜日影響CV",
+                "需要期補正後CV", "需要期影響CV",
+                "月初月末補正後CV", "月初月末影響CV",
+                "マジ得後補正後CV", "マジ得後影響CV",
+                "LINE補正後CV", "LINE影響CV",
+                "予測CV", "実績CV", "差分", "誤差率",
+            ]
+            diagnostic_cols = [c for c in diagnostic_cols if c in bt_display.columns]
+            bt_export = bt_display[diagnostic_cols].rename(columns={"media": "媒体"})
+            numeric_diag = [c for c in bt_export.columns if c not in {"媒体", "誤差率"}]
+            for c in numeric_diag:
+                bt_export[c] = pd.to_numeric(bt_export[c], errors="coerce").round(2)
+
             bt_month_filename = str(bt_target_month).replace("/", "-").replace(" ", "")
             st.download_button(
-                "📥 媒体別バックテスト結果をCSVで保存",
+                "📥 診断付きバックテストCSVを保存",
                 data=bt_export.to_csv(index=False).encode("utf-8-sig"),
                 file_name=f"AFF定常予測_バックテスト_{bt_month_filename}.csv",
                 mime="text/csv",
                 key=f"download_backtest_media_{bt_month_filename}",
+                type="primary",
+            )
+            st.caption("※ 表右上のExportではなく、このボタンから保存すると上記の分かりやすいファイル名になります。")
+            st.dataframe(
+                bt_export,
+                width="stretch",
+                hide_index=True,
             )
 
             inactive_bt = bt_result.get("inactive_media", pd.DataFrame())
