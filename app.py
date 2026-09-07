@@ -5,6 +5,7 @@
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
+import numpy as np
 import datetime
 import base64
 import glob
@@ -1785,47 +1786,135 @@ def _calculate_normal_month_base(
     history_df: pd.DataFrame,
     selected_months: list[str],
 ) -> pd.DataFrame:
-    """選択した月度の定常/通常実績から媒体×商品IDの日平均を返す。
+    """logic.factorsの定常学習ロジックを呼び出す互換ラッパー。"""
+    from logic.factors import calculate_normal_month_base
 
-    この処理はapp.py内に置き、logic.factorsの更新タイミング差による
-    ImportErrorでアプリ全体が起動不能になるのを防ぐ。
-    """
-    columns = ["media", "商品ID", "base_cv", "cost"]
-    if not selected_months:
-        return pd.DataFrame(columns=columns)
+    return calculate_normal_month_base(history_df, selected_months)
 
-    required = {"date", "media", "商品ID", "月度", "CPN名", "cv", "cost"}
-    missing = required - set(history_df.columns)
-    if missing:
-        raise ValueError(
-            "定常月度学習に必要な列がありません: " + ", ".join(sorted(missing))
-        )
 
+
+
+def _run_normal_backtest(
+    history_df: pd.DataFrame,
+    cpn_master: pd.DataFrame,
+    target_month: str,
+    learning_month_count: int = 6,
+) -> dict:
+    """指定月を未来扱いし、それ以前の実績だけで定常予測を再現する。"""
+    from logic.factors import calculate_dynamic_factor_tables, calculate_normal_month_base
+
+    normal_labels = {"通常", "定常"}
     work = history_df.copy()
     work["date"] = pd.to_datetime(work["date"], errors="coerce").dt.normalize()
     work["月度"] = work["月度"].astype("string").str.strip()
     work["CPN名"] = work["CPN名"].astype("string").str.strip()
 
-    selected_month_set = {str(x).strip() for x in selected_months}
-    selected = work[
-        work["月度"].isin(selected_month_set)
-        & work["CPN名"].isin(["通常", "定常"])
-    ].copy()
-    if selected.empty:
-        return pd.DataFrame(columns=columns)
-
-    total_days = selected["date"].dropna().nunique()
-    if total_days <= 0:
-        return pd.DataFrame(columns=columns)
-
-    result = (
-        selected.groupby(["media", "商品ID"], as_index=False)
-        .agg(total_cv=("cv", "sum"), total_cost=("cost", "sum"))
+    month_order = (
+        work.loc[
+            work["CPN名"].isin(normal_labels) & work["月度"].astype(str).ne("未設定"),
+            ["月度", "date"],
+        ]
+        .groupby("月度", as_index=False)
+        .agg(first_date=("date", "min"), last_date=("date", "max"))
+        .sort_values(["first_date", "月度"], kind="stable")
     )
-    result["base_cv"] = result["total_cv"] / float(total_days)
-    result["cost"] = result["total_cost"] / float(total_days)
-    return result[columns]
+    target_row = month_order.loc[month_order["月度"].astype(str).eq(str(target_month))]
+    if target_row.empty:
+        raise ValueError(f"{target_month} の定常実績がありません。")
 
+    target_dates_all = work.loc[work["月度"].astype(str).eq(str(target_month)), "date"].dropna()
+    target_start = (
+        pd.Timestamp(target_dates_all.min()).normalize()
+        if not target_dates_all.empty
+        else pd.Timestamp(target_row.iloc[0]["first_date"]).normalize()
+    )
+    prior_months = month_order.loc[month_order["last_date"].lt(target_start), "月度"].astype(str).tolist()
+    if not prior_months:
+        raise ValueError("バックテスト対象月より前の定常実績がありません。")
+
+    learning_month_count = max(1, int(learning_month_count))
+    learning_months = prior_months[-learning_month_count:]
+    training = work.loc[work["date"].lt(target_start)].copy()
+
+    base_pair = calculate_normal_month_base(training, learning_months)
+    if base_pair.empty:
+        raise ValueError("バックテスト学習期間に定常実績がありません。")
+    factor_tables = calculate_dynamic_factor_tables(training, learning_months)
+
+    # 対象月のカレンダー条件はCPNマスタだけから取得し、実績CVは予測計算へ渡さない。
+    master = cpn_master.copy()
+    master["日付"] = pd.to_datetime(master["日付"], errors="coerce").dt.normalize()
+    master["月度"] = master["月度"].astype("string").str.strip()
+    master["CPN名"] = master["CPN名"].astype("string").str.strip()
+    target_calendar = master.loc[
+        master["月度"].astype(str).eq(str(target_month)) & master["CPN名"].isin(normal_labels),
+        ["日付", "月度", "line_oa_flag", "magitoku_after_flag"],
+    ].drop_duplicates("日付")
+    if target_calendar.empty:
+        raise ValueError(f"CPNマスタに {target_month} の定常日がありません。")
+
+    future = pd.DataFrame({"date": sorted(target_calendar["日付"].dropna().unique())}).merge(base_pair, how="cross")
+    future["date"] = pd.to_datetime(future["date"]).dt.normalize()
+    future["weekday"] = future["date"].dt.day_name()
+    future = add_business_edge_flags(future)
+    future = future.merge(
+        target_calendar.rename(columns={"日付": "date"}),
+        on="date",
+        how="left",
+    )
+    future["line_oa_flag"] = future["line_oa_flag"].fillna(0).astype(int)
+    future["magitoku_after_flag"] = future["magitoku_after_flag"].fillna(0).astype(int)
+    future["CPN名"] = "通常"
+    future["cpn_factor"] = 1.0
+
+    forecast = forecast_cv(future, factor_tables)
+    forecast_daily = (
+        forecast.groupby(["date", "media"], as_index=False)
+        .agg(forecast_cv=("forecast_cv", "sum"))
+    )
+
+    actual = work.loc[
+        work["月度"].astype(str).eq(str(target_month)) & work["CPN名"].isin(normal_labels)
+    ].copy()
+    actual_daily = (
+        actual.groupby(["date", "media"], as_index=False)
+        .agg(actual_cv=("cv", "sum"))
+    )
+
+    daily_compare = forecast_daily.merge(actual_daily, on=["date", "media"], how="outer").fillna(0.0)
+    daily_compare["差分"] = daily_compare["forecast_cv"] - daily_compare["actual_cv"]
+    daily_compare["絶対誤差"] = daily_compare["差分"].abs()
+
+    media_compare = (
+        daily_compare.groupby("media", as_index=False)
+        .agg(予測CV=("forecast_cv", "sum"), 実績CV=("actual_cv", "sum"), 絶対誤差=("絶対誤差", "sum"))
+    )
+    media_compare["差分"] = media_compare["予測CV"] - media_compare["実績CV"]
+    media_compare["誤差率"] = np.where(
+        media_compare["実績CV"].ne(0),
+        media_compare["差分"] / media_compare["実績CV"],
+        np.nan,
+    )
+
+    total_forecast = float(daily_compare["forecast_cv"].sum())
+    total_actual = float(daily_compare["actual_cv"].sum())
+    total_diff = total_forecast - total_actual
+    total_error_rate = total_diff / total_actual if total_actual else np.nan
+    wape = float(daily_compare["絶対誤差"].sum() / total_actual) if total_actual else np.nan
+
+    return {
+        "target_month": str(target_month),
+        "learning_months": learning_months,
+        "cutoff_date": target_start - pd.Timedelta(days=1),
+        "total_forecast": total_forecast,
+        "total_actual": total_actual,
+        "total_diff": total_diff,
+        "total_error_rate": total_error_rate,
+        "wape": wape,
+        "media_compare": media_compare,
+        "daily_compare": daily_compare,
+        "excluded": factor_tables.get("excluded", pd.DataFrame()),
+    }
 
 
 def _prepare_af_history(uploaded_af_apply, uploaded_af_issue, af_code_master, cpn_master):
@@ -2165,6 +2254,7 @@ if uploaded_master and has_any_actual:
         from data.loader import add_business_edge_flags
         from logic.factors import (
             calculate_dynamic_factor_tables,
+            calculate_normal_month_base,
             calculate_selected_cpn_base,
             get_cpn_reference_periods,
             enforce_premium_media_cost,
@@ -2651,21 +2741,23 @@ if uploaded_master and has_any_actual:
         str(history_df["date"].max()),
         float(pd.to_numeric(history_df["cv"], errors="coerce").fillna(0).sum()),
         float(pd.to_numeric(history_df["cost"], errors="coerce").fillna(0).sum()),
+        tuple(selected_learning_months) if "selected_learning_months" in locals() else (),
     )
 
     if st.session_state.get("_factor_cache_key") == factor_cache_key:
         factor_tables = st.session_state["_factor_tables"]
     else:
         factor_tables = calculate_dynamic_factor_tables(
-            history_df
+            history_df,
+            selected_learning_months if "selected_learning_months" in locals() else None,
         )
         st.session_state["_factor_cache_key"] = factor_cache_key
         st.session_state["_factor_tables"] = factor_tables
 
     st.subheader("📐 実績から算出した変動係数")
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["曜日", "月初・月末", "需要期", "LINE OA"]
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["曜日", "月初・月末", "需要期", "LINE OA", "学習除外日"]
     )
 
     with tab1:
@@ -2701,6 +2793,131 @@ if uploaded_master and has_any_actual:
                 width="stretch",
                 hide_index=True,
             )
+
+
+    with tab5:
+        excluded = factor_tables.get("excluded", pd.DataFrame())
+        if excluded.empty:
+            st.info("マジ得直後・異常値による学習除外日はありません。")
+        else:
+            preview_excluded = excluded.copy()
+            if "date" in preview_excluded.columns:
+                preview_excluded["date"] = pd.to_datetime(preview_excluded["date"]).dt.strftime("%Y/%m/%d")
+            st.caption("定常の基礎値・変動係数の学習から除外した媒体×日です。予測対象実績そのものは削除しません。")
+            st.dataframe(
+                preview_excluded.round(3),
+                width="stretch",
+                hide_index=True,
+            )
+
+    st.subheader("🧪 定常バックテスト")
+    st.caption(
+        "対象月の実績を予測計算から隠し、前月末までのデータだけで当時の定常予測を再現します。"
+        "対象月の実績は比較表示にだけ使用します。"
+    )
+
+    bt_month_source = history_df[
+        history_df["CPN名"].isin(normal_labels)
+        & history_df["月度"].astype(str).ne("未設定")
+    ][["月度", "date"]].copy()
+    bt_month_order = (
+        bt_month_source.groupby("月度", as_index=False)
+        .agg(first_date=("date", "min"), last_date=("date", "max"))
+        .sort_values(["first_date", "月度"], kind="stable")
+    )
+    bt_options = bt_month_order["月度"].astype(str).tolist()[1:]
+
+    if not bt_options:
+        st.info("バックテストには2月度以上の定常実績が必要です。")
+    else:
+        bt_c1, bt_c2 = st.columns([2, 1])
+        with bt_c1:
+            bt_target_month = st.selectbox(
+                "検証する月度",
+                options=bt_options,
+                index=len(bt_options) - 1,
+                key="normal_backtest_target_month",
+                help="例: 8月度を選ぶと、7月末以前の実績だけで8月度を予測します。",
+            )
+        target_pos = bt_month_order.index[
+            bt_month_order["月度"].astype(str).eq(str(bt_target_month))
+        ][0]
+        target_order_pos = bt_month_order.index.get_loc(target_pos)
+        max_bt_months = max(1, target_order_pos)
+        default_bt_months = min(6, max_bt_months)
+        with bt_c2:
+            bt_learning_months = st.number_input(
+                "学習月度数",
+                min_value=1,
+                max_value=max_bt_months,
+                value=default_bt_months,
+                step=1,
+                key="normal_backtest_learning_months",
+            )
+
+        try:
+            bt_result = _run_normal_backtest(
+                history_df,
+                cpn_master,
+                bt_target_month,
+                int(bt_learning_months),
+            )
+            st.caption(
+                f"予測時点: {bt_result['cutoff_date'].strftime('%Y/%m/%d')} ／ "
+                f"学習月度: {', '.join(bt_result['learning_months'])}"
+            )
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("予測CV", f"{bt_result['total_forecast']:,.0f}")
+            m2.metric("実績CV", f"{bt_result['total_actual']:,.0f}")
+            m3.metric(
+                "差分",
+                f"{bt_result['total_diff']:+,.0f}",
+                delta=(
+                    f"{bt_result['total_error_rate']:+.1%}"
+                    if pd.notna(bt_result["total_error_rate"])
+                    else None
+                ),
+                delta_color="off",
+            )
+            m4.metric(
+                "日次WAPE",
+                f"{bt_result['wape']:.1%}" if pd.notna(bt_result["wape"]) else "-",
+                help="媒体×日ごとの絶対誤差合計 ÷ 実績CV合計。小さいほど予測精度が高い指標です。",
+            )
+
+            bt_display = bt_result["media_compare"].copy()
+            bt_display["予測CV"] = bt_display["予測CV"].round(0).astype(int)
+            bt_display["実績CV"] = bt_display["実績CV"].round(0).astype(int)
+            bt_display["差分"] = bt_display["差分"].round(0).astype(int)
+            bt_display["誤差率"] = bt_display["誤差率"].map(
+                lambda x: f"{x:+.1%}" if pd.notna(x) else "-"
+            )
+            st.dataframe(
+                bt_display[["media", "予測CV", "実績CV", "差分", "誤差率"]]
+                .rename(columns={"media": "媒体"}),
+                width="stretch",
+                hide_index=True,
+            )
+
+            with st.expander("バックテスト日別明細"):
+                bt_daily = bt_result["daily_compare"].copy()
+                bt_daily["date"] = pd.to_datetime(bt_daily["date"]).dt.strftime("%Y/%m/%d")
+                bt_daily = bt_daily.rename(
+                    columns={
+                        "date": "日付",
+                        "media": "媒体",
+                        "forecast_cv": "予測CV",
+                        "actual_cv": "実績CV",
+                    }
+                )
+                st.dataframe(
+                    bt_daily[["日付", "媒体", "予測CV", "実績CV", "差分"]].round(2),
+                    width="stretch",
+                    hide_index=True,
+                )
+        except Exception as bt_exc:
+            st.warning(f"バックテストを実行できませんでした: {bt_exc}")
 
     # ---------------------------------------------------------
     # 予測 → 松竹梅 → 最適化 は一度計算したら session_state に保持。
