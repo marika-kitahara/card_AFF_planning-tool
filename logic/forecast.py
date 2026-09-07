@@ -12,7 +12,8 @@ def forecast_cv(
     # 診断用に、補正を1段ずつ適用した途中値を保持する。
     # 最終 forecast_cv の式自体は従来と同じ。
     df["stage_base_cv"] = df["base_cv"] * df["cpn_factor"]
-    df["stage_weekday_cv"] = df["stage_base_cv"] * df["weekday_factor"]
+    df["stage_unit_price_cv"] = df["stage_base_cv"] * df.get("unit_price_factor", 1.0)
+    df["stage_weekday_cv"] = df["stage_unit_price_cv"] * df["weekday_factor"]
     df["stage_season_cv"] = df["stage_weekday_cv"] * df["season_factor"]
     df["stage_month_edge_cv"] = df["stage_season_cv"] * df["month_edge_factor"]
     df["stage_after_cv"] = df["stage_month_edge_cv"] * df["after_factor"]

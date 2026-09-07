@@ -9,6 +9,12 @@ from config.constants import (
     OUTLIER_MAD_Z_THRESHOLD,
     FACTOR_PRIOR_DAYS,
     INACTIVE_MEDIA_LOOKBACK_DAYS,
+    UNIT_PRICE_MIN_MONTHS,
+    UNIT_PRICE_PRIOR_MONTHS,
+    UNIT_PRICE_ELASTICITY_MIN,
+    UNIT_PRICE_ELASTICITY_MAX,
+    UNIT_PRICE_FACTOR_MIN,
+    UNIT_PRICE_FACTOR_MAX,
 )
 
 
@@ -355,6 +361,101 @@ def calculate_selected_cpn_base(
     return result[columns]
 
 
+
+def calculate_unit_price_response_table(
+    history_df: pd.DataFrame,
+    selected_months: list[str] | None = None,
+) -> pd.DataFrame:
+    """媒体別に、1件あたり単価と日平均CVの関係を月度単位で推定する。
+
+    COST合計はCV増加に伴って増えるため、そのまま説明変数にはしない。
+    月度ごとの unit_price = total_cost / total_cv を使い、
+    log(日平均CV) ~ elasticity * log(unit_price) の傾きを安全に縮小して返す。
+    データ不足・単価変動不足では elasticity=0（補正なし）。
+    """
+    columns = [
+        "media", "reference_unit_price", "latest_unit_price", "elasticity_raw",
+        "elasticity", "sample_months", "price_variation", "fit_r2",
+    ]
+    clean, daily, _ = _prepare_normal_learning_data(history_df, selected_months)
+    if clean.empty or daily.empty:
+        return pd.DataFrame(columns=columns)
+
+    # 媒体×月度のCV/COSTを元粒度から集計。日平均CVの分母は媒体行がない日も含む全定常日。
+    work = clean.copy()
+    work["cv"] = pd.to_numeric(work["cv"], errors="coerce").fillna(0.0)
+    work["cost"] = pd.to_numeric(work["cost"], errors="coerce").fillna(0.0)
+    work["month_key"] = work["月度"].astype("string").str.strip()
+    monthly = work.groupby(["media", "month_key"], as_index=False).agg(
+        total_cv=("cv", "sum"), total_cost=("cost", "sum"), last_date=("date", "max")
+    )
+    eligible = daily.copy()
+    if "月度" not in eligible.columns:
+        # dailyには月度がない旧データ互換。dateからcleanの月度を戻す。
+        date_month = clean[["date", "月度"]].drop_duplicates("date")
+        eligible = eligible.merge(date_month, on="date", how="left")
+    eligible["month_key"] = eligible["月度"].astype("string").str.strip()
+    day_counts = eligible.groupby(["media", "month_key"])["date"].nunique().rename("eligible_days")
+    monthly = monthly.merge(day_counts.reset_index(), on=["media", "month_key"], how="left")
+    monthly["eligible_days"] = pd.to_numeric(monthly["eligible_days"], errors="coerce").fillna(0).clip(lower=1)
+    monthly["daily_cv"] = monthly["total_cv"] / monthly["eligible_days"]
+    monthly["unit_price"] = monthly["total_cost"] / monthly["total_cv"].replace(0, np.nan)
+    monthly = monthly.replace([np.inf, -np.inf], np.nan)
+    monthly = monthly.loc[
+        monthly["daily_cv"].gt(0) & monthly["unit_price"].gt(0)
+    ].copy()
+    if monthly.empty:
+        return pd.DataFrame(columns=columns)
+
+    # 選択月度の新しい月ほど重くするため、last_dateから月順位を作る。
+    max_period = monthly["last_date"].dt.to_period("M").max()
+    month_period = monthly["last_date"].dt.to_period("M")
+    monthly["month_age"] = month_period.map(lambda x: int(max_period.ordinal - x.ordinal) if pd.notna(x) else 0)
+    monthly["w"] = RECENCY_MONTH_DECAY ** monthly["month_age"].clip(lower=0)
+
+    rows = []
+    for media, g in monthly.groupby("media", sort=False):
+        g = g.sort_values("last_date")
+        n = int(len(g))
+        ref_price = _weighted_mean(g["unit_price"], g["w"])
+        latest_price = float(g.iloc[-1]["unit_price"]) if n else np.nan
+        raw = 0.0
+        shrunk = 0.0
+        fit_r2 = 0.0
+        variation = 0.0
+        if n >= UNIT_PRICE_MIN_MONTHS:
+            x = np.log(pd.to_numeric(g["unit_price"], errors="coerce").to_numpy(dtype=float))
+            y = np.log(pd.to_numeric(g["daily_cv"], errors="coerce").to_numpy(dtype=float))
+            w = pd.to_numeric(g["w"], errors="coerce").fillna(0).to_numpy(dtype=float)
+            valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(w) & (w > 0)
+            x, y, w = x[valid], y[valid], w[valid]
+            if len(x) >= UNIT_PRICE_MIN_MONTHS and np.ptp(x) >= 0.05:
+                variation = float(np.exp(np.max(x) - np.min(x)) - 1.0)
+                wx = np.average(x, weights=w)
+                wy = np.average(y, weights=w)
+                varx = np.average((x - wx) ** 2, weights=w)
+                if varx > 1e-8:
+                    raw = float(np.average((x - wx) * (y - wy), weights=w) / varx)
+                    raw = float(np.clip(raw, UNIT_PRICE_ELASTICITY_MIN, UNIT_PRICE_ELASTICITY_MAX))
+                    yhat = wy + raw * (x - wx)
+                    sst = float(np.sum(w * (y - wy) ** 2))
+                    sse = float(np.sum(w * (y - yhat) ** 2))
+                    fit_r2 = max(0.0, min(1.0, 1.0 - sse / sst)) if sst > 1e-8 else 0.0
+                    # 月数が少ない・説明力が弱いほど0（補正なし）へ強く縮小。
+                    confidence = n / float(n + UNIT_PRICE_PRIOR_MONTHS)
+                    shrunk = raw * confidence * fit_r2
+        rows.append({
+            "media": media,
+            "reference_unit_price": float(ref_price) if pd.notna(ref_price) else np.nan,
+            "latest_unit_price": latest_price,
+            "elasticity_raw": raw,
+            "elasticity": float(shrunk),
+            "sample_months": n,
+            "price_variation": variation,
+            "fit_r2": fit_r2,
+        })
+    return pd.DataFrame(rows, columns=columns)
+
 def calculate_dynamic_factor_tables(
     history_df: pd.DataFrame,
     selected_months: list[str] | None = None,
@@ -369,7 +470,7 @@ def calculate_dynamic_factor_tables(
     normal, daily, excluded = _prepare_normal_learning_data(history_df, selected_months)
     if daily.empty:
         empty = pd.DataFrame()
-        return {"weekday": empty, "month_edge": empty, "season": empty, "line_oa": empty, "excluded": excluded}
+        return {"weekday": empty, "month_edge": empty, "season": empty, "line_oa": empty, "unit_price": empty, "excluded": excluded}
 
     # 媒体ごとの全体基準CV。基礎値と同じく全定常日を直近加重で評価する。
     base_by_media = daily.groupby("media")[["cv", "recency_weight"]].apply(
@@ -495,6 +596,7 @@ def calculate_dynamic_factor_tables(
     line_oa = pd.DataFrame(line_rows)
 
     inactive_media = identify_inactive_media(history_df, selected_months)
+    unit_price = calculate_unit_price_response_table(history_df, selected_months)
 
     return {
         "weekday": weekday_avg,
@@ -503,6 +605,7 @@ def calculate_dynamic_factor_tables(
         "line_oa": line_oa,
         "excluded": excluded,
         "inactive_media": inactive_media,
+        "unit_price": unit_price,
     }
 
 
@@ -516,6 +619,10 @@ def apply_dynamic_factors(
     season_map = factor_tables["season"].set_index(["media", "month"])["factor"] if not factor_tables["season"].empty else pd.Series(dtype=float)
     edge_map = factor_tables["month_edge"].set_index(["media", "区分"])["factor"] if not factor_tables["month_edge"].empty else pd.Series(dtype=float)
     line_map = factor_tables["line_oa"].set_index("media")["factor"] if not factor_tables["line_oa"].empty else pd.Series(dtype=float)
+    unit_tbl = factor_tables.get("unit_price", pd.DataFrame())
+    unit_ref_map = unit_tbl.set_index("media")["reference_unit_price"] if not unit_tbl.empty else pd.Series(dtype=float)
+    unit_latest_map = unit_tbl.set_index("media")["latest_unit_price"] if not unit_tbl.empty else pd.Series(dtype=float)
+    unit_elasticity_map = unit_tbl.set_index("media")["elasticity"] if not unit_tbl.empty else pd.Series(dtype=float)
 
     out["weekday_factor"] = [weekday_map.get((m, w), 1.0) for m, w in zip(out["media"], out["weekday"])]
     out["season_factor"] = [season_map.get((m, month), 1.0) for m, month in zip(out["media"], out["date"].dt.month)]
@@ -531,6 +638,23 @@ def apply_dynamic_factors(
 
     out["after_factor"] = 1.0
     out.loc[out["magitoku_after_flag"].eq(1), "after_factor"] = MAGITOKU_AFTER_FACTOR
+
+    # 単価補正: 指定単価があればそれを、なければ学習期間の直近単価を使用。
+    # 基準単価は学習期間の直近加重平均。データ不足ではelasticity=0なので必ず1.0。
+    out["unit_price_reference"] = out["media"].map(unit_ref_map)
+    out["unit_price_latest"] = out["media"].map(unit_latest_map)
+    out["unit_price_elasticity"] = out["media"].map(unit_elasticity_map).fillna(0.0)
+    if "planned_unit_price" in out.columns:
+        planned = pd.to_numeric(out["planned_unit_price"], errors="coerce")
+    else:
+        planned = pd.Series(np.nan, index=out.index, dtype=float)
+    out["unit_price_planned"] = planned.fillna(out["unit_price_latest"]).fillna(out["unit_price_reference"])
+    ratio = out["unit_price_planned"] / out["unit_price_reference"].replace(0, np.nan)
+    ratio = ratio.replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(lower=0.25, upper=4.0)
+    out["unit_price_factor"] = np.power(ratio, out["unit_price_elasticity"])
+    out["unit_price_factor"] = pd.to_numeric(out["unit_price_factor"], errors="coerce").fillna(1.0).clip(
+        lower=UNIT_PRICE_FACTOR_MIN, upper=UNIT_PRICE_FACTOR_MAX
+    )
     return out
 
 
