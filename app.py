@@ -1868,6 +1868,32 @@ def _run_normal_backtest(
     future["cpn_factor"] = 1.0
 
     forecast = forecast_cv(future, factor_tables)
+
+    # 診断列は forecast.py 側でも生成するが、旧ファイルとの混在や
+    # デプロイ差し替え漏れがあってもバックテスト自体が落ちないよう、
+    # ここでも不足列を再構築する。最終予測式は従来と同一。
+    stage_formulas = {
+        "stage_base_cv": ("base_cv", "cpn_factor"),
+        "stage_weekday_cv": ("stage_base_cv", "weekday_factor"),
+        "stage_season_cv": ("stage_weekday_cv", "season_factor"),
+        "stage_month_edge_cv": ("stage_season_cv", "month_edge_factor"),
+        "stage_after_cv": ("stage_month_edge_cv", "after_factor"),
+        "stage_line_cv": ("stage_after_cv", "line_factor"),
+    }
+    for stage_col, (left_col, factor_col) in stage_formulas.items():
+        if stage_col not in forecast.columns:
+            if left_col not in forecast.columns or factor_col not in forecast.columns:
+                raise ValueError(
+                    f"バックテスト診断列を再構築できません: {stage_col} "
+                    f"(必要列: {left_col}, {factor_col})"
+                )
+            forecast[stage_col] = (
+                pd.to_numeric(forecast[left_col], errors="coerce").fillna(0.0)
+                * pd.to_numeric(forecast[factor_col], errors="coerce").fillna(1.0)
+            )
+    if "forecast_cv" not in forecast.columns:
+        forecast["forecast_cv"] = forecast["stage_line_cv"]
+
     forecast_daily = (
         forecast.groupby(["date", "media"], as_index=False)
         .agg(
