@@ -1785,11 +1785,12 @@ def _daily_pair_average(df: pd.DataFrame) -> pd.DataFrame:
 def _calculate_normal_month_base(
     history_df: pd.DataFrame,
     selected_months: list[str],
+    calendar_dates=None,
 ) -> pd.DataFrame:
     """logic.factorsの定常学習ロジックを呼び出す互換ラッパー。"""
     from logic.factors import calculate_normal_month_base
 
-    return calculate_normal_month_base(history_df, selected_months)
+    return calculate_normal_month_base(history_df, selected_months, calendar_dates=calendar_dates)
 
 
 
@@ -1941,21 +1942,39 @@ def _run_normal_backtest(
     target_start = pd.Timestamp(target_dates.min()).normalize()
     target_end = pd.Timestamp(target_dates.max()).normalize()
 
-    # 学習期間は営業操作・自動探索を行わず、直近6月度に固定する。
-    # 過去月度が6未満の場合のみ、利用可能な全月度を使う。
+    # 学習はCPN月度数ではなく、予測基準日以前の直近60暦日に固定する。
+    # CPN月度の日数・その中の定常日数が不均一でも、同じ時間幅で現在の媒体力を評価する。
     learning_score_table = pd.DataFrame()
-    if learning_month_count is None:
-        learning_month_count = min(6, len(prior_months))
-    learning_month_count = max(1, min(int(learning_month_count), len(prior_months)))
-    learning_months = prior_months[-learning_month_count:]
+    cutoff_date = target_start - pd.Timedelta(days=1)
+    learning_start = cutoff_date - pd.Timedelta(days=59)
+    training = work.loc[work["date"].between(learning_start, cutoff_date)].copy()
 
-    # 対象月度の最初のCPN対象日より前だけを学習に使う。
-    training = work.loc[work["date"].lt(target_start)].copy()
+    # 60日窓のうち、CPNマスタ上で「通常/定常」の日だけを0CV日の分母にも使う。
+    learning_calendar_dates = (
+        master.loc[
+            master["日付"].between(learning_start, cutoff_date)
+            & master["CPN名"].isin(normal_labels),
+            "日付",
+        ]
+        .dropna().drop_duplicates().sort_values().tolist()
+    )
+    if not learning_calendar_dates:
+        raise ValueError("予測基準日前60日間にCPNマスタの定常日がありません。")
 
-    base_pair = calculate_normal_month_base(training, learning_months)
+    learning_months = (
+        training.loc[training["CPN名"].isin(normal_labels), "月度"]
+        .dropna().astype(str).loc[lambda x: x.ne("未設定")].drop_duplicates().tolist()
+    )
+    learning_month_count = len(learning_months)
+
+    base_pair = calculate_normal_month_base(
+        training, learning_months, calendar_dates=learning_calendar_dates
+    )
     if base_pair.empty:
-        raise ValueError("バックテスト学習期間に定常実績がありません。")
-    factor_tables = calculate_dynamic_factor_tables(training, learning_months)
+        raise ValueError("予測基準日前60日間に定常実績がありません。")
+    factor_tables = calculate_dynamic_factor_tables(
+        training, learning_months, calendar_dates=learning_calendar_dates
+    )
 
     # 学習データ監査: 予測ロジックは変えず、「実際に何を学習対象にしたか」だけ可視化する。
     # CPNマスタ上の対象日数と、ローデータ上の実績量を月度別に並べる。
@@ -2105,7 +2124,7 @@ def _run_normal_backtest(
     )
 
     # 予測の土台を監査できるよう、稼働率×稼働時CVの内訳を媒体別結果へ付与。
-    diagnostics = calculate_normal_media_diagnostics(training, learning_months)
+    diagnostics = calculate_normal_media_diagnostics(training, learning_months, calendar_dates=learning_calendar_dates)
     if not diagnostics.empty:
         diagnostics = diagnostics.rename(columns={
             "activity_rate": "学習稼働率",
@@ -2158,7 +2177,9 @@ def _run_normal_backtest(
         "learning_months": learning_months,
         "learning_month_count": learning_month_count,
         "learning_score_table": learning_score_table,
-        "cutoff_date": target_start - pd.Timedelta(days=1),
+        "cutoff_date": cutoff_date,
+        "learning_start": learning_start,
+        "learning_calendar_day_count": len(learning_calendar_dates),
         "target_start": target_start,
         "target_end": target_end,
         "target_day_count": int(target_dates.nunique()),
@@ -2861,31 +2882,46 @@ if uploaded_master and has_any_actual:
             st.error("施策①と施策②の期間が重複しています。期間が重ならないように設定してください。")
             st.stop()
 
-    # 定常の基礎値は、選択月度の定常実績の日平均から算出する。
+    # 定常学習はCPN月度数ではなく、予測開始日前の直近60暦日に固定する。
+    # 月度日数・定常日数が不均一でも、同じ時間幅で現在の媒体力を評価する。
     needs_normal_learning = any(seg["cpn"] in normal_labels for seg in planning_segments)
     selected_learning_months = []
+    normal_training_df = history_df
+    normal_learning_calendar_dates = None
+    normal_learning_start = None
+    normal_learning_cutoff = None
     if needs_normal_learning:
-        normal_month_source = history_df[
-            history_df["CPN名"].isin(normal_labels)
-            & history_df["月度"].astype(str).ne("未設定")
-        ][["date", "月度"]].copy()
-        normal_month_order = (
-            normal_month_source.groupby("月度", as_index=False)
-            .agg(last_date=("date", "max"))
-            .sort_values(["last_date", "月度"], kind="stable")
+        first_normal_start = min(
+            pd.Timestamp(seg["start"]).normalize()
+            for seg in planning_segments if seg["cpn"] in normal_labels
         )
-        month_options = normal_month_order["月度"].astype(str).tolist()
-        default_months = month_options[-6:] if len(month_options) > 6 else month_options
-
-        selected_learning_months = st.sidebar.multiselect(
-            "定常 学習月度（複数選択）",
-            options=month_options,
-            default=default_months,
-            help="デフォルトは実績で読めた直近6月度。選択月度内の定常CV合計÷定常日数を基礎日平均にします。",
+        normal_learning_cutoff = first_normal_start - pd.Timedelta(days=1)
+        normal_learning_start = normal_learning_cutoff - pd.Timedelta(days=59)
+        normal_training_df = history_df.loc[
+            pd.to_datetime(history_df["date"], errors="coerce").dt.normalize()
+            .between(normal_learning_start, normal_learning_cutoff)
+        ].copy()
+        normal_learning_calendar_dates = (
+            cpn_master.loc[
+                pd.to_datetime(cpn_master["日付"], errors="coerce").dt.normalize()
+                .between(normal_learning_start, normal_learning_cutoff)
+                & cpn_master["CPN名"].astype(str).str.strip().isin(normal_labels),
+                "日付",
+            ]
+            .pipe(pd.to_datetime, errors="coerce")
+            .dropna().dt.normalize().drop_duplicates().sort_values().tolist()
         )
-        if not selected_learning_months:
-            st.warning("定常を使う場合は学習月度を1つ以上選択してください。")
+        selected_learning_months = (
+            normal_training_df.loc[normal_training_df["CPN名"].isin(normal_labels), "月度"]
+            .dropna().astype(str).loc[lambda x: x.ne("未設定")].drop_duplicates().tolist()
+        )
+        if not normal_learning_calendar_dates:
+            st.error("予測開始日前60日間にCPNマスタの定常日がありません。")
             st.stop()
+        st.sidebar.caption(
+            f"定常学習: {normal_learning_start.strftime('%Y/%m/%d')}〜"
+            f"{normal_learning_cutoff.strftime('%Y/%m/%d')}（直近60日）"
+        )
 
     segment_bases = []
     reference_descriptions = []
@@ -2894,15 +2930,17 @@ if uploaded_master and has_any_actual:
         selected_cpn = seg["cpn"]
         if selected_cpn in normal_labels:
             base_pair_seg = _calculate_normal_month_base(
-                history_df,
+                normal_training_df,
                 selected_learning_months,
+                calendar_dates=normal_learning_calendar_dates,
             )
             if base_pair_seg.empty:
-                st.error("選択した月度に定常実績がありません。")
+                st.error("予測開始日前60日間に定常実績がありません。")
                 st.stop()
-            reference_key_seg = ("normal_months", tuple(selected_learning_months))
+            reference_key_seg = ("normal_60days", str(normal_learning_start), str(normal_learning_cutoff))
             reference_descriptions.append(
-                f"{seg['label']} {selected_cpn}: 定常学習月度 " + ", ".join(selected_learning_months)
+                f"{seg['label']} {selected_cpn}: 定常学習 直近60日 "
+                f"({normal_learning_start.strftime('%Y/%m/%d')}〜{normal_learning_cutoff.strftime('%Y/%m/%d')})"
             )
         else:
             available_periods = get_cpn_reference_periods(history_df, selected_cpn)
@@ -3000,15 +3038,16 @@ if uploaded_master and has_any_actual:
         str(history_df["date"].max()),
         float(pd.to_numeric(history_df["cv"], errors="coerce").fillna(0).sum()),
         float(pd.to_numeric(history_df["cost"], errors="coerce").fillna(0).sum()),
-        tuple(selected_learning_months) if "selected_learning_months" in locals() else (),
+        (str(normal_learning_start), str(normal_learning_cutoff)) if needs_normal_learning else (),
     )
 
     if st.session_state.get("_factor_cache_key") == factor_cache_key:
         factor_tables = st.session_state["_factor_tables"]
     else:
         factor_tables = calculate_dynamic_factor_tables(
-            history_df,
-            selected_learning_months if "selected_learning_months" in locals() else None,
+            normal_training_df if needs_normal_learning else history_df,
+            selected_learning_months if needs_normal_learning else None,
+            calendar_dates=normal_learning_calendar_dates if needs_normal_learning else None,
         )
         st.session_state["_factor_cache_key"] = factor_cache_key
         st.session_state["_factor_tables"] = factor_tables
@@ -3132,13 +3171,13 @@ if uploaded_master and has_any_actual:
                 history_df,
                 cpn_master,
                 bt_target_month,
-                learning_month_count=6,
                 auto_select_learning=False,
             )
             st.caption(
                 f"検証対象: CPNマスタ {bt_result['target_month']}（定常{bt_result['target_day_count']}日） ／ "
                 f"予測基準日: {bt_result['cutoff_date'].strftime('%Y/%m/%d')} ／ "
-                f"学習期間: 直近{bt_result['learning_month_count']}月度（固定）"
+                f"学習期間: {bt_result['learning_start'].strftime('%Y/%m/%d')}〜{bt_result['cutoff_date'].strftime('%Y/%m/%d')} "
+                f"（直近60日・定常{bt_result['learning_calendar_day_count']}日）"
             )
 
             m1, m2, m3, m4 = st.columns(4)
