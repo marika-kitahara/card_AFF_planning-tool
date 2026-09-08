@@ -1910,7 +1910,7 @@ def _run_normal_backtest(
     auto_select_learning: bool = True,
 ) -> dict:
     """指定月を未来扱いし、それ以前の実績だけで定常予測を再現する。"""
-    from logic.factors import calculate_dynamic_factor_tables, calculate_normal_month_base, calculate_normal_media_diagnostics, calculate_unit_price_response_table
+    from logic.factors import calculate_dynamic_factor_tables, calculate_normal_month_base, calculate_normal_media_diagnostics, calculate_unit_price_response_table, calculate_media_continuation_table
 
     normal_labels = {"通常", "定常"}
     work = history_df.copy()
@@ -2065,6 +2065,26 @@ def _run_normal_backtest(
     if "forecast_cv" not in forecast.columns:
         forecast["forecast_cv"] = forecast["stage_line_cv"]
 
+    # 掲載有無は過去CVだけでは完全には予知できないため、
+    # バックテストでは「未定」として過去の月度間掲載継続率を期待値に反映する。
+    # 対象月の実績は一切使わず、予測基準日までの履歴だけで算出する。
+    continuation_bt = calculate_media_continuation_table(
+        work.loc[work["date"].le(cutoff_date)].copy(),
+        cpn_master=master,
+        cutoff_date=cutoff_date,
+    )
+    continuation_map = (
+        continuation_bt.set_index("media")["continuation_rate"].to_dict()
+        if not continuation_bt.empty else {}
+    )
+    global_cont_rate = (
+        float(continuation_bt["global_continuation_rate"].iloc[0])
+        if not continuation_bt.empty else 0.70
+    )
+    forecast["掲載継続率"] = forecast["media"].map(continuation_map).fillna(global_cont_rate).clip(0.0, 1.0)
+    forecast["forecast_cv_before_publication"] = pd.to_numeric(forecast["forecast_cv"], errors="coerce").fillna(0.0)
+    forecast["forecast_cv"] = forecast["forecast_cv_before_publication"] * forecast["掲載継続率"]
+
     forecast_daily = (
         forecast.groupby(["date", "media"], as_index=False)
         .agg(
@@ -2075,6 +2095,8 @@ def _run_normal_backtest(
             月初月末補正後CV=("stage_month_edge_cv", "sum"),
             マジ得後補正後CV=("stage_after_cv", "sum"),
             LINE補正後CV=("stage_line_cv", "sum"),
+            掲載判定前CV=("forecast_cv_before_publication", "sum"),
+            予測掲載継続率=("掲載継続率", "mean"),
             forecast_cv=("forecast_cv", "sum"),
         )
     )
@@ -2104,6 +2126,8 @@ def _run_normal_backtest(
             月初月末補正後CV=("月初月末補正後CV", "sum"),
             マジ得後補正後CV=("マジ得後補正後CV", "sum"),
             LINE補正後CV=("LINE補正後CV", "sum"),
+            掲載判定前CV=("掲載判定前CV", "sum"),
+            予測掲載継続率=("予測掲載継続率", "mean"),
             予測CV=("forecast_cv", "sum"),
             実績CV=("actual_cv", "sum"),
             絶対誤差=("絶対誤差", "sum"),
@@ -2122,6 +2146,8 @@ def _run_normal_backtest(
         media_compare["差分"] / media_compare["実績CV"],
         np.nan,
     )
+    media_compare["掲載継続影響CV"] = media_compare["予測CV"] - media_compare["掲載判定前CV"]
+    media_compare["対象月掲載実績"] = np.where(media_compare["実績CV"].gt(0), "継続", "終了/未掲載")
 
     # 予測の土台を監査できるよう、稼働率×稼働時CVの内訳を媒体別結果へ付与。
     diagnostics = calculate_normal_media_diagnostics(training, learning_months, calendar_dates=learning_calendar_dates)
@@ -2166,8 +2192,15 @@ def _run_normal_backtest(
             actual_price[["media", "対象月実績単価_診断のみ"]], on="media", how="left"
         )
 
+    total_forecast_before_publication = float(daily_compare["掲載判定前CV"].sum())
     total_forecast = float(daily_compare["forecast_cv"].sum())
     total_actual = float(daily_compare["actual_cv"].sum())
+    actual_active_media = set(media_compare.loc[media_compare["実績CV"].gt(0), "media"].astype(str))
+    continued_media_raw_forecast = float(
+        media_compare.loc[media_compare["media"].astype(str).isin(actual_active_media), "掲載判定前CV"].sum()
+    )
+    publication_end_raw_forecast = total_forecast_before_publication - continued_media_raw_forecast
+    continued_media_raw_error_rate = (continued_media_raw_forecast - total_actual) / total_actual if total_actual else np.nan
     total_diff = total_forecast - total_actual
     total_error_rate = total_diff / total_actual if total_actual else np.nan
     wape = float(daily_compare["絶対誤差"].sum() / total_actual) if total_actual else np.nan
@@ -2183,7 +2216,11 @@ def _run_normal_backtest(
         "target_start": target_start,
         "target_end": target_end,
         "target_day_count": int(target_dates.nunique()),
+        "total_forecast_before_publication": total_forecast_before_publication,
         "total_forecast": total_forecast,
+        "continued_media_raw_forecast": continued_media_raw_forecast,
+        "continued_media_raw_error_rate": continued_media_raw_error_rate,
+        "publication_end_raw_forecast": publication_end_raw_forecast,
         "total_actual": total_actual,
         "total_diff": total_diff,
         "total_error_rate": total_error_rate,
@@ -2192,6 +2229,7 @@ def _run_normal_backtest(
         "daily_compare": daily_compare,
         "excluded": factor_tables.get("excluded", pd.DataFrame()),
         "inactive_media": factor_tables.get("inactive_media", pd.DataFrame()),
+        "continuation_table": continuation_bt,
         "learning_audit": learning_audit,
         "learning_summary": learning_summary,
     }
@@ -2538,6 +2576,7 @@ if uploaded_master and has_any_actual:
             calculate_selected_cpn_base,
             get_cpn_reference_periods,
             enforce_premium_media_cost,
+            calculate_media_continuation_table,
         )
         from config.constants import RECENT_NORMAL_DAYS
 
@@ -3133,6 +3172,69 @@ if uploaded_master and has_any_actual:
                 hide_index=True,
             )
 
+    # ---------------------------------------------------------
+    # 定常媒体の掲載予定。過去データだけでは翌月度の掲載終了を完全には予知できないため、
+    # 営業が知っている情報を優先し、未定だけ過去の掲載継続率で期待値化する。
+    # ---------------------------------------------------------
+    publication_factor_map = {m: 1.0 for m in selected_media}
+    publication_status_map = {m: "掲載予定" for m in selected_media}
+    continuation_table_main = pd.DataFrame()
+    if needs_normal_learning:
+        continuation_history = history_df.loc[
+            pd.to_datetime(history_df["date"], errors="coerce").dt.normalize().le(normal_learning_cutoff)
+        ].copy()
+        continuation_table_main = calculate_media_continuation_table(
+            continuation_history,
+            cpn_master=cpn_master,
+            cutoff_date=normal_learning_cutoff,
+        )
+        cont_map_main = (
+            continuation_table_main.set_index("media")["continuation_rate"].to_dict()
+            if not continuation_table_main.empty else {}
+        )
+        global_cont_main = (
+            float(continuation_table_main["global_continuation_rate"].iloc[0])
+            if not continuation_table_main.empty else 0.70
+        )
+
+        st.subheader("📌 定常媒体の掲載予定")
+        st.caption(
+            "掲載予定は予測を100%採用、掲載なしは0件、未定は過去の掲載継続率を掛けた期待値で予測します。"
+            "営業側で把握している掲載予定を、過去データの推測より優先します。"
+        )
+        publication_editor = pd.DataFrame({
+            "媒体": selected_media,
+            "掲載状態": ["未定"] * len(selected_media),
+            "未定時継続率(%)": [float(cont_map_main.get(m, global_cont_main)) * 100.0 for m in selected_media],
+        })
+        publication_editor["未定時継続率(%)"] = publication_editor["未定時継続率(%)"].clip(0, 100)
+        edited_publication = st.data_editor(
+            publication_editor,
+            width="stretch",
+            hide_index=True,
+            disabled=["媒体", "未定時継続率(%)"],
+            column_config={
+                "掲載状態": st.column_config.SelectboxColumn(
+                    "掲載状態",
+                    options=["掲載予定", "未定", "掲載なし"],
+                    required=True,
+                ),
+                "未定時継続率(%)": st.column_config.NumberColumn(
+                    "未定時継続率(%)",
+                    format="%.0f",
+                    help="過去の定常月度間で、掲載が次月度も継続した確率。未定の場合だけ予測へ使用します。",
+                ),
+            },
+            key="normal_publication_status_editor",
+        )
+        for _, r in edited_publication.iterrows():
+            media = str(r["媒体"])
+            status = str(r["掲載状態"])
+            cont_raw = pd.to_numeric(r["未定時継続率(%)"], errors="coerce")
+            cont = float(cont_raw) / 100.0 if pd.notna(cont_raw) else 0.0
+            publication_status_map[media] = status
+            publication_factor_map[media] = 1.0 if status == "掲載予定" else (0.0 if status == "掲載なし" else cont)
+
     st.subheader("🧪 定常バックテスト")
     st.caption(
         "対象月度の実績を予測計算から隠し、CPNマスタ上の対象月度開始日前までのデータだけで当時の定常予測を再現します。"
@@ -3198,6 +3300,18 @@ if uploaded_master and has_any_actual:
                 f"{bt_result['wape']:.1%}" if pd.notna(bt_result["wape"]) else "-",
                 help="媒体×日ごとの絶対誤差合計 ÷ 実績CV合計。小さいほど予測精度が高い指標です。",
             )
+            b1, b2, b3 = st.columns(3)
+            b1.metric("掲載判定前予測", f"{bt_result.get('total_forecast_before_publication', 0):,.0f}")
+            b2.metric(
+                "実績継続媒体だけの素予測",
+                f"{bt_result.get('continued_media_raw_forecast', 0):,.0f}",
+                delta=(
+                    f"{bt_result.get('continued_media_raw_error_rate'):+.1%}"
+                    if pd.notna(bt_result.get('continued_media_raw_error_rate')) else None
+                ),
+                delta_color="off",
+            )
+            b3.metric("実績終了/未掲載媒体への素予測", f"{bt_result.get('publication_end_raw_forecast', 0):,.0f}")
 
             bt_display = bt_result["media_compare"].copy()
             bt_display["予測CV"] = bt_display["予測CV"].round(0).astype(int)
@@ -3213,6 +3327,7 @@ if uploaded_master and has_any_actual:
                 "月初月末補正後CV", "月初月末影響CV",
                 "マジ得後補正後CV", "マジ得後影響CV",
                 "LINE補正後CV", "LINE影響CV",
+                "掲載判定前CV", "予測掲載継続率", "掲載継続影響CV", "対象月掲載実績",
                 "予測CV", "実績CV", "差分", "誤差率",
             ]
             diagnostic_cols = [c for c in diagnostic_cols if c in bt_display.columns]
@@ -3232,7 +3347,7 @@ if uploaded_master and has_any_actual:
             )
 
             # 営業向けの評価表は、判断に必要な項目だけを表示する。
-            sales_cols = ["媒体", "予測CV", "実績CV", "差分", "誤差率"]
+            sales_cols = ["媒体", "予測CV", "実績CV", "差分", "誤差率", "対象月掲載実績"]
             sales_cols = [c for c in sales_cols if c in bt_export.columns]
             st.dataframe(
                 bt_export[sales_cols],
@@ -3329,6 +3444,7 @@ if uploaded_master and has_any_actual:
         len(base_pair),
         round(float(pd.to_numeric(base_pair["base_cv"], errors="coerce").fillna(0).sum()), 6),
         round(float(pd.to_numeric(base_pair["cost"], errors="coerce").fillna(0).sum()), 2),
+        tuple((m, publication_status_map.get(m, "掲載予定"), round(float(publication_factor_map.get(m, 1.0)), 6)) for m in selected_media),
     )
 
     cached_calc = st.session_state.get("_planning_calc")
@@ -3399,6 +3515,21 @@ if uploaded_master and has_any_actual:
 
         forecast_df = enforce_premium_media_cost(
             forecast_df
+        )
+
+        # 定常施策だけ掲載状態を反映。
+        # 「未定」は過去継続率で期待値化し、掲載なしはCV/COSTとも0にする。
+        forecast_df["掲載状態"] = forecast_df["media"].map(publication_status_map).fillna("掲載予定")
+        forecast_df["掲載係数"] = forecast_df["media"].map(publication_factor_map).fillna(1.0)
+        normal_pub_mask = forecast_df["CPN名"].astype(str).str.strip().isin(normal_labels)
+        forecast_df["forecast_cv_before_publication"] = forecast_df["forecast_cv"]
+        forecast_df.loc[normal_pub_mask, "forecast_cv"] = (
+            pd.to_numeric(forecast_df.loc[normal_pub_mask, "forecast_cv"], errors="coerce").fillna(0.0)
+            * pd.to_numeric(forecast_df.loc[normal_pub_mask, "掲載係数"], errors="coerce").fillna(1.0)
+        )
+        forecast_df.loc[normal_pub_mask, "cost"] = (
+            pd.to_numeric(forecast_df.loc[normal_pub_mask, "cost"], errors="coerce").fillna(0.0)
+            * pd.to_numeric(forecast_df.loc[normal_pub_mask, "掲載係数"], errors="coerce").fillna(1.0)
         )
 
         # simulate_plan用に日付表示形式を変換
