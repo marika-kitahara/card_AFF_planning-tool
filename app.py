@@ -1957,6 +1957,52 @@ def _run_normal_backtest(
         raise ValueError("バックテスト学習期間に定常実績がありません。")
     factor_tables = calculate_dynamic_factor_tables(training, learning_months)
 
+    # 学習データ監査: 予測ロジックは変えず、「実際に何を学習対象にしたか」だけ可視化する。
+    # CPNマスタ上の対象日数と、ローデータ上の実績量を月度別に並べる。
+    learning_audit_rows = []
+    for lm in learning_months:
+        lm_master_dates = (
+            master.loc[
+                master["月度"].astype(str).eq(str(lm)) & master["CPN名"].isin(normal_labels),
+                "日付",
+            ]
+            .dropna().drop_duplicates().sort_values()
+        )
+        lm_raw = training.loc[
+            training["月度"].astype(str).eq(str(lm))
+            & training["CPN名"].isin(normal_labels)
+        ].copy()
+        lm_raw["cv"] = pd.to_numeric(lm_raw.get("cv", 0), errors="coerce").fillna(0.0)
+        learning_audit_rows.append({
+            "学習月度": str(lm),
+            "CPN対象日数": int(lm_master_dates.nunique()),
+            "CPN最初の日": lm_master_dates.min() if not lm_master_dates.empty else pd.NaT,
+            "CPN最後の日": lm_master_dates.max() if not lm_master_dates.empty else pd.NaT,
+            "実績存在日数": int(lm_raw["date"].nunique()) if not lm_raw.empty else 0,
+            "CV合計": float(lm_raw["cv"].sum()) if not lm_raw.empty else 0.0,
+            "稼働媒体数": int(lm_raw.loc[lm_raw["cv"].gt(0), "media"].nunique()) if not lm_raw.empty else 0,
+            "元データ行数": int(len(lm_raw)),
+        })
+    learning_audit = pd.DataFrame(learning_audit_rows)
+
+    selected_training = training.loc[
+        training["月度"].astype(str).isin([str(x) for x in learning_months])
+        & training["CPN名"].isin(normal_labels)
+    ].copy()
+    selected_training["cv"] = pd.to_numeric(selected_training.get("cv", 0), errors="coerce").fillna(0.0)
+    excluded_audit = factor_tables.get("excluded", pd.DataFrame()).copy()
+    inactive_audit = factor_tables.get("inactive_media", pd.DataFrame()).copy()
+    learning_summary = {
+        "最初の日": selected_training["date"].min() if not selected_training.empty else pd.NaT,
+        "最後の日": selected_training["date"].max() if not selected_training.empty else pd.NaT,
+        "実績存在日数": int(selected_training["date"].nunique()) if not selected_training.empty else 0,
+        "CV合計": float(selected_training["cv"].sum()) if not selected_training.empty else 0.0,
+        "媒体数": int(selected_training["media"].nunique()) if not selected_training.empty else 0,
+        "元データ行数": int(len(selected_training)),
+        "除外媒体日数": int(len(excluded_audit)),
+        "休眠除外媒体数": int(len(inactive_audit)),
+    }
+
     # 対象月のカレンダー条件は上でCPNマスタから確定済み。
     future = pd.DataFrame({"date": sorted(target_calendar["日付"].dropna().unique())}).merge(base_pair, how="cross")
     future["date"] = pd.to_datetime(future["date"]).dt.normalize()
@@ -2125,6 +2171,8 @@ def _run_normal_backtest(
         "daily_compare": daily_compare,
         "excluded": factor_tables.get("excluded", pd.DataFrame()),
         "inactive_media": factor_tables.get("inactive_media", pd.DataFrame()),
+        "learning_audit": learning_audit,
+        "learning_summary": learning_summary,
     }
 
 
@@ -3152,6 +3200,31 @@ if uploaded_master and has_any_actual:
                 width="stretch",
                 hide_index=True,
             )
+
+            # 学習データそのものを監査する。予測値には影響しない診断表示。
+            with st.expander("学習データ診断（分析用）"):
+                audit = bt_result.get("learning_audit", pd.DataFrame()).copy()
+                summary = bt_result.get("learning_summary", {})
+                if summary:
+                    first_day = summary.get("最初の日")
+                    last_day = summary.get("最後の日")
+                    first_text = pd.Timestamp(first_day).strftime("%Y/%m/%d") if pd.notna(first_day) else "-"
+                    last_text = pd.Timestamp(last_day).strftime("%Y/%m/%d") if pd.notna(last_day) else "-"
+                    a1, a2, a3, a4 = st.columns(4)
+                    a1.metric("学習実績日数", f"{summary.get('実績存在日数', 0):,}日")
+                    a2.metric("学習CV合計", f"{summary.get('CV合計', 0):,.0f}")
+                    a3.metric("学習媒体数", f"{summary.get('媒体数', 0):,}")
+                    a4.metric("元データ行数", f"{summary.get('元データ行数', 0):,}")
+                    st.caption(
+                        f"実際に学習対象として抽出した期間: {first_text}〜{last_text} ／ "
+                        f"異常値・マジ得直後の除外媒体日: {summary.get('除外媒体日数', 0):,} ／ "
+                        f"休眠除外媒体: {summary.get('休眠除外媒体数', 0):,}"
+                    )
+                if not audit.empty:
+                    for c in ["CPN最初の日", "CPN最後の日"]:
+                        audit[c] = pd.to_datetime(audit[c], errors="coerce").dt.strftime("%Y/%m/%d").fillna("-")
+                    audit["CV合計"] = pd.to_numeric(audit["CV合計"], errors="coerce").fillna(0).round(0).astype(int)
+                    st.dataframe(audit, width="stretch", hide_index=True)
 
             # ロジック検証用の詳細値は普段は隠し、必要なときだけ確認できるようにする。
             with st.expander("予測ロジック詳細（分析用）"):
