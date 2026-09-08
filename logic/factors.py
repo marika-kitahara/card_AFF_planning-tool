@@ -68,25 +68,26 @@ def _normalize_selected_months(selected_months: list[str] | None) -> list[str]:
 
 
 def _add_recency_weights(df: pd.DataFrame) -> pd.DataFrame:
-    """月度ではなく実日付順で、直近月ほど大きい学習ウェイトを付与する。
+    """実日付ベースで、直近ほど大きい学習ウェイトを付与する。
 
-    最新の実績月=1.0、1か月古いごとにRECENCY_MONTH_DECAY倍。
-    同じ月度内の日は同じ重みとし、説明可能性を優先する。
+    最新日=1.0、30日古くなるごとにRECENCY_MONTH_DECAY倍。
+    CPN月度の日数に依存せず、60日窓の中でも新しい実績を強く評価する。
     """
     out = df.copy()
     if out.empty:
         out["recency_weight"] = pd.Series(dtype=float)
         return out
 
-    dates = pd.to_datetime(out["date"], errors="coerce")
-    month_period = dates.dt.to_period("M")
-    latest = month_period.max()
+    dates = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
+    latest = dates.max()
     if pd.isna(latest):
         out["recency_weight"] = 1.0
         return out
 
-    month_age = (latest.year - month_period.dt.year) * 12 + (latest.month - month_period.dt.month)
-    out["recency_weight"] = np.power(float(RECENCY_MONTH_DECAY), month_age.astype(float))
+    age_days = (pd.Timestamp(latest).normalize() - dates).dt.days.clip(lower=0)
+    out["recency_weight"] = np.power(
+        float(RECENCY_MONTH_DECAY), age_days.astype(float) / 30.0
+    )
     return out
 
 
@@ -143,6 +144,7 @@ def _detect_media_daily_outliers(daily: pd.DataFrame) -> pd.DataFrame:
 def _prepare_normal_learning_data(
     history_df: pd.DataFrame,
     selected_months: list[str] | None = None,
+    calendar_dates=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """定常学習用データを作成し、マジ得直後・異常値を除外する。
 
@@ -199,7 +201,14 @@ def _prepare_normal_learning_data(
     observed_daily = _daily_media(normal)
     if not observed_daily.empty:
         media_list = pd.DataFrame({"media": sorted(normal["media"].dropna().astype(str).unique())})
-        calendar = pd.DataFrame({"date": sorted(normal["date"].dropna().unique())})
+        if calendar_dates is None:
+            eligible_dates = sorted(normal["date"].dropna().unique())
+        else:
+            eligible_dates = sorted(
+                pd.to_datetime(pd.Series(list(calendar_dates)), errors="coerce")
+                .dropna().dt.normalize().unique()
+            )
+        calendar = pd.DataFrame({"date": eligible_dates})
         calendar = _add_recency_weights(calendar)
         calendar["weekday"] = calendar["date"].dt.day_name()
 
@@ -459,6 +468,7 @@ def calculate_unit_price_response_table(
 def calculate_dynamic_factor_tables(
     history_df: pd.DataFrame,
     selected_months: list[str] | None = None,
+    calendar_dates=None,
 ) -> dict[str, pd.DataFrame]:
     """定常実績から媒体別係数を算出する。
 
@@ -467,7 +477,7 @@ def calculate_dynamic_factor_tables(
     - 直近月ほど重く評価
     - 曜日係数は媒体別かつ月水準を正規化して算出し、季節との二重取りを抑える
     """
-    normal, daily, excluded = _prepare_normal_learning_data(history_df, selected_months)
+    normal, daily, excluded = _prepare_normal_learning_data(history_df, selected_months, calendar_dates)
     if daily.empty:
         empty = pd.DataFrame()
         return {"weekday": empty, "month_edge": empty, "season": empty, "line_oa": empty, "unit_price": empty, "excluded": excluded}
@@ -675,6 +685,7 @@ def enforce_premium_media_cost(df: pd.DataFrame) -> pd.DataFrame:
 def calculate_normal_month_base(
     history_df: pd.DataFrame,
     selected_months: list[str],
+    calendar_dates=None,
 ) -> pd.DataFrame:
     """選択月度の定常実績から媒体×商品IDの加重日平均を返す。
 
@@ -693,7 +704,7 @@ def calculate_normal_month_base(
     if missing:
         raise ValueError("定常月度学習に必要な列がありません: " + ", ".join(sorted(missing)))
 
-    clean, _, _ = _prepare_normal_learning_data(history_df, selected_months)
+    clean, _, _ = _prepare_normal_learning_data(history_df, selected_months, calendar_dates)
     if clean.empty:
         return pd.DataFrame(columns=columns)
 
@@ -706,7 +717,7 @@ def calculate_normal_month_base(
 
     # 媒体ごとの「全定常日」を分母にする。行が無い日は0CV=非稼働日。
     # base_cv = 稼働率 × 稼働時CV と同値だが、診断値も保持して説明可能にする。
-    _, full_daily, _ = _prepare_normal_learning_data(history_df, selected_months)
+    _, full_daily, _ = _prepare_normal_learning_data(history_df, selected_months, calendar_dates)
     if not inactive.empty and not full_daily.empty:
         full_daily = full_daily.loc[~full_daily["media"].isin(inactive["media"])].copy()
     media_day_weights = full_daily.groupby("media")["recency_weight"].sum()
@@ -741,10 +752,11 @@ def calculate_normal_month_base(
 def calculate_normal_media_diagnostics(
     history_df: pd.DataFrame,
     selected_months: list[str],
+    calendar_dates=None,
 ) -> pd.DataFrame:
     """定常予測の媒体別基礎値を、稼働率×稼働時CVに分解して返す。"""
     columns = ["media", "activity_rate", "active_daily_cv", "expected_daily_cv", "eligible_days", "active_days"]
-    clean, daily, _ = _prepare_normal_learning_data(history_df, selected_months)
+    clean, daily, _ = _prepare_normal_learning_data(history_df, selected_months, calendar_dates)
     if daily.empty:
         return pd.DataFrame(columns=columns)
     inactive = identify_inactive_media(history_df, selected_months)
