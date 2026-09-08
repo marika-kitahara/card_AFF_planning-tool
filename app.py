@@ -2196,11 +2196,14 @@ def _run_normal_backtest(
     total_forecast = float(daily_compare["forecast_cv"].sum())
     total_actual = float(daily_compare["actual_cv"].sum())
     actual_active_media = set(media_compare.loc[media_compare["実績CV"].gt(0), "media"].astype(str))
-    continued_media_raw_forecast = float(
-        media_compare.loc[media_compare["media"].astype(str).isin(actual_active_media), "掲載判定前CV"].sum()
-    )
+    active_mask = media_compare["media"].astype(str).isin(actual_active_media)
+    # 素予測（掲載継続率を掛ける前）と最終予測（継続率補正後）を分けて監査する。
+    continued_media_raw_forecast = float(media_compare.loc[active_mask, "掲載判定前CV"].sum())
     publication_end_raw_forecast = total_forecast_before_publication - continued_media_raw_forecast
     continued_media_raw_error_rate = (continued_media_raw_forecast - total_actual) / total_actual if total_actual else np.nan
+    continued_media_final_forecast = float(media_compare.loc[active_mask, "予測CV"].sum())
+    inactive_media_final_forecast = float(media_compare.loc[~active_mask, "予測CV"].sum())
+    continued_media_final_error_rate = (continued_media_final_forecast - total_actual) / total_actual if total_actual else np.nan
     total_diff = total_forecast - total_actual
     total_error_rate = total_diff / total_actual if total_actual else np.nan
     wape = float(daily_compare["絶対誤差"].sum() / total_actual) if total_actual else np.nan
@@ -2221,6 +2224,9 @@ def _run_normal_backtest(
         "continued_media_raw_forecast": continued_media_raw_forecast,
         "continued_media_raw_error_rate": continued_media_raw_error_rate,
         "publication_end_raw_forecast": publication_end_raw_forecast,
+        "continued_media_final_forecast": continued_media_final_forecast,
+        "continued_media_final_error_rate": continued_media_final_error_rate,
+        "inactive_media_final_forecast": inactive_media_final_forecast,
         "total_actual": total_actual,
         "total_diff": total_diff,
         "total_error_rate": total_error_rate,
@@ -3300,18 +3306,24 @@ if uploaded_master and has_any_actual:
                 f"{bt_result['wape']:.1%}" if pd.notna(bt_result["wape"]) else "-",
                 help="媒体×日ごとの絶対誤差合計 ÷ 実績CV合計。小さいほど予測精度が高い指標です。",
             )
+            st.caption("誤差の切り分け")
             b1, b2, b3 = st.columns(3)
-            b1.metric("掲載判定前予測", f"{bt_result.get('total_forecast_before_publication', 0):,.0f}")
+            b1.metric("最終予測（全媒体）", f"{bt_result.get('total_forecast', 0):,.0f}")
             b2.metric(
-                "実績継続媒体だけの素予測",
-                f"{bt_result.get('continued_media_raw_forecast', 0):,.0f}",
+                "実績あり媒体の予測",
+                f"{bt_result.get('continued_media_final_forecast', 0):,.0f}",
                 delta=(
-                    f"{bt_result.get('continued_media_raw_error_rate'):+.1%}"
-                    if pd.notna(bt_result.get('continued_media_raw_error_rate')) else None
+                    f"{bt_result.get('continued_media_final_error_rate'):+.1%}"
+                    if pd.notna(bt_result.get('continued_media_final_error_rate')) else None
                 ),
                 delta_color="off",
+                help="対象月度にCV実績があった媒体だけに絞った最終予測。CV量そのものの予測精度を見るための指標です。",
             )
-            b3.metric("実績終了/未掲載媒体への素予測", f"{bt_result.get('publication_end_raw_forecast', 0):,.0f}")
+            b3.metric(
+                "実績なし媒体への予測",
+                f"{bt_result.get('inactive_media_final_forecast', 0):,.0f}",
+                help="対象月度にCV実績がなかった媒体へ残っていた予測。掲載有無・稼働継続の読み違いによる余剰予測の目安です。",
+            )
 
             bt_display = bt_result["media_compare"].copy()
             bt_display["予測CV"] = bt_display["予測CV"].round(0).astype(int)
@@ -3332,7 +3344,8 @@ if uploaded_master and has_any_actual:
             ]
             diagnostic_cols = [c for c in diagnostic_cols if c in bt_display.columns]
             bt_export = bt_display[diagnostic_cols].rename(columns={"media": "媒体"})
-            numeric_diag = [c for c in bt_export.columns if c not in {"媒体", "誤差率"}]
+            # 文字列の判定列を数値変換すると空欄になるため、明示的に除外する。
+            numeric_diag = [c for c in bt_export.columns if c not in {"媒体", "誤差率", "対象月掲載実績"}]
             for c in numeric_diag:
                 bt_export[c] = pd.to_numeric(bt_export[c], errors="coerce").round(2)
 
