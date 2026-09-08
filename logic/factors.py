@@ -313,6 +313,129 @@ def identify_inactive_media(
     ) if rows else pd.DataFrame(columns=columns)
 
 
+
+def calculate_media_continuation_table(
+    history_df: pd.DataFrame,
+    cpn_master: pd.DataFrame | None = None,
+    cutoff_date=None,
+    prior_transitions: int = 3,
+) -> pd.DataFrame:
+    """媒体ごとの「次の定常月度でも掲載が続く確率」を過去遷移から推定する。
+
+    - 予測時点より未来の実績は使わない。
+    - 各媒体について、定常月度でCV>0だった月度の次月度でもCV>0だった割合を計算。
+    - 遷移回数が少ない媒体は全媒体の継続率へ縮小して過信を防ぐ。
+    - 最新定常月度で稼働していない媒体は、未定時継続率をさらに低くする。
+
+    Returns columns:
+        media, continuation_rate, media_transition_count, media_continue_count,
+        global_continuation_rate, latest_month_active, latest_month
+    """
+    cols = [
+        "media", "continuation_rate", "media_transition_count",
+        "media_continue_count", "global_continuation_rate",
+        "latest_month_active", "latest_month",
+    ]
+    if history_df is None or history_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    work = history_df.copy()
+    work["date"] = pd.to_datetime(work["date"], errors="coerce").dt.normalize()
+    work["CPN名"] = work["CPN名"].astype("string").str.strip()
+    work["月度"] = work["月度"].astype("string").str.strip()
+    work["cv"] = pd.to_numeric(work["cv"], errors="coerce").fillna(0.0)
+    if cutoff_date is not None:
+        cutoff = pd.Timestamp(cutoff_date).normalize()
+        work = work.loc[work["date"].le(cutoff)].copy()
+    normal = work.loc[
+        work["CPN名"].isin(["通常", "定常"])
+        & work["月度"].notna()
+        & work["月度"].astype(str).ne("未設定")
+    ].copy()
+    if normal.empty:
+        return pd.DataFrame(columns=cols)
+
+    # 月度順はCPNマスタを優先。マスタが無ければ実績の最初の日で並べる。
+    month_order = []
+    if cpn_master is not None and not cpn_master.empty:
+        master = cpn_master.copy()
+        master["日付"] = pd.to_datetime(master["日付"], errors="coerce").dt.normalize()
+        master["CPN名"] = master["CPN名"].astype("string").str.strip()
+        master["月度"] = master["月度"].astype("string").str.strip()
+        if cutoff_date is not None:
+            master = master.loc[master["日付"].le(pd.Timestamp(cutoff_date).normalize())].copy()
+        m = (
+            master.loc[
+                master["CPN名"].isin(["通常", "定常"])
+                & master["月度"].notna()
+                & master["月度"].astype(str).ne("未設定")
+            ]
+            .groupby("月度", as_index=False)["日付"].min()
+            .sort_values("日付", kind="stable")
+        )
+        month_order = m["月度"].astype(str).tolist()
+    if not month_order:
+        month_order = (
+            normal.groupby("月度", as_index=False)["date"].min()
+            .sort_values("date", kind="stable")["月度"].astype(str).tolist()
+        )
+
+    # 実績が全く存在しない月度は遷移評価から外す。
+    observed_months = set(normal["月度"].astype(str).unique())
+    month_order = [m for m in month_order if m in observed_months]
+    if not month_order:
+        return pd.DataFrame(columns=cols)
+
+    active = (
+        normal.groupby(["月度", "media"], as_index=False)["cv"].sum()
+    )
+    active = active.loc[active["cv"].gt(0)].copy()
+    active_sets = {
+        m: set(active.loc[active["月度"].astype(str).eq(str(m)), "media"].astype(str))
+        for m in month_order
+    }
+
+    global_eligible = 0
+    global_continue = 0
+    media_eligible = {}
+    media_continue = {}
+    for prev_m, next_m in zip(month_order[:-1], month_order[1:]):
+        prev_set = active_sets.get(prev_m, set())
+        next_set = active_sets.get(next_m, set())
+        global_eligible += len(prev_set)
+        global_continue += len(prev_set & next_set)
+        for media in prev_set:
+            media_eligible[media] = media_eligible.get(media, 0) + 1
+            if media in next_set:
+                media_continue[media] = media_continue.get(media, 0) + 1
+
+    global_rate = (global_continue / global_eligible) if global_eligible else 0.70
+    global_rate = float(np.clip(global_rate, 0.05, 1.0))
+    latest_month = month_order[-1]
+    latest_set = active_sets.get(latest_month, set())
+    prior = max(int(prior_transitions), 1)
+
+    rows = []
+    all_media = sorted(normal["media"].dropna().astype(str).unique())
+    for media in all_media:
+        n = int(media_eligible.get(media, 0))
+        c = int(media_continue.get(media, 0))
+        rate = (c + global_rate * prior) / float(n + prior)
+        latest_active = media in latest_set
+        # 最新月度ですでに非稼働なら「未定」の期待値はかなり低く見る。
+        if not latest_active:
+            rate *= 0.25
+        rows.append({
+            "media": media,
+            "continuation_rate": float(np.clip(rate, 0.0, 1.0)),
+            "media_transition_count": n,
+            "media_continue_count": c,
+            "global_continuation_rate": global_rate,
+            "latest_month_active": bool(latest_active),
+            "latest_month": str(latest_month),
+        })
+    return pd.DataFrame(rows, columns=cols)
+
 def get_cpn_reference_periods(
     history_df: pd.DataFrame,
     selected_cpn: str,
