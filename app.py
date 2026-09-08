@@ -3205,41 +3205,85 @@ if uploaded_master and has_any_actual:
 
         st.subheader("📌 定常媒体の掲載予定")
         st.caption(
-            "掲載予定は予測を100%採用、掲載なしは0件、未定は過去の掲載継続率を掛けた期待値で予測します。"
-            "営業側で把握している掲載予定を、過去データの推測より優先します。"
+            "営業側で把握している掲載予定を優先します。掲載予定は100%、掲載なしは0件、未定だけ過去の掲載継続率で期待値化します。"
         )
+
+        # 掲載状態はsession_stateへ保持し、表の再描画や一括変更でも選択を維持する。
+        status_store = st.session_state.setdefault("_publication_status_values", {})
+        for media in selected_media:
+            status_store.setdefault(str(media), "未定")
+        valid_statuses = {"掲載予定", "未定", "掲載なし"}
+        status_store = {
+            str(m): (status_store.get(str(m), "未定") if status_store.get(str(m), "未定") in valid_statuses else "未定")
+            for m in selected_media
+        }
+        st.session_state["_publication_status_values"] = status_store
+        st.session_state.setdefault("_publication_editor_version", 0)
+
+        bulk_cols = st.columns(3)
+        if bulk_cols[0].button("全て掲載予定", use_container_width=True, key="publication_all_planned"):
+            st.session_state["_publication_status_values"] = {str(m): "掲載予定" for m in selected_media}
+            st.session_state["_publication_editor_version"] += 1
+            st.rerun()
+        if bulk_cols[1].button("全て未定", use_container_width=True, key="publication_all_unknown"):
+            st.session_state["_publication_status_values"] = {str(m): "未定" for m in selected_media}
+            st.session_state["_publication_editor_version"] += 1
+            st.rerun()
+        if bulk_cols[2].button("全て掲載なし", use_container_width=True, key="publication_all_none"):
+            st.session_state["_publication_status_values"] = {str(m): "掲載なし" for m in selected_media}
+            st.session_state["_publication_editor_version"] += 1
+            st.rerun()
+
+        status_store = st.session_state["_publication_status_values"]
         publication_editor = pd.DataFrame({
             "媒体": selected_media,
-            "掲載状態": ["未定"] * len(selected_media),
-            "未定時継続率(%)": [float(cont_map_main.get(m, global_cont_main)) * 100.0 for m in selected_media],
+            "掲載状態": [status_store.get(str(m), "未定") for m in selected_media],
         })
-        publication_editor["未定時継続率(%)"] = publication_editor["未定時継続率(%)"].clip(0, 100)
+        editor_key = f"normal_publication_status_editor_{st.session_state['_publication_editor_version']}"
         edited_publication = st.data_editor(
             publication_editor,
             width="stretch",
             hide_index=True,
-            disabled=["媒体", "未定時継続率(%)"],
+            disabled=["媒体"],
             column_config={
                 "掲載状態": st.column_config.SelectboxColumn(
                     "掲載状態",
                     options=["掲載予定", "未定", "掲載なし"],
                     required=True,
                 ),
-                "未定時継続率(%)": st.column_config.NumberColumn(
-                    "未定時継続率(%)",
-                    format="%.0f",
-                    help="過去の定常月度間で、掲載が次月度も継続した確率。未定の場合だけ予測へ使用します。",
-                ),
             },
-            key="normal_publication_status_editor",
+            key=editor_key,
         )
+
+        # 編集結果を保存し、その場で予測係数へ反映する。
+        updated_store = dict(status_store)
         for _, r in edited_publication.iterrows():
             media = str(r["媒体"])
             status = str(r["掲載状態"])
-            cont_raw = pd.to_numeric(r["未定時継続率(%)"], errors="coerce")
-            cont = float(cont_raw) / 100.0 if pd.notna(cont_raw) else 0.0
+            updated_store[media] = status if status in valid_statuses else "未定"
+        st.session_state["_publication_status_values"] = updated_store
+
+        for media in selected_media:
+            media = str(media)
+            status = updated_store.get(media, "未定")
+            cont = float(cont_map_main.get(media, global_cont_main))
             publication_status_map[media] = status
             publication_factor_map[media] = 1.0 if status == "掲載予定" else (0.0 if status == "掲載なし" else cont)
+
+        status_counts = pd.Series([publication_status_map.get(str(m), "未定") for m in selected_media]).value_counts()
+        st.caption(
+            f"掲載予定 {int(status_counts.get('掲載予定', 0))}媒体 / "
+            f"未定 {int(status_counts.get('未定', 0))}媒体 / "
+            f"掲載なし {int(status_counts.get('掲載なし', 0))}媒体"
+        )
+
+        with st.expander("未定時の掲載継続率（分析用）"):
+            continuation_preview = pd.DataFrame({
+                "媒体": selected_media,
+                "掲載継続率(%)": [float(cont_map_main.get(m, global_cont_main)) * 100.0 for m in selected_media],
+            })
+            continuation_preview["掲載継続率(%)"] = continuation_preview["掲載継続率(%)"].clip(0, 100).round(0).astype(int)
+            st.dataframe(continuation_preview, width="stretch", hide_index=True)
 
     st.subheader("🧪 定常バックテスト")
     st.caption(
@@ -3632,6 +3676,53 @@ if uploaded_master and has_any_actual:
 
         # 条件が変わって再計算した場合、古い提出Excelは破棄
         st.session_state.pop("submission_excel", None)
+
+    # 掲載状態を反映した定常予測の即時サマリー。
+    # 掲載状態を変更するとcalc_keyが変わるため、Streamlitの再実行でここも即座に更新される。
+    if needs_normal_learning and not forecast_df.empty:
+        normal_pub_summary_mask = forecast_df["CPN名"].astype(str).str.strip().isin(normal_labels)
+        normal_pub_rows = forecast_df.loc[normal_pub_summary_mask].copy()
+        if not normal_pub_rows.empty:
+            normal_pub_rows["forecast_cv_before_publication"] = pd.to_numeric(
+                normal_pub_rows.get("forecast_cv_before_publication", normal_pub_rows["forecast_cv"]),
+                errors="coerce",
+            ).fillna(0.0)
+            normal_pub_rows["forecast_cv"] = pd.to_numeric(normal_pub_rows["forecast_cv"], errors="coerce").fillna(0.0)
+            pub_total_before = float(normal_pub_rows["forecast_cv_before_publication"].sum())
+            pub_total_after = float(normal_pub_rows["forecast_cv"].sum())
+            pub_impact = pub_total_after - pub_total_before
+
+            st.subheader("📌 掲載状態反映後の定常予測")
+            sm1, sm2, sm3 = st.columns(3)
+            sm1.metric("掲載判定前CV", f"{pub_total_before:,.0f}")
+            sm2.metric("掲載状態反映後CV", f"{pub_total_after:,.0f}")
+            sm3.metric("掲載状態による増減", f"{pub_impact:+,.0f}")
+
+            pub_media = (
+                normal_pub_rows.groupby("media", as_index=False)
+                .agg(
+                    掲載判定前CV=("forecast_cv_before_publication", "sum"),
+                    予測CV=("forecast_cv", "sum"),
+                )
+            )
+            pub_media["掲載状態"] = pub_media["media"].map(publication_status_map).fillna("掲載予定")
+            pub_media = pub_media.rename(columns={"media": "媒体"})
+            pub_media["予測CV"] = pub_media["予測CV"].round(0).astype(int)
+            pub_media["掲載判定前CV"] = pub_media["掲載判定前CV"].round(0).astype(int)
+            pub_media = pub_media.sort_values(["予測CV", "掲載判定前CV"], ascending=False)
+            st.dataframe(
+                pub_media[["媒体", "掲載状態", "予測CV"]],
+                width="stretch",
+                hide_index=True,
+            )
+            with st.expander("掲載状態による補正詳細（分析用）"):
+                detail = pub_media.copy()
+                detail["増減CV"] = detail["予測CV"] - detail["掲載判定前CV"]
+                st.dataframe(
+                    detail[["媒体", "掲載状態", "掲載判定前CV", "予測CV", "増減CV"]],
+                    width="stretch",
+                    hide_index=True,
+                )
 
     # 係数確認用の明細
     with st.expander("予測係数の確認"):
