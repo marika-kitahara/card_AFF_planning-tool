@@ -16,7 +16,7 @@ def optimize_budget(df, mode="CV最大"):
     if mode == "CV最大":
         result = work.loc[work.groupby(["date","media"])["cv"].idxmax()]
 
-    elif mode == "CPA最小":
+    elif mode in {"CPA最小", "単価最小"}:
         result = work.loc[work.groupby(["date","media"])["cpa"].idxmin()]
 
     else:

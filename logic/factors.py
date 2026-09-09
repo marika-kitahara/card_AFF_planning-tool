@@ -15,12 +15,6 @@ from config.constants import (
     UNIT_PRICE_ELASTICITY_MAX,
     UNIT_PRICE_FACTOR_MIN,
     UNIT_PRICE_FACTOR_MAX,
-    GLOBAL_TREND_WINDOW_DAYS,
-    GLOBAL_TREND_MIN_DAYS,
-    GLOBAL_TREND_MIN_STABLE_MEDIA,
-    GLOBAL_TREND_PRIOR_DAYS,
-    GLOBAL_TREND_FACTOR_MIN,
-    GLOBAL_TREND_FACTOR_MAX,
 )
 
 
@@ -506,8 +500,8 @@ def calculate_unit_price_response_table(
 ) -> pd.DataFrame:
     """媒体別に、1件あたり単価と日平均CVの関係を月度単位で推定する。
 
-    COST合計はCV増加に伴って増えるため、そのまま説明変数にはしない。
-    月度ごとの unit_price = total_cost / total_cv を使い、
+    単価はローデータW列「グロス」を正とする。
+    月度ごとのCV加重グロス単価を使い、
     log(日平均CV) ~ elasticity * log(unit_price) の傾きを安全に縮小して返す。
     データ不足・単価変動不足では elasticity=0（補正なし）。
     """
@@ -523,9 +517,17 @@ def calculate_unit_price_response_table(
     work = clean.copy()
     work["cv"] = pd.to_numeric(work["cv"], errors="coerce").fillna(0.0)
     work["cost"] = pd.to_numeric(work["cost"], errors="coerce").fillna(0.0)
+    if "gross_unit" in work.columns:
+        work["gross_unit"] = pd.to_numeric(work["gross_unit"], errors="coerce").fillna(0.0)
+    else:
+        work["gross_unit"] = 0.0
+    work["gross_weight"] = work["gross_unit"] * work["cv"].clip(lower=0)
     work["month_key"] = work["月度"].astype("string").str.strip()
     monthly = work.groupby(["media", "month_key"], as_index=False).agg(
-        total_cv=("cv", "sum"), total_cost=("cost", "sum"), last_date=("date", "max")
+        total_cv=("cv", "sum"),
+        total_cost=("cost", "sum"),
+        gross_weight=("gross_weight", "sum"),
+        last_date=("date", "max"),
     )
     eligible = daily.copy()
     if "月度" not in eligible.columns:
@@ -537,7 +539,7 @@ def calculate_unit_price_response_table(
     monthly = monthly.merge(day_counts.reset_index(), on=["media", "month_key"], how="left")
     monthly["eligible_days"] = pd.to_numeric(monthly["eligible_days"], errors="coerce").fillna(0).clip(lower=1)
     monthly["daily_cv"] = monthly["total_cv"] / monthly["eligible_days"]
-    monthly["unit_price"] = monthly["total_cost"] / monthly["total_cv"].replace(0, np.nan)
+    monthly["unit_price"] = monthly["gross_weight"] / monthly["total_cv"].replace(0, np.nan)
     monthly = monthly.replace([np.inf, -np.inf], np.nan)
     monthly = monthly.loc[
         monthly["daily_cv"].gt(0) & monthly["unit_price"].gt(0)
@@ -594,96 +596,6 @@ def calculate_unit_price_response_table(
         })
     return pd.DataFrame(rows, columns=columns)
 
-
-def calculate_global_trend_table(
-    history_df: pd.DataFrame,
-    selected_months: list[str] | None = None,
-    calendar_dates=None,
-) -> pd.DataFrame:
-    """直近30日とその前30日の「継続媒体のCV水準」を比較する。
-
-    掲載媒体数の増減は掲載継続率側で扱うため、両期間でCV>0だった媒体を
-    原則として比較対象にする。媒体構成変化と全体トレンドの二重補正を避ける。
-    データ不足時は1.0へフォールバックし、少数日では1.0側へ縮小する。
-    """
-    columns = [
-        "factor", "raw_factor", "prior_daily_cv", "recent_daily_cv",
-        "prior_days", "recent_days", "stable_media_count", "method",
-    ]
-    _, daily, _ = _prepare_normal_learning_data(history_df, selected_months, calendar_dates)
-    if daily.empty:
-        return pd.DataFrame([{
-            "factor": 1.0, "raw_factor": 1.0, "prior_daily_cv": np.nan,
-            "recent_daily_cv": np.nan, "prior_days": 0, "recent_days": 0,
-            "stable_media_count": 0, "method": "データ不足",
-        }], columns=columns)
-
-    d = daily.copy()
-    d["date"] = pd.to_datetime(d["date"], errors="coerce").dt.normalize()
-    d["cv"] = pd.to_numeric(d["cv"], errors="coerce").fillna(0.0)
-    latest = d["date"].max()
-    if pd.isna(latest):
-        return pd.DataFrame([{
-            "factor": 1.0, "raw_factor": 1.0, "prior_daily_cv": np.nan,
-            "recent_daily_cv": np.nan, "prior_days": 0, "recent_days": 0,
-            "stable_media_count": 0, "method": "日付不足",
-        }], columns=columns)
-
-    window = max(int(GLOBAL_TREND_WINDOW_DAYS), 1)
-    recent_start = pd.Timestamp(latest).normalize() - pd.Timedelta(days=window - 1)
-    prior_end = recent_start - pd.Timedelta(days=1)
-    prior_start = prior_end - pd.Timedelta(days=window - 1)
-    recent = d[d["date"].between(recent_start, latest)].copy()
-    prior = d[d["date"].between(prior_start, prior_end)].copy()
-    recent_days = int(recent["date"].nunique())
-    prior_days = int(prior["date"].nunique())
-
-    if recent_days < int(GLOBAL_TREND_MIN_DAYS) or prior_days < int(GLOBAL_TREND_MIN_DAYS):
-        return pd.DataFrame([{
-            "factor": 1.0, "raw_factor": 1.0, "prior_daily_cv": np.nan,
-            "recent_daily_cv": np.nan, "prior_days": prior_days, "recent_days": recent_days,
-            "stable_media_count": 0, "method": "定常日不足",
-        }], columns=columns)
-
-    recent_by_media = recent.groupby("media")["cv"].sum()
-    prior_by_media = prior.groupby("media")["cv"].sum()
-    stable_media = sorted(set(recent_by_media[recent_by_media.gt(0)].index) & set(prior_by_media[prior_by_media.gt(0)].index))
-    method = "両期間継続媒体"
-    if len(stable_media) >= int(GLOBAL_TREND_MIN_STABLE_MEDIA):
-        recent_eval = recent[recent["media"].isin(stable_media)]
-        prior_eval = prior[prior["media"].isin(stable_media)]
-    else:
-        # 継続媒体が少なすぎる場合だけ全媒体へフォールバック。
-        recent_eval = recent
-        prior_eval = prior
-        method = "全媒体フォールバック"
-
-    recent_daily = recent_eval.groupby("date")["cv"].sum()
-    prior_daily = prior_eval.groupby("date")["cv"].sum()
-    recent_level = float(recent_daily.mean()) if not recent_daily.empty else np.nan
-    prior_level = float(prior_daily.mean()) if not prior_daily.empty else np.nan
-    if pd.isna(recent_level) or pd.isna(prior_level) or prior_level <= 0:
-        raw = 1.0
-    else:
-        raw = recent_level / prior_level
-
-    # 少数日の偶然を過信しない。両窓の少ない方の日数で1.0側へ縮小。
-    n = min(recent_days, prior_days)
-    confidence = n / float(n + max(int(GLOBAL_TREND_PRIOR_DAYS), 1))
-    factor = 1.0 + confidence * (float(raw) - 1.0)
-    factor = float(np.clip(factor, GLOBAL_TREND_FACTOR_MIN, GLOBAL_TREND_FACTOR_MAX))
-    return pd.DataFrame([{
-        "factor": factor,
-        "raw_factor": float(raw),
-        "prior_daily_cv": prior_level,
-        "recent_daily_cv": recent_level,
-        "prior_days": prior_days,
-        "recent_days": recent_days,
-        "stable_media_count": len(stable_media),
-        "method": method,
-    }], columns=columns)
-
-
 def calculate_dynamic_factor_tables(
     history_df: pd.DataFrame,
     selected_months: list[str] | None = None,
@@ -699,7 +611,7 @@ def calculate_dynamic_factor_tables(
     normal, daily, excluded = _prepare_normal_learning_data(history_df, selected_months, calendar_dates)
     if daily.empty:
         empty = pd.DataFrame()
-        return {"weekday": empty, "month_edge": empty, "season": empty, "line_oa": empty, "global_trend": pd.DataFrame([{"factor": 1.0}]), "unit_price": empty, "excluded": excluded}
+        return {"weekday": empty, "month_edge": empty, "season": empty, "line_oa": empty, "unit_price": empty, "excluded": excluded}
 
     # 媒体ごとの全体基準CV。基礎値と同じく全定常日を直近加重で評価する。
     base_by_media = daily.groupby("media")[["cv", "recency_weight"]].apply(
@@ -827,13 +739,11 @@ def calculate_dynamic_factor_tables(
     inactive_media = identify_inactive_media(history_df, selected_months)
     unit_price = calculate_unit_price_response_table(history_df, selected_months)
 
-    global_trend = calculate_global_trend_table(history_df, selected_months, calendar_dates)
     return {
         "weekday": weekday_avg,
         "month_edge": month_edge,
         "season": season_avg,
         "line_oa": line_oa,
-        "global_trend": global_trend,
         "excluded": excluded,
         "inactive_media": inactive_media,
         "unit_price": unit_price,
@@ -854,13 +764,6 @@ def apply_dynamic_factors(
     unit_ref_map = unit_tbl.set_index("media")["reference_unit_price"] if not unit_tbl.empty else pd.Series(dtype=float)
     unit_latest_map = unit_tbl.set_index("media")["latest_unit_price"] if not unit_tbl.empty else pd.Series(dtype=float)
     unit_elasticity_map = unit_tbl.set_index("media")["elasticity"] if not unit_tbl.empty else pd.Series(dtype=float)
-    trend_tbl = factor_tables.get("global_trend", pd.DataFrame())
-    global_trend_factor = (
-        float(pd.to_numeric(trend_tbl["factor"], errors="coerce").dropna().iloc[0])
-        if not trend_tbl.empty and "factor" in trend_tbl.columns and not pd.to_numeric(trend_tbl["factor"], errors="coerce").dropna().empty
-        else 1.0
-    )
-    out["global_trend_factor"] = float(np.clip(global_trend_factor, GLOBAL_TREND_FACTOR_MIN, GLOBAL_TREND_FACTOR_MAX))
 
     out["weekday_factor"] = [weekday_map.get((m, w), 1.0) for m, w in zip(out["media"], out["weekday"])]
     out["season_factor"] = [season_map.get((m, month), 1.0) for m, month in zip(out["media"], out["date"].dt.month)]
