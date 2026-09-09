@@ -206,6 +206,9 @@ def _load_data_cached(raw_bytes: bytes, exclude_compensation: bool = True) -> pd
     df["media"] = df["パートナーサイト名"].astype(str).str.strip()
     df["cv"] = pd.to_numeric(df["件数"], errors="coerce")
     raw_cost = pd.to_numeric(df["報酬額"], errors="coerce").fillna(0.0)
+    # W列「グロス」は営業プランで使う媒体グロス単価。
+    # 報酬額/cv を単価として逆算せず、元データのグロスをそのまま保持する。
+    df["gross_unit"] = gross_raw
     df["商品ID"] = df["商品ID"].map(_normalize_id_value)
 
     comp_text = compensation_raw.astype("string").fillna("").str.strip()
@@ -218,6 +221,10 @@ def _load_data_cached(raw_bytes: bytes, exclude_compensation: bool = True) -> pd
     df = df.loc[valid_mask].copy()
     result_flag = result_flag.loc[df.index]
     raw_cost = raw_cost.loc[df.index]
+    gross_raw = gross_raw.loc[df.index]
+    df["gross_unit"] = gross_raw
+    # 同一日・媒体に複数単価が混在しても扱えるよう、発生件数で加重平均する。
+    df["gross_amount_for_weight"] = df["gross_unit"] * pd.to_numeric(df["cv"], errors="coerce").fillna(0.0)
 
     y_mask = result_flag.eq("Y")
     df["approved_cv"] = 0.0
@@ -241,6 +248,7 @@ def _load_data_cached(raw_bytes: bytes, exclude_compensation: bool = True) -> pd
         .agg(
             cv=("cv", "sum"),
             cost=("cost", "sum"),
+            gross_amount_for_weight=("gross_amount_for_weight", "sum"),
             approved_cv=("approved_cv", "sum"),
             approval_base_cv=("approval_base_cv", "sum"),
             approval_source_column=("approval_source_column", "first"),
@@ -250,6 +258,11 @@ def _load_data_cached(raw_bytes: bytes, exclude_compensation: bool = True) -> pd
         )
         .reset_index()
     )
+    grouped["gross_unit"] = (
+        grouped["gross_amount_for_weight"]
+        / pd.to_numeric(grouped["cv"], errors="coerce").replace(0, pd.NA)
+    ).fillna(0.0)
+    grouped = grouped.drop(columns=["gross_amount_for_weight"])
     return grouped
 
 
