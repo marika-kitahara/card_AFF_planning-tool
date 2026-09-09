@@ -13,6 +13,12 @@ from io import BytesIO
 
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
+
+# Streamlit Cloudでもaptに依存せず日本語を描画できるようにする。
+try:
+    import japanize_matplotlib  # noqa: F401
+except Exception:
+    japanize_matplotlib = None
 from pathlib import Path
 from copy import copy
 
@@ -1456,11 +1462,22 @@ def _figure_png_bytes(fig, dpi: int = 180) -> bytes:
 
 
 def _get_japanese_font_properties():
-    """Noto CJK等の日本語フォントをファイルから直接指定する。
+    """日本語フォントを安全に取得する。
 
-    Streamlit CloudではMatplotlibのフォントキャッシュに新規インストール済み
-    フォントが反映されない場合があるため、family名ではなくfnameを使う。
+    まずpip依存だけで導入できる japanize-matplotlib のIPAexGothicを使う。
+    見つからない場合だけNoto/IPA系のシステムフォントを探索する。
+    packages.txt/aptには依存しない。
     """
+    if japanize_matplotlib is not None:
+        try:
+            path = font_manager.findfont("IPAexGothic", fallback_to_default=False)
+            if path and Path(path).is_file():
+                plt.rcParams["font.family"] = "IPAexGothic"
+                plt.rcParams["axes.unicode_minus"] = False
+                return font_manager.FontProperties(fname=path)
+        except Exception:
+            pass
+
     candidates = [
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
