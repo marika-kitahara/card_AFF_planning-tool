@@ -1,41 +1,60 @@
 import pandas as pd
 from config.constants import BUDGET_STEP, UP_RATE, DOWN_RATE
 
-def simulate_plan(df):
 
+def simulate_plan(df):
+    """
+    松竹梅を「単価(CPA)」基準でシミュレーションする。
+
+    基礎単価 = 基礎COST / 基礎予測CV
+    梅 = 基礎単価 - BUDGET_STEP
+    竹 = 基礎単価
+    松 = 基礎単価 + BUDGET_STEP
+
+    CVは従来どおり単価変更に応じて UP_RATE / DOWN_RATE で変化させ、
+    COSTは「予測CV × 採用単価」で算出する。
+    単価が0円以下になる候補は営業向けプランとして成立しないため生成しない。
+    """
     results = []
 
     for _, row in df.iterrows():
+        base_cv = float(pd.to_numeric(row.get("forecast_cv", 0), errors="coerce") or 0)
+        base_cost = float(pd.to_numeric(row.get("cost", 0), errors="coerce") or 0)
 
-        base_cv = row["forecast_cv"]
-        base_cost = row["cost"]
+        # CVがない場合は意味のある単価を作れないため候補外。
+        if base_cv <= 0:
+            continue
 
-        for label, delta in {
+        base_unit_price = base_cost / base_cv
+
+        for label, unit_delta in {
             "梅": -BUDGET_STEP,
             "竹": 0,
             "松": BUDGET_STEP,
         }.items():
+            unit_price = base_unit_price + unit_delta
 
-            if delta >= 0:
-                multiplier = UP_RATE ** (delta / BUDGET_STEP)
+            # マイナス/0円単価は最適プラン候補にしない。
+            if unit_price <= 0:
+                continue
+
+            if unit_delta >= 0:
+                multiplier = UP_RATE ** (unit_delta / BUDGET_STEP)
             else:
-                multiplier = DOWN_RATE ** abs(delta / BUDGET_STEP)
+                multiplier = DOWN_RATE ** abs(unit_delta / BUDGET_STEP)
 
             new_cv = base_cv * multiplier
-            new_cost = base_cost + delta
+            new_cost = new_cv * unit_price
 
-            cpa = new_cost / new_cv if new_cv != 0 else 0
-
-            # ✅ ←ここが超重要！！
             result = {
                 "date": row["date"],
                 "media": row["media"],
                 "plan": label,
                 "cv": new_cv,
                 "cost": new_cost,
-                "cpa": cpa,
+                # CPA = 採用単価。最適プラン/手動設定の単価にもこの値が連動する。
+                "cpa": unit_price,
             }
-            # 複合施策時に、どの施策由来の予測かを後工程まで保持する。
             if "CPN名" in row.index:
                 result["CPN名"] = row["CPN名"]
             if "planning_segment" in row.index:
