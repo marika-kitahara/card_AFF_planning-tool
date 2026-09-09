@@ -781,6 +781,46 @@ def render_manual_settings(
         )
 
 
+
+def _resolve_submission_cpn_month(cpn_master, start_date, end_date=None):
+    """提出用Excelの月度をCPNマスタ基準で解決する。"""
+    fallback_ts = pd.Timestamp(start_date)
+    fallback_label = f"{fallback_ts.year}年{fallback_ts.month}月度"
+
+    if cpn_master is None or len(cpn_master) == 0:
+        return fallback_label, fallback_ts.year, fallback_ts.month
+    if "日付" not in cpn_master.columns or "月度" not in cpn_master.columns:
+        return fallback_label, fallback_ts.year, fallback_ts.month
+
+    master = cpn_master[["日付", "月度"]].copy()
+    master["日付"] = pd.to_datetime(master["日付"], errors="coerce").dt.normalize()
+    master["月度"] = master["月度"].astype("string").str.strip()
+    master = master.dropna(subset=["日付", "月度"])
+    master = master.loc[master["月度"].ne("") & master["月度"].ne("未設定")]
+    if master.empty:
+        return fallback_label, fallback_ts.year, fallback_ts.month
+
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize() if end_date is not None else start
+
+    # まず予測開始日そのもののCPN月度を正とする。
+    exact = master.loc[master["日付"].eq(start), "月度"]
+    if not exact.empty:
+        label = str(exact.iloc[0])
+    else:
+        # 開始日に行がない場合だけ、予測対象期間内で最頻の月度を採用する。
+        in_range = master.loc[master["日付"].between(start, end), "月度"]
+        if in_range.empty:
+            return fallback_label, fallback_ts.year, fallback_ts.month
+        label = str(in_range.mode().iloc[0])
+
+    import re
+    m = re.search(r"(\d{4})年\s*(\d{1,2})月度?", label)
+    if m:
+        return label, int(m.group(1)), int(m.group(2))
+    return label, fallback_ts.year, fallback_ts.month
+
+
 def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings, start_date, end_date, selected_cpn, opt_mode):
     """
     添付された提出用Excelそのものをテンプレートとして使い、
@@ -797,6 +837,10 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
       最適プランの値へ置き換える。
     ※元テンプレートそのものは変更しない。
     """
+    submission_month_label, submission_year, submission_month = _resolve_submission_cpn_month(
+        cpn_master, start_date, end_date
+    )
+
     plan = opt_summary.copy()
     plan["date"] = pd.to_datetime(plan["date"], errors="coerce").dt.normalize()
     plan = plan.dropna(subset=["date", "media"])
@@ -1104,7 +1148,7 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
     # =========================================================
     # 1) メインシート：○月（既存移管合算）
     # =========================================================
-    new_main_name = f"{pd.Timestamp(start_date).month}月（既存移管合算）"
+    new_main_name = f"{submission_month}月（既存移管合算）"
     main_ws.title = new_main_name
 
     # 最小テンプレートは他シートから旧シート名を参照する数式を持たないため、
@@ -1340,7 +1384,7 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
         sws,
         1,
         1,
-        f"{pd.Timestamp(start_date).month}月度サマリ 件数・発行・コスト",
+        f"{submission_month}月度サマリ 件数・発行・コスト",
     )
 
     sum_forecast = 0
@@ -4109,10 +4153,12 @@ if uploaded_master and has_any_actual:
         with history_analytics_placeholder.container():
             st.warning(f"月度別実績を集計できません。{analytics_exc}")
 
+    submission_month_label, submission_year, submission_month = _resolve_submission_cpn_month(
+        cpn_master, start_date, end_date
+    )
     submission_filename = (
         f"【提出用】楽天カード"
-        f"{pd.Timestamp(start_date).year}年"
-        f"{pd.Timestamp(start_date).month}月"
+        f"{submission_year}年{submission_month}月度"
         f"プランニング.xlsx"
     )
 
