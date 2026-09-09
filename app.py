@@ -421,9 +421,13 @@ def _build_manual_settings_defaults(
     opt_summary: pd.DataFrame,
     history_df: pd.DataFrame,
     selected_cpn: str,
+    forecast_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
-    最適プラン / 提案用Excelの計算値を、手動設定テーブルの初期値へ変換する。
+    手動設定テーブルの初期値を作る。
+
+    件数は「掲載状態反映後の予測Forecast」をそのまま採用し、
+    単価・承認率は最適プラン / 過去実績から取得する。
 
     編集可能:
       今回プラン採用グロス単価
@@ -454,6 +458,39 @@ def _build_manual_settings_defaults(
         totals["unit_weight"]
         / totals["plan_cv"].replace(0, pd.NA)
     ).fillna(0)
+
+    # 手動設定の初期「今回採用件数」は、最適化後の件数ではなく
+    # 掲載状態反映後のForecastをそのまま使う。
+    forecast_count_map = {}
+    if forecast_df is not None and not forecast_df.empty:
+        f = forecast_df.copy()
+        if "media" in f.columns and "forecast_cv" in f.columns:
+            f["media"] = f["media"].astype(str)
+            f["forecast_cv"] = pd.to_numeric(
+                f["forecast_cv"], errors="coerce"
+            ).fillna(0.0)
+            forecast_count_map = (
+                f.groupby("media")["forecast_cv"].sum().to_dict()
+            )
+
+            # 最適化結果に出ていない媒体でもForecastが正なら手動設定へ残す。
+            existing_media = set(totals["media"].astype(str))
+            missing_rows = [
+                {
+                    "media": media,
+                    "plan_cv": 0.0,
+                    "plan_cost": 0.0,
+                    "unit_weight": 0.0,
+                    "opt_unit": 0.0,
+                }
+                for media, cv in forecast_count_map.items()
+                if media not in existing_media and float(cv or 0) > 0
+            ]
+            if missing_rows:
+                totals = pd.concat(
+                    [totals, pd.DataFrame(missing_rows)],
+                    ignore_index=True,
+                )
 
     period = _calculate_period_media_metrics(history_df)
 
@@ -515,7 +552,9 @@ def _build_manual_settings_defaults(
             if gross_unit <= 0:
                 gross_unit = opt_unit
 
-        adopted_count = float(r.plan_cv or 0)
+        # Forecastが取得できる場合は掲載状態反映後Forecastを優先。
+        # Forecastが無い場合だけ従来の最適化後件数へフォールバック。
+        adopted_count = float(forecast_count_map.get(media, r.plan_cv or 0))
         approved_count = adopted_count * float(rate or 0)
         cost = approved_count * float(gross_unit or 0)
         issue_cpa = cost / approved_count if approved_count else 0
@@ -635,6 +674,7 @@ def render_manual_settings(
     history_df,
     selected_cpn,
     calc_key,
+    forecast_df=None,
 ):
     """
     手動設定エディタの安全版。
@@ -644,12 +684,14 @@ def render_manual_settings(
     予測・最適化結果は既存のsession_stateキャッシュを再利用するため、
     重い再計算は発生しない。
     """
-    if st.session_state.get("_manual_calc_key") != calc_key:
-        st.session_state["_manual_calc_key"] = calc_key
+    manual_calc_key = ("forecast_count_defaults_v2", calc_key)
+    if st.session_state.get("_manual_calc_key") != manual_calc_key:
+        st.session_state["_manual_calc_key"] = manual_calc_key
         st.session_state["_manual_settings"] = _build_manual_settings_defaults(
             opt_summary=opt_summary,
             history_df=history_df,
             selected_cpn=selected_cpn,
+            forecast_df=forecast_df,
         )
 
         # 計算条件が変わった時だけEditorのwidget stateもリセット
@@ -668,6 +710,7 @@ def render_manual_settings(
                 opt_summary=opt_summary,
                 history_df=history_df,
                 selected_cpn=selected_cpn,
+                forecast_df=forecast_df,
             ),
         )
     )
@@ -3328,7 +3371,7 @@ if uploaded_master and has_any_actual:
     opt_mode = st.sidebar.radio(
         "最適基準",
         ["単価最小", "CV最大"],
-        index=0,
+        index=1,
     )
 
     # ---------------------------------------------------------
@@ -4201,7 +4244,7 @@ if uploaded_master and has_any_actual:
 
     st.subheader("✍️ 手動設定")
     st.caption(
-        "初期値は上の最適プランと過去実績から自動設定。"
+        "初期件数は掲載状態反映後のForecast、単価・承認率は最適プランと過去実績から自動設定。"
         "グロス単価・承認率・採用件数を編集すると、費用は自動計算されます。"
         "承認件数と発行CPAは入力内容から自動計算します。"
     )
@@ -4211,6 +4254,7 @@ if uploaded_master and has_any_actual:
         history_df=history_df,
         selected_cpn=selected_cpn,
         calc_key=calc_key,
+        forecast_df=forecast_df,
     )
 
     # 過去実績分析には、手動設定後の今回プランを「今回」として単価帯グラフへ追加する。
@@ -4221,6 +4265,7 @@ if uploaded_master and has_any_actual:
                 opt_summary=opt_summary,
                 history_df=history_df,
                 selected_cpn=selected_cpn,
+                forecast_df=forecast_df,
             ),
         )
     )
@@ -4294,6 +4339,7 @@ if uploaded_master and has_any_actual:
                 opt_summary=opt_summary,
                 history_df=history_df,
                 selected_cpn=selected_cpn,
+                forecast_df=forecast_df,
             ),
         )
     )
