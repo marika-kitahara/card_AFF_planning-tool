@@ -3317,6 +3317,98 @@ if uploaded_master and has_any_actual:
         st.session_state["_publication_status_values"] = status_store
         st.session_state.setdefault("_publication_editor_version", 0)
 
+        # ExcelなどのA列SID / B列媒体名をそのまま貼り付けて、掲載媒体を一括反映できる。
+        # SIDを最優先で照合し、SIDが空欄・不一致の場合のみ媒体名で補完する。
+        with st.expander("📋 掲載媒体をコピペで一括設定", expanded=False):
+            st.caption(
+                "ExcelのA列=SID、B列=媒体名をそのままコピーして貼り付けてください。"
+                "記載のある媒体だけを『掲載予定』、それ以外を『掲載なし』にします。"
+            )
+            pasted_publication_text = st.text_area(
+                "掲載媒体一覧",
+                key="publication_media_paste_text",
+                height=180,
+                placeholder="123456\tモッピー\n234567\tハピタス\n345678\tLINEポイントクラブ",
+                label_visibility="collapsed",
+            )
+            if st.button(
+                "貼り付けた媒体を掲載予定に反映",
+                use_container_width=True,
+                key="publication_apply_pasted_list",
+                type="primary",
+            ):
+                # 現在選択中の媒体についてSIDマスタを作る。
+                media_sid_map = {}
+                if "SID" in history_df.columns:
+                    sid_src = history_df[["media", "SID"]].copy()
+                    sid_src["media"] = sid_src["media"].astype(str).str.strip()
+                    sid_src["SID"] = sid_src["SID"].map(_normalize_sid)
+                    sid_src = sid_src[sid_src["media"].isin([str(m) for m in selected_media])]
+                    sid_src = sid_src[sid_src["SID"] != ""]
+                    for media, grp in sid_src.groupby("media", sort=False):
+                        # 同一媒体に複数SIDがある場合も、どれか1つが一致すれば掲載予定にする。
+                        media_sid_map[str(media)] = set(grp["SID"].astype(str))
+
+                sid_to_media = {}
+                for media, sid_values in media_sid_map.items():
+                    for sid in sid_values:
+                        sid_to_media.setdefault(sid, set()).add(media)
+                name_to_media = {str(m).strip(): str(m) for m in selected_media}
+
+                matched_media = set()
+                unmatched_rows = []
+                input_rows = 0
+                for raw_line in (pasted_publication_text or "").splitlines():
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    # Excel貼り付けはタブ区切り。念のためカンマ区切りにも対応。
+                    parts = [x.strip() for x in (line.split("\t") if "\t" in line else line.split(","))]
+                    sid = _normalize_sid(parts[0]) if parts else ""
+                    media_name = parts[1].strip() if len(parts) >= 2 else ""
+                    # ヘッダー行は読み飛ばす。
+                    if sid.upper() == "SID" or media_name in {"媒体", "媒体名"}:
+                        continue
+                    input_rows += 1
+
+                    row_matches = set(sid_to_media.get(sid, set())) if sid else set()
+                    if not row_matches and media_name:
+                        exact_media = name_to_media.get(media_name)
+                        if exact_media:
+                            row_matches.add(exact_media)
+                    if row_matches:
+                        matched_media.update(row_matches)
+                    else:
+                        unmatched_rows.append(line)
+
+                if input_rows == 0:
+                    st.warning("掲載媒体が入力されていません。SID・媒体名を貼り付けてください。")
+                else:
+                    st.session_state["_publication_status_values"] = {
+                        str(m): ("掲載予定" if str(m) in matched_media else "掲載なし")
+                        for m in selected_media
+                    }
+                    st.session_state["_publication_editor_version"] += 1
+                    st.session_state["_publication_paste_result"] = {
+                        "matched": len(matched_media),
+                        "none": len(selected_media) - len(matched_media),
+                        "unmatched": unmatched_rows,
+                    }
+                    st.rerun()
+
+            paste_result = st.session_state.pop("_publication_paste_result", None)
+            if paste_result:
+                st.success(
+                    f"{paste_result['matched']}媒体を掲載予定、"
+                    f"{paste_result['none']}媒体を掲載なしに設定しました。"
+                )
+                if paste_result["unmatched"]:
+                    st.warning(
+                        f"一致しなかった入力が{len(paste_result['unmatched'])}件あります。"
+                        "SIDまたは媒体名を確認してください。"
+                    )
+                    st.code("\n".join(paste_result["unmatched"][:30]))
+
         bulk_cols = st.columns(3)
         if bulk_cols[0].button("全て掲載予定", use_container_width=True, key="publication_all_planned"):
             st.session_state["_publication_status_values"] = {str(m): "掲載予定" for m in selected_media}
