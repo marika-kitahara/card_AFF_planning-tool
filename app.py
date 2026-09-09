@@ -2978,14 +2978,21 @@ if uploaded_master and has_any_actual:
     all_product_ids = sorted(
         [x for x in history_df["商品ID"].dropna().astype(str).unique() if str(x).strip() != ""]
     )
-    product_id_one = next(
-        (pid for pid in all_product_ids if str(pid).strip() == "1"),
-        next(
-            (pid for pid in all_product_ids if pd.to_numeric(pid, errors="coerce") == 1),
-            None,
-        ),
-    )
-    default_product_ids = [product_id_one] if product_id_one is not None else all_product_ids[:1]
+    # 商品IDは、存在する場合は 1 と 2 をデフォルト選択。
+    # どちらも無い場合だけ、従来どおり先頭1件を初期値にする。
+    default_product_ids = []
+    for target_id in (1, 2):
+        matched_id = next(
+            (pid for pid in all_product_ids if str(pid).strip() == str(target_id)),
+            next(
+                (pid for pid in all_product_ids if pd.to_numeric(pid, errors="coerce") == target_id),
+                None,
+            ),
+        )
+        if matched_id is not None and matched_id not in default_product_ids:
+            default_product_ids.append(matched_id)
+    if not default_product_ids:
+        default_product_ids = all_product_ids[:1]
     selected_product_ids = st.sidebar.multiselect(
         "商品ID",
         all_product_ids,
