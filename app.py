@@ -821,6 +821,69 @@ def _resolve_submission_cpn_month(cpn_master, start_date, end_date=None):
     return label, fallback_ts.year, fallback_ts.month
 
 
+def _copy_cell_style_and_format(src, dst):
+    """セルの値以外の表示設定を複製する。"""
+    if src.has_style:
+        dst._style = copy(src._style)
+    if src.number_format:
+        dst.number_format = src.number_format
+    if src.font:
+        dst.font = copy(src.font)
+    if src.fill:
+        dst.fill = copy(src.fill)
+    if src.border:
+        dst.border = copy(src.border)
+    if src.alignment:
+        dst.alignment = copy(src.alignment)
+    if src.protection:
+        dst.protection = copy(src.protection)
+
+
+def _extend_sheet_date_columns(ws, first_date_col, base_slots, required_slots, total_col):
+    """33日テンプレートを必要日数まで右方向へ拡張し、Total列を後ろへ送る。"""
+    required_slots = max(int(required_slots), int(base_slots))
+    extra = required_slots - int(base_slots)
+    if extra <= 0:
+        return total_col
+
+    source_col = total_col - 1  # 既存の最後の日付列
+    ws.insert_cols(total_col, amount=extra)
+
+    src_letter = get_column_letter(source_col)
+    src_width = ws.column_dimensions[src_letter].width
+    for offset in range(extra):
+        new_col = total_col + offset
+        new_letter = get_column_letter(new_col)
+        if src_width is not None:
+            ws.column_dimensions[new_letter].width = src_width
+        for row in range(1, ws.max_row + 1):
+            _copy_cell_style_and_format(ws.cell(row, source_col), ws.cell(row, new_col))
+            ws.cell(row, new_col).value = None
+
+    return total_col + extra
+
+
+def _extend_summary_date_rows(ws, base_slots, required_slots, first_data_row=3, total_row=36):
+    """全体サマリの33日分行を必要日数まで下方向へ拡張する。"""
+    required_slots = max(int(required_slots), int(base_slots))
+    extra = required_slots - int(base_slots)
+    if extra <= 0:
+        return total_row
+
+    source_row = total_row - 1
+    ws.insert_rows(total_row, amount=extra)
+    src_height = ws.row_dimensions[source_row].height
+    for offset in range(extra):
+        new_row = total_row + offset
+        if src_height is not None:
+            ws.row_dimensions[new_row].height = src_height
+        for col in range(1, ws.max_column + 1):
+            _copy_cell_style_and_format(ws.cell(source_row, col), ws.cell(new_row, col))
+            ws.cell(new_row, col).value = None
+
+    return total_row + extra
+
+
 def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings, start_date, end_date, selected_cpn, opt_mode):
     """
     添付された提出用Excelそのものをテンプレートとして使い、
@@ -850,8 +913,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
 
     # 複合施策では「開始～終了の連続日」ではなく、実際に予測した対象日だけを出力する。
     dates = sorted(pd.Timestamp(x).normalize() for x in plan["date"].dropna().unique())
-    if len(dates) > 33:
-        raise ValueError("提出用テンプレートは最大33日分です。施策①+施策②の対象日数を33日以内にしてください。")
 
     daily = (
         plan.groupby(["date", "media"], as_index=False)
@@ -1156,8 +1217,16 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
     # これにより提出用Excel生成時の処理時間を大幅に削減する。
 
     first_date_col = 25  # Y
-    total_col = 58       # BF
-    date_slots = 33
+    base_date_slots = 33
+    date_slots = max(base_date_slots, len(dates))
+    total_col = 58       # BF（33日テンプレート時）
+    total_col = _extend_sheet_date_columns(
+        main_ws,
+        first_date_col=first_date_col,
+        base_slots=base_date_slots,
+        required_slots=date_slots,
+        total_col=total_col,
+    )
 
     # 上部サマリの日付・Target/Actual/GAP
     _set_date_slots(main_ws, 2, first_date_col, date_slots, dates, total_col)
@@ -1298,12 +1367,28 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
     ]
 
     metric_first_date_col = 9   # I
-    metric_total_col = 42       # AP
+    metric_base_date_slots = 33
     metric_header_row = 3
     metric_data_start = 4
 
     for sheet_name, metric_kind in metric_specs:
         ws = wb_out[sheet_name]
+        metric_total_col = 42  # AP（33日テンプレート時）
+        metric_total_col = _extend_sheet_date_columns(
+            ws,
+            first_date_col=metric_first_date_col,
+            base_slots=metric_base_date_slots,
+            required_slots=date_slots,
+            total_col=metric_total_col,
+        )
+        # 1行目のタイトル結合範囲も拡張後のTotal列まで広げる。
+        try:
+            for rng in list(ws.merged_cells.ranges):
+                if rng.min_row == 1 and rng.max_row == 1 and rng.min_col == 1:
+                    ws.unmerge_cells(str(rng))
+            ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=metric_total_col)
+        except Exception:
+            pass
 
         _set_date_slots(
             ws,
@@ -1380,6 +1465,13 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
     # 5) 全体サマリ
     # =========================================================
     sws = wb_out["全体サマリ（定常期間サマリ）"]
+    summary_total_row = _extend_summary_date_rows(
+        sws,
+        base_slots=33,
+        required_slots=date_slots,
+        first_data_row=3,
+        total_row=36,
+    )
     _set_value(
         sws,
         1,
@@ -1391,7 +1483,7 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
     sum_issue = 0
     sum_cost = 0
 
-    for i in range(33):
+    for i in range(date_slots):
         r = 3 + i
 
         if i < len(dates):
@@ -1427,15 +1519,15 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
     total_rate = sum_issue / sum_forecast if sum_forecast else 0
     total_cpa = round(sum_cost / sum_issue) if sum_issue else 0
 
-    _set_value(sws, 36, 1, "Total")
-    _set_value(sws, 36, 2, sum_forecast)
-    _set_value(sws, 36, 3, sum_forecast)
-    _set_value(sws, 36, 4, 0)
-    _set_value(sws, 36, 5, sum_issue)
-    _set_value(sws, 36, 6, 0)
-    _set_percent(sws, 36, 7, total_rate)
-    _set_value(sws, 36, 8, sum_cost)
-    _set_value(sws, 36, 9, total_cpa)
+    _set_value(sws, summary_total_row, 1, "Total")
+    _set_value(sws, summary_total_row, 2, sum_forecast)
+    _set_value(sws, summary_total_row, 3, sum_forecast)
+    _set_value(sws, summary_total_row, 4, 0)
+    _set_value(sws, summary_total_row, 5, sum_issue)
+    _set_value(sws, summary_total_row, 6, 0)
+    _set_percent(sws, summary_total_row, 7, total_rate)
+    _set_value(sws, summary_total_row, 8, sum_cost)
+    _set_value(sws, summary_total_row, 9, total_cpa)
 
     # =========================================================
     # 既存移管合算シート：不要列 E:W を最終出力時に削除
@@ -1536,17 +1628,36 @@ def _figure_png_bytes(fig, dpi: int = 180) -> bytes:
 def _get_japanese_font_properties():
     """日本語フォントを安全に取得する。
 
-    まずpip依存だけで導入できる japanize-matplotlib のIPAexGothicを使う。
-    見つからない場合だけNoto/IPA系のシステムフォントを探索する。
-    packages.txt/aptには依存しない。
+    Streamlit CloudではOSパッケージに依存せず、japanize-matplotlibに
+    同梱されているIPAexGothicを直接登録して利用する。
     """
     if japanize_matplotlib is not None:
         try:
-            path = font_manager.findfont("IPAexGothic", fallback_to_default=False)
-            if path and Path(path).is_file():
-                plt.rcParams["font.family"] = "IPAexGothic"
-                plt.rcParams["axes.unicode_minus"] = False
-                return font_manager.FontProperties(fname=path)
+            pkg_dir = Path(japanize_matplotlib.__file__).resolve().parent
+            bundled = [
+                pkg_dir / "fonts" / "ipaexg.ttf",
+                pkg_dir / "fonts" / "ipaexg.ttf",
+            ]
+            for path in bundled:
+                if path.is_file():
+                    font_manager.fontManager.addfont(str(path))
+                    prop = font_manager.FontProperties(fname=str(path))
+                    family = prop.get_name()
+                    plt.rcParams["font.family"] = family
+                    plt.rcParams["axes.unicode_minus"] = False
+                    return prop
+            # 同梱フォントのパス構成が変わっても探索できるようにする。
+            for path in pkg_dir.rglob("*.ttf"):
+                try:
+                    font_manager.fontManager.addfont(str(path))
+                    prop = font_manager.FontProperties(fname=str(path))
+                    family = prop.get_name()
+                    if family:
+                        plt.rcParams["font.family"] = family
+                        plt.rcParams["axes.unicode_minus"] = False
+                        return prop
+                except Exception:
+                    continue
         except Exception:
             pass
 
@@ -1567,9 +1678,10 @@ def _get_japanese_font_properties():
         seen.add(path)
         try:
             if Path(path).is_file():
+                font_manager.fontManager.addfont(str(path))
                 prop = font_manager.FontProperties(fname=path)
-                # 実際に名前を取得できることまで確認
-                _ = prop.get_name()
+                family = prop.get_name()
+                plt.rcParams["font.family"] = family
                 plt.rcParams["axes.unicode_minus"] = False
                 return prop
         except Exception:
@@ -1687,11 +1799,12 @@ def render_history_analytics(
         x = range(len(monthly))
         labels_raw = monthly["月度"].astype(str).tolist()
         labels = labels_raw if jp_font else [_chart_month_label(v) for v in labels_raw]
+        scope_suffix_display = scope_suffix if jp_font else ("Magi-toku period" if analysis_scope == "マジ得" else "Full period")
 
         fig_count, ax_count = plt.subplots(figsize=(12, 5))
         ax_count.bar(x, monthly["発行数"])
         ax_count.set_title(
-            f"月度別 発行数（{scope_suffix}）" if jp_font else f"Issued count by month ({scope_suffix})",
+            f"月度別 発行数（{scope_suffix}）" if jp_font else f"Issued count by month ({scope_suffix_display})",
             fontproperties=jp_font,
         )
         ax_count.set_ylabel("発行数" if jp_font else "Issued count", fontproperties=jp_font)
@@ -1712,7 +1825,7 @@ def render_history_analytics(
         fig_cpa, ax_cpa = plt.subplots(figsize=(12, 5))
         ax_cpa.plot(x, monthly["発行CPA"], marker="o")
         ax_cpa.set_title(
-            f"月度別 発行CPA（{scope_suffix}）" if jp_font else f"Issued CPA by month ({scope_suffix})",
+            f"月度別 発行CPA（{scope_suffix}）" if jp_font else f"Issued CPA by month ({scope_suffix_display})",
             fontproperties=jp_font,
         )
         ax_cpa.set_ylabel("発行CPA（円）" if jp_font else "Issued CPA (JPY)", fontproperties=jp_font)
