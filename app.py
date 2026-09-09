@@ -69,12 +69,12 @@ def create_report_table(df):
     metric_map = {
         "cv": "CV",
         "cost": "COST",
-        "cpa": "CPA",
+        "cpa": "単価",
     }
     metric_order = {
         "CV": 0,
         "COST": 1,
-        "CPA": 2,
+        "単価": 2,
     }
 
     long_df["metric"] = long_df["metric"].map(metric_map)
@@ -106,7 +106,7 @@ def create_report_table(df):
         result["media"].duplicated()
     )
 
-    # planは3行（CV/COST/CPA）の先頭だけ表示
+    # planは3行（CV/COST/単価）の先頭だけ表示
     result["plan"] = result["plan"].mask(
         result["plan"].eq(result["plan"].shift())
         & result["media"].isna()
@@ -299,16 +299,11 @@ def _calculate_period_media_metrics(history_df: pd.DataFrame):
     """
     媒体別に定常・マジ得の過去実績指標を作る。
 
-    定常承認率:
-        定常/通常期間の 成果承認フラグY件数 / 全件数
+    承認率 = Y件数 / (Y + D)件数
+    グロス単価 = ローデータW列「グロス」の直近実績
 
-    マジ得承認率:
-        マジ得期間の 成果承認フラグY件数 / 全件数
-
-    マジ得単価:
-        マジ得期間の cost / cv
-
-    媒体に該当期間実績がない場合は、その期間の全媒体加重値をフォールバック。
+    COST/発生CVから単価を逆算しない。
+    営業プランで使う「単価」はW列グロスを正とする。
     """
     required = {
         "media", "CPN名", "cv", "cost",
@@ -321,18 +316,25 @@ def _calculate_period_media_metrics(history_df: pd.DataFrame):
             + ", ".join(sorted(missing))
         )
 
-    work = history_df[
-        ["media", "CPN名", "cv", "cost", "approved_cv", "approval_base_cv"]
-    ].copy()
+    use_cols = [
+        "media", "CPN名", "date", "cv", "cost",
+        "approved_cv", "approval_base_cv",
+    ]
+    if "gross_unit" in history_df.columns:
+        use_cols.append("gross_unit")
 
+    work = history_df[use_cols].copy()
     work["media"] = work["media"].astype(str)
     work["CPN名"] = work["CPN名"].astype(str).str.strip()
+    work["date"] = pd.to_datetime(work["date"], errors="coerce")
     for col in ["cv", "cost", "approved_cv", "approval_base_cv"]:
         work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0)
+    if "gross_unit" not in work.columns:
+        work["gross_unit"] = 0.0
+    work["gross_unit"] = pd.to_numeric(work["gross_unit"], errors="coerce").fillna(0.0)
 
     def build(mask):
         sub = work[mask].copy()
-
         if sub.empty:
             return {}, 0.0, {}, 0.0
 
@@ -345,30 +347,41 @@ def _calculate_period_media_metrics(history_df: pd.DataFrame):
                 approval_base_cv=("approval_base_cv", "sum"),
             )
         )
-
         agg["approval_rate"] = (
             agg["approved_cv"]
             / agg["approval_base_cv"].replace(0, pd.NA)
         ).fillna(0).clip(0, 1)
-
-        agg["unit_price"] = (
-            agg["cost"]
-            / agg["cv"].replace(0, pd.NA)
-        ).fillna(0)
 
         total_base = sub["approval_base_cv"].sum()
         overall_rate = (
             float(sub["approved_cv"].sum() / total_base)
             if total_base > 0 else 0.0
         )
-        total_cv = sub["cv"].sum()
-        overall_unit = (
-            float(sub["cost"].sum() / total_cv)
-            if total_cv > 0 else 0.0
-        )
+
+        # 媒体ごとの「最新の正のグロス単価」を採用。
+        # 同一最新日に複数行ある場合はCV加重平均。
+        positive = sub[sub["gross_unit"].gt(0) & sub["date"].notna()].copy()
+        unit_map = {}
+        if not positive.empty:
+            positive["gross_weight"] = positive["gross_unit"] * positive["cv"].clip(lower=0)
+            daily_unit = (
+                positive.groupby(["media", "date"], as_index=False)
+                .agg(gross_weight=("gross_weight", "sum"), unit_cv=("cv", "sum"))
+            )
+            daily_unit["unit"] = (
+                daily_unit["gross_weight"]
+                / daily_unit["unit_cv"].replace(0, pd.NA)
+            )
+            daily_unit = daily_unit[daily_unit["unit"].gt(0)].sort_values("date")
+            latest = daily_unit.groupby("media", as_index=False).tail(1)
+            unit_map = dict(zip(latest["media"], latest["unit"].astype(float)))
+
+        # フォールバックは全該当実績のCV加重グロス単価。
+        total_weight = float((positive["gross_unit"] * positive["cv"].clip(lower=0)).sum()) if not positive.empty else 0.0
+        total_unit_cv = float(positive["cv"].clip(lower=0).sum()) if not positive.empty else 0.0
+        overall_unit = total_weight / total_unit_cv if total_unit_cv > 0 else 0.0
 
         rate_map = dict(zip(agg["media"], agg["approval_rate"].astype(float)))
-        unit_map = dict(zip(agg["media"], agg["unit_price"].astype(float)))
         return rate_map, overall_rate, unit_map, overall_unit
 
     normal_mask = work["CPN名"].isin(["通常", "定常"])
@@ -416,26 +429,29 @@ def _build_manual_settings_defaults(
       今回プラン採用グロス単価
       今回プラン採用承認率
       今回採用件数
-      費用
 
     自動計算:
       承認件数 = 今回採用件数 × 今回プラン採用承認率
-      発行CPA   = 費用 ÷ 承認件数
+      費用     = 承認件数 × 今回プラン採用グロス単価
+      発行CPA = 費用 ÷ 承認件数
     """
     plan = opt_summary.copy()
     plan["media"] = plan["media"].astype(str)
     plan["cv"] = pd.to_numeric(plan["cv"], errors="coerce").fillna(0)
     plan["cost"] = pd.to_numeric(plan["cost"], errors="coerce").fillna(0)
 
+    plan["cpa"] = pd.to_numeric(plan.get("cpa", 0), errors="coerce").fillna(0)
+    plan["_unit_weight"] = plan["cpa"] * plan["cv"]
     totals = (
         plan.groupby("media", as_index=False)
         .agg(
             plan_cv=("cv", "sum"),
             plan_cost=("cost", "sum"),
+            unit_weight=("_unit_weight", "sum"),
         )
     )
     totals["opt_unit"] = (
-        totals["plan_cost"]
+        totals["unit_weight"]
         / totals["plan_cv"].replace(0, pd.NA)
     ).fillna(0)
 
@@ -481,7 +497,9 @@ def _build_manual_settings_defaults(
                         cpn_gross = opt_unit
                 else:
                     cpn_rate = period["normal_rate"].get(media, period["normal_rate_all"])
-                    cpn_gross = opt_unit
+                    cpn_gross = period["normal_unit"].get(media, period["normal_unit_all"])
+                    if cpn_gross <= 0:
+                        cpn_gross = opt_unit
                 weighted_rate += weight * float(cpn_rate or 0)
                 weighted_gross += weight * float(cpn_gross or 0)
             rate = weighted_rate / weight_total if weight_total else 0.0
@@ -493,7 +511,9 @@ def _build_manual_settings_defaults(
                 gross_unit = opt_unit
         else:
             rate = period["normal_rate"].get(media, period["normal_rate_all"])
-            gross_unit = opt_unit
+            gross_unit = period["normal_unit"].get(media, period["normal_unit_all"])
+            if gross_unit <= 0:
+                gross_unit = opt_unit
 
         adopted_count = float(r.plan_cv or 0)
         approved_count = adopted_count * float(rate or 0)
@@ -560,6 +580,12 @@ def _normalize_manual_settings(df: pd.DataFrame) -> pd.DataFrame:
     out["承認件数"] = (
         out["今回採用件数"]
         * out["今回プラン採用承認率"]
+    )
+    # 営業プランの定義に合わせ、費用は編集値ではなく自動計算する。
+    # 発行コスト = 発行見込み(承認件数) × 今回プラン採用グロス単価
+    out["費用"] = (
+        out["承認件数"]
+        * out["今回プラン採用グロス単価"]
     )
 
     out["発行CPA"] = (
@@ -660,6 +686,7 @@ def render_manual_settings(
         disabled=[
             "SID",
             "媒体名",
+            "費用",
             "承認件数",
             "発行CPA",
         ],
@@ -729,6 +756,7 @@ def render_manual_settings(
     derived = normalized[
         [
             "媒体名",
+            "費用",
             "承認件数",
             "発行CPA",
         ]
@@ -2859,6 +2887,10 @@ if uploaded_master and has_any_actual:
                         media,
                         _period_preview["magi_rate_all"],
                     ),
+                    "定常単価": _period_preview["normal_unit"].get(
+                        media,
+                        _period_preview["normal_unit_all"],
+                    ),
                     "マジ得単価": _period_preview["magi_unit"].get(
                         media,
                         _period_preview["magi_unit_all"],
@@ -2874,6 +2906,9 @@ if uploaded_master and has_any_actual:
         approval_preview["マジ得承認率"] = approval_preview["マジ得承認率"].map(
             lambda x: f"{x:.1%}"
         )
+        approval_preview["定常単価"] = approval_preview["定常単価"].map(
+            lambda x: f"¥{x:,.0f}"
+        )
         approval_preview["マジ得単価"] = approval_preview["マジ得単価"].map(
             lambda x: f"¥{x:,.0f}"
         )
@@ -2881,7 +2916,7 @@ if uploaded_master and has_any_actual:
         with st.expander("✅ 定常・マジ得の過去実績指標"):
             st.caption(
                 "承認率 = 成果承認フラグYの件数 ÷ 全件数 / "
-                "マジ得単価 = マジ得期間cost ÷ CV"
+                "単価 = ローデータW列『グロス』の直近実績"
             )
             st.dataframe(
                 approval_preview,
@@ -3115,7 +3150,7 @@ if uploaded_master and has_any_actual:
 
     opt_mode = st.sidebar.radio(
         "最適基準",
-        ["CPA最小", "CV最大"],
+        ["単価最小", "CV最大"],
         index=0,
     )
 
@@ -3675,6 +3710,28 @@ if uploaded_master and has_any_actual:
             * pd.to_numeric(forecast_df.loc[normal_pub_mask, "掲載係数"], errors="coerce").fillna(1.0)
         )
 
+        # 営業プランの計算定義へ合わせる。
+        # Forecast(発生件数) × 承認率 = 発行見込み
+        # 発行見込み × W列グロス単価 = 発行コスト
+        _plan_period_metrics = _calculate_period_media_metrics(history_df)
+        is_magi_plan = forecast_df["CPN名"].astype(str).str.strip().eq("マジ得")
+        normal_rate_map = _plan_period_metrics["normal_rate"]
+        magi_rate_map = _plan_period_metrics["magi_rate"]
+        normal_unit_map = _plan_period_metrics["normal_unit"]
+        magi_unit_map = _plan_period_metrics["magi_unit"]
+        forecast_df["approval_rate"] = [
+            (magi_rate_map.get(str(m), _plan_period_metrics["magi_rate_all"]) if magi
+             else normal_rate_map.get(str(m), _plan_period_metrics["normal_rate_all"]))
+            for m, magi in zip(forecast_df["media"], is_magi_plan)
+        ]
+        forecast_df["gross_unit"] = [
+            (magi_unit_map.get(str(m), _plan_period_metrics["magi_unit_all"]) if magi
+             else normal_unit_map.get(str(m), _plan_period_metrics["normal_unit_all"]))
+            for m, magi in zip(forecast_df["media"], is_magi_plan)
+        ]
+        forecast_df["approval_rate"] = pd.to_numeric(forecast_df["approval_rate"], errors="coerce").fillna(0.0).clip(0, 1)
+        forecast_df["gross_unit"] = pd.to_numeric(forecast_df["gross_unit"], errors="coerce").fillna(0.0)
+
         # simulate_plan用に日付表示形式を変換
         forecast_df = forecast_df.copy()
         forecast_df["date"] = format_date(
@@ -3688,6 +3745,8 @@ if uploaded_master and has_any_actual:
         sim_group_cols = ["date", "media", "plan"]
         if "CPN名" in sim_df.columns:
             sim_group_cols.append("CPN名")
+        sim_df = sim_df.copy()
+        sim_df["_unit_weight"] = pd.to_numeric(sim_df["cpa"], errors="coerce").fillna(0) * pd.to_numeric(sim_df["cv"], errors="coerce").fillna(0)
         sim_summary = (
             sim_df.groupby(
                 sim_group_cols,
@@ -3696,17 +3755,15 @@ if uploaded_master and has_any_actual:
             .agg(
                 cv=("cv", "sum"),
                 cost=("cost", "sum"),
+                approved_cv=("approved_cv", "sum"),
+                _unit_weight=("_unit_weight", "sum"),
             )
         )
-
         sim_summary["cpa"] = (
-            (sim_summary["cost"] / sim_summary["cv"])
-            .replace(
-                [float("inf"), float("-inf")],
-                0,
-            )
-            .fillna(0)
-        )
+            sim_summary["_unit_weight"]
+            / sim_summary["cv"].replace(0, pd.NA)
+        ).fillna(0)
+        sim_summary = sim_summary.drop(columns=["_unit_weight"])
 
         sim_summary["date"] = format_date(
             sim_summary
@@ -3720,6 +3777,8 @@ if uploaded_master and has_any_actual:
         opt_group_cols = ["date", "media", "plan"]
         if "CPN名" in opt_df.columns:
             opt_group_cols.append("CPN名")
+        opt_df = opt_df.copy()
+        opt_df["_unit_weight"] = pd.to_numeric(opt_df["cpa"], errors="coerce").fillna(0) * pd.to_numeric(opt_df["cv"], errors="coerce").fillna(0)
         opt_summary = (
             opt_df.groupby(
                 opt_group_cols,
@@ -3728,17 +3787,15 @@ if uploaded_master and has_any_actual:
             .agg(
                 cv=("cv", "sum"),
                 cost=("cost", "sum"),
+                approved_cv=("approved_cv", "sum"),
+                _unit_weight=("_unit_weight", "sum"),
             )
         )
-
         opt_summary["cpa"] = (
-            (opt_summary["cost"] / opt_summary["cv"])
-            .replace(
-                [float("inf"), float("-inf")],
-                0,
-            )
-            .fillna(0)
-        )
+            opt_summary["_unit_weight"]
+            / opt_summary["cv"].replace(0, pd.NA)
+        ).fillna(0)
+        opt_summary = opt_summary.drop(columns=["_unit_weight"])
 
         opt_summary["date"] = format_date(
             opt_summary
@@ -3857,7 +3914,7 @@ if uploaded_master and has_any_actual:
     st.subheader("✍️ 手動設定")
     st.caption(
         "初期値は上の最適プランと過去実績から自動設定。"
-        "グロス単価・承認率・採用件数・費用を直接編集できます。"
+        "グロス単価・承認率・採用件数を編集すると、費用は自動計算されます。"
         "承認件数と発行CPAは入力内容から自動計算します。"
     )
 
