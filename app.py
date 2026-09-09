@@ -2045,7 +2045,8 @@ def _run_normal_backtest(
     stage_formulas = {
         "stage_base_cv": ("base_cv", "cpn_factor"),
         "stage_unit_price_cv": ("stage_base_cv", "unit_price_factor"),
-        "stage_weekday_cv": ("stage_unit_price_cv", "weekday_factor"),
+        "stage_global_trend_cv": ("stage_unit_price_cv", "global_trend_factor"),
+        "stage_weekday_cv": ("stage_global_trend_cv", "weekday_factor"),
         "stage_season_cv": ("stage_weekday_cv", "season_factor"),
         "stage_month_edge_cv": ("stage_season_cv", "month_edge_factor"),
         "stage_after_cv": ("stage_month_edge_cv", "after_factor"),
@@ -2090,6 +2091,7 @@ def _run_normal_backtest(
         .agg(
             基礎CV=("stage_base_cv", "sum"),
             単価補正後CV=("stage_unit_price_cv", "sum"),
+            全体トレンド補正後CV=("stage_global_trend_cv", "sum"),
             曜日補正後CV=("stage_weekday_cv", "sum"),
             需要期補正後CV=("stage_season_cv", "sum"),
             月初月末補正後CV=("stage_month_edge_cv", "sum"),
@@ -2121,6 +2123,7 @@ def _run_normal_backtest(
         .agg(
             基礎CV=("基礎CV", "sum"),
             単価補正後CV=("単価補正後CV", "sum"),
+            全体トレンド補正後CV=("全体トレンド補正後CV", "sum"),
             曜日補正後CV=("曜日補正後CV", "sum"),
             需要期補正後CV=("需要期補正後CV", "sum"),
             月初月末補正後CV=("月初月末補正後CV", "sum"),
@@ -2135,7 +2138,8 @@ def _run_normal_backtest(
     )
     # 各補正が予測総量を何CV動かしたか。暴走地点の特定に使う。
     media_compare["単価影響CV"] = media_compare["単価補正後CV"] - media_compare["基礎CV"]
-    media_compare["曜日影響CV"] = media_compare["曜日補正後CV"] - media_compare["単価補正後CV"]
+    media_compare["全体トレンド影響CV"] = media_compare["全体トレンド補正後CV"] - media_compare["単価補正後CV"]
+    media_compare["曜日影響CV"] = media_compare["曜日補正後CV"] - media_compare["全体トレンド補正後CV"]
     media_compare["需要期影響CV"] = media_compare["需要期補正後CV"] - media_compare["曜日補正後CV"]
     media_compare["月初月末影響CV"] = media_compare["月初月末補正後CV"] - media_compare["需要期補正後CV"]
     media_compare["マジ得後影響CV"] = media_compare["マジ得後補正後CV"] - media_compare["月初月末補正後CV"]
@@ -3127,8 +3131,8 @@ if uploaded_master and has_any_actual:
 
     st.subheader("📐 実績から算出した変動係数")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["曜日", "月初・月末", "需要期", "LINE OA", "学習除外日", "休眠媒体"]
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+        ["曜日", "月初・月末", "需要期", "LINE OA", "全体トレンド", "学習除外日", "休眠媒体"]
     )
 
     with tab1:
@@ -3167,6 +3171,24 @@ if uploaded_master and has_any_actual:
 
 
     with tab5:
+        trend_preview = factor_tables.get("global_trend", pd.DataFrame()).copy()
+        if trend_preview.empty:
+            st.info("全体トレンド補正は1.0です。")
+        else:
+            trend_view = trend_preview.rename(columns={
+                "factor": "採用係数",
+                "raw_factor": "生の比率",
+                "prior_daily_cv": "前半30日の日平均CV",
+                "recent_daily_cv": "後半30日の日平均CV",
+                "prior_days": "前半の定常日数",
+                "recent_days": "後半の定常日数",
+                "stable_media_count": "継続媒体数",
+                "method": "算出方法",
+            })
+            st.caption("前半30日と後半30日の両方で稼働した媒体を中心に、案件全体のCV水準変化を補正します。係数は0.70〜1.30に制限します。")
+            st.dataframe(trend_view.round(3), width="stretch", hide_index=True)
+
+    with tab6:
         excluded = factor_tables.get("excluded", pd.DataFrame())
         if excluded.empty:
             st.info("マジ得直後・異常値による学習除外日はありません。")
@@ -3181,7 +3203,7 @@ if uploaded_master and has_any_actual:
                 hide_index=True,
             )
 
-    with tab6:
+    with tab7:
         inactive_media = factor_tables.get("inactive_media", pd.DataFrame())
         if inactive_media.empty:
             st.info("直近30日CVなしで休眠判定された媒体はありません。")
@@ -3313,209 +3335,212 @@ if uploaded_master and has_any_actual:
             continuation_preview["掲載継続率(%)"] = continuation_preview["掲載継続率(%)"].clip(0, 100).round(0).astype(int)
             st.dataframe(continuation_preview, width="stretch", hide_index=True)
 
-    st.subheader("🧪 定常バックテスト")
-    st.caption(
-        "対象月度の実績を予測計算から隠し、CPNマスタ上の対象月度開始日前までのデータだけで当時の定常予測を再現します。"
-        "対象月の実績は比較表示にだけ使用します。"
-    )
-
-    # 選択肢・月度順もローデータではなくCPNマスタを正とする。
-    bt_master = cpn_master.copy()
-    bt_master["日付"] = pd.to_datetime(bt_master["日付"], errors="coerce").dt.normalize()
-    bt_master["月度"] = bt_master["月度"].astype("string").str.strip()
-    bt_master["CPN名"] = bt_master["CPN名"].astype("string").str.strip()
-    bt_month_labels = _get_cpn_normal_months(bt_master)
-    # 実績比較ができる月度だけ選択肢に出す。期間定義そのものはCPNマスタ準拠。
-    history_months = set(
-        history_df.loc[
-            history_df["CPN名"].isin(normal_labels)
-            & history_df["月度"].astype(str).ne("未設定"),
-            "月度",
-        ].astype(str)
-    )
-    bt_options = [m for m in bt_month_labels[1:] if m in history_months]
-
-    if not bt_options:
-        st.info("バックテストには2月度以上の定常実績が必要です。")
-    else:
-        bt_target_month = st.selectbox(
-            "検証する月度",
-            options=bt_options,
-            index=len(bt_options) - 1,
-            key="normal_backtest_target_month",
-            help="月度はCPNマスタ基準です。対象月度のCPNマスタ登録日だけを予測・実績比較します。",
+    with st.expander("🧪 定常バックテスト", expanded=False):
+        st.caption(
+            "対象月度の実績を予測計算から隠し、CPNマスタ上の対象月度開始日前までのデータだけで当時の定常予測を再現します。"
+            "対象月の実績は比較表示にだけ使用します。"
         )
 
-        try:
-            bt_result = _run_normal_backtest(
-                history_df,
-                cpn_master,
-                bt_target_month,
-                auto_select_learning=False,
-            )
-            st.caption(
-                f"検証対象: CPNマスタ {bt_result['target_month']}（定常{bt_result['target_day_count']}日） ／ "
-                f"予測基準日: {bt_result['cutoff_date'].strftime('%Y/%m/%d')} ／ "
-                f"学習期間: {bt_result['learning_start'].strftime('%Y/%m/%d')}〜{bt_result['cutoff_date'].strftime('%Y/%m/%d')} "
-                f"（直近60日・定常{bt_result['learning_calendar_day_count']}日）"
+        # 選択肢・月度順もローデータではなくCPNマスタを正とする。
+        bt_master = cpn_master.copy()
+        bt_master["日付"] = pd.to_datetime(bt_master["日付"], errors="coerce").dt.normalize()
+        bt_master["月度"] = bt_master["月度"].astype("string").str.strip()
+        bt_master["CPN名"] = bt_master["CPN名"].astype("string").str.strip()
+        bt_month_labels = _get_cpn_normal_months(bt_master)
+        # 実績比較ができる月度だけ選択肢に出す。期間定義そのものはCPNマスタ準拠。
+        history_months = set(
+            history_df.loc[
+                history_df["CPN名"].isin(normal_labels)
+                & history_df["月度"].astype(str).ne("未設定"),
+                "月度",
+            ].astype(str)
+        )
+        bt_options = [m for m in bt_month_labels[1:] if m in history_months]
+
+        if not bt_options:
+            st.info("バックテストには2月度以上の定常実績が必要です。")
+        else:
+            bt_target_month = st.selectbox(
+                "検証する月度",
+                options=bt_options,
+                index=len(bt_options) - 1,
+                key="normal_backtest_target_month",
+                help="月度はCPNマスタ基準です。対象月度のCPNマスタ登録日だけを予測・実績比較します。",
             )
 
-            st.caption(
-                f"対象月度に実際に掲載があった {bt_result.get('published_media_count', 0):,}媒体だけを自動抽出して評価しています。"
-            )
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("予測CV", f"{bt_result.get('published_media_forecast', 0):,.0f}")
-            m2.metric("実績CV", f"{bt_result.get('published_media_actual', 0):,.0f}")
-            m3.metric(
-                "差分",
-                f"{bt_result.get('published_media_diff', 0):+,.0f}",
-                delta=(
-                    f"{bt_result.get('published_media_error_rate'):+.1%}"
-                    if pd.notna(bt_result.get("published_media_error_rate"))
-                    else None
-                ),
-                delta_color="off",
-            )
-            m4.metric(
-                "日次WAPE",
-                f"{bt_result.get('published_wape'):.1%}" if pd.notna(bt_result.get("published_wape")) else "-",
-                help="対象月度に掲載があった媒体だけの、媒体×日ごとの絶対誤差合計 ÷ 実績CV合計。小さいほど予測精度が高い指標です。",
-            )
-
-            bt_display = bt_result["media_compare"].copy()
-            bt_display["予測CV"] = bt_display["予測CV"].round(0).astype(int)
-            bt_display["実績CV"] = bt_display["実績CV"].round(0).astype(int)
-            bt_display["差分"] = bt_display["差分"].round(0).astype(int)
-            bt_display["誤差率"] = bt_display["誤差率"].map(
-                lambda x: f"{x:+.1%}" if pd.notna(x) else "-"
-            )
-            diagnostic_cols = [
-                "media", "学習稼働率", "稼働時日平均CV", "基礎期待CV/日", "学習対象日数", "稼働日数",
-                "基礎CV", "曜日補正後CV", "曜日影響CV",
-                "需要期補正後CV", "需要期影響CV",
-                "月初月末補正後CV", "月初月末影響CV",
-                "マジ得後補正後CV", "マジ得後影響CV",
-                "LINE補正後CV", "LINE影響CV",
-                "掲載判定前CV", "予測掲載継続率", "掲載継続影響CV", "対象月掲載実績",
-                "予測CV", "実績CV", "差分", "誤差率",
-            ]
-            diagnostic_cols = [c for c in diagnostic_cols if c in bt_display.columns]
-            bt_export = bt_display[diagnostic_cols].rename(columns={"media": "媒体"})
-            # 文字列の判定列を数値変換すると空欄になるため、明示的に除外する。
-            numeric_diag = [c for c in bt_export.columns if c not in {"媒体", "誤差率", "対象月掲載実績"}]
-            for c in numeric_diag:
-                bt_export[c] = pd.to_numeric(bt_export[c], errors="coerce").round(2)
-
-            # 営業向けは、対象月度に実際に掲載があった媒体だけを自動抽出する。
-            bt_export_published = bt_export.loc[
-                bt_export["対象月掲載実績"].astype(str).eq("掲載あり")
-            ].copy() if "対象月掲載実績" in bt_export.columns else bt_export.copy()
-
-            bt_month_filename = str(bt_target_month).replace("/", "-").replace(" ", "")
-            st.download_button(
-                "📥 バックテストCSVを保存",
-                data=bt_export_published.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"AFF定常予測_バックテスト_{bt_month_filename}.csv",
-                mime="text/csv",
-                key=f"download_backtest_media_{bt_month_filename}",
-                type="primary",
-            )
-
-            # 営業向けの評価表は、掲載媒体かつ判断に必要な項目だけを表示する。
-            sales_cols = ["媒体", "予測CV", "実績CV", "差分", "誤差率"]
-            sales_cols = [c for c in sales_cols if c in bt_export_published.columns]
-            st.dataframe(
-                bt_export_published[sales_cols],
-                width="stretch",
-                hide_index=True,
-            )
-
-            # 掲載されなかった媒体への予測や全媒体ベースの評価は、分析用として普段は隠す。
-            with st.expander("全媒体・掲載判定の詳細（分析用）"):
-                b1, b2, b3 = st.columns(3)
-                b1.metric("全媒体の最終予測", f"{bt_result.get('total_forecast', 0):,.0f}")
-                b2.metric("掲載媒体の予測", f"{bt_result.get('published_media_forecast', 0):,.0f}")
-                b3.metric(
-                    "掲載なし媒体への予測",
-                    f"{bt_result.get('unpublished_media_forecast', 0):,.0f}",
-                    help="対象月度のローデータに登場しなかった媒体へ残っていた予測です。",
+            try:
+                bt_result = _run_normal_backtest(
+                    history_df,
+                    cpn_master,
+                    bt_target_month,
+                    auto_select_learning=False,
                 )
+                st.caption(
+                    f"検証対象: CPNマスタ {bt_result['target_month']}（定常{bt_result['target_day_count']}日） ／ "
+                    f"予測基準日: {bt_result['cutoff_date'].strftime('%Y/%m/%d')} ／ "
+                    f"学習期間: {bt_result['learning_start'].strftime('%Y/%m/%d')}〜{bt_result['cutoff_date'].strftime('%Y/%m/%d')} "
+                    f"（直近60日・定常{bt_result['learning_calendar_day_count']}日）"
+                )
+
+                st.caption(
+                    f"対象月度に実際に掲載があった {bt_result.get('published_media_count', 0):,}媒体だけを自動抽出して評価しています。"
+                )
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("予測CV", f"{bt_result.get('published_media_forecast', 0):,.0f}")
+                m2.metric("実績CV", f"{bt_result.get('published_media_actual', 0):,.0f}")
+                m3.metric(
+                    "差分",
+                    f"{bt_result.get('published_media_diff', 0):+,.0f}",
+                    delta=(
+                        f"{bt_result.get('published_media_error_rate'):+.1%}"
+                        if pd.notna(bt_result.get("published_media_error_rate"))
+                        else None
+                    ),
+                    delta_color="off",
+                )
+                m4.metric(
+                    "日次WAPE",
+                    f"{bt_result.get('published_wape'):.1%}" if pd.notna(bt_result.get("published_wape")) else "-",
+                    help="対象月度に掲載があった媒体だけの、媒体×日ごとの絶対誤差合計 ÷ 実績CV合計。小さいほど予測精度が高い指標です。",
+                )
+
+                bt_display = bt_result["media_compare"].copy()
+                bt_display["予測CV"] = bt_display["予測CV"].round(0).astype(int)
+                bt_display["実績CV"] = bt_display["実績CV"].round(0).astype(int)
+                bt_display["差分"] = bt_display["差分"].round(0).astype(int)
+                bt_display["誤差率"] = bt_display["誤差率"].map(
+                    lambda x: f"{x:+.1%}" if pd.notna(x) else "-"
+                )
+                diagnostic_cols = [
+                    "media", "学習稼働率", "稼働時日平均CV", "基礎期待CV/日", "学習対象日数", "稼働日数",
+                    "基礎CV", "単価補正後CV", "単価影響CV",
+                    "全体トレンド補正後CV", "全体トレンド影響CV",
+                    "曜日補正後CV", "曜日影響CV",
+                    "需要期補正後CV", "需要期影響CV",
+                    "月初月末補正後CV", "月初月末影響CV",
+                    "マジ得後補正後CV", "マジ得後影響CV",
+                    "LINE補正後CV", "LINE影響CV",
+                    "掲載判定前CV", "予測掲載継続率", "掲載継続影響CV", "対象月掲載実績",
+                    "予測CV", "実績CV", "差分", "誤差率",
+                ]
+                diagnostic_cols = [c for c in diagnostic_cols if c in bt_display.columns]
+                bt_export = bt_display[diagnostic_cols].rename(columns={"media": "媒体"})
+                # 文字列の判定列を数値変換すると空欄になるため、明示的に除外する。
+                numeric_diag = [c for c in bt_export.columns if c not in {"媒体", "誤差率", "対象月掲載実績"}]
+                for c in numeric_diag:
+                    bt_export[c] = pd.to_numeric(bt_export[c], errors="coerce").round(2)
+
+                # 営業向けは、対象月度に実際に掲載があった媒体だけを自動抽出する。
+                bt_export_published = bt_export.loc[
+                    bt_export["対象月掲載実績"].astype(str).eq("掲載あり")
+                ].copy() if "対象月掲載実績" in bt_export.columns else bt_export.copy()
+
+                bt_month_filename = str(bt_target_month).replace("/", "-").replace(" ", "")
+                st.download_button(
+                    "📥 バックテストCSVを保存",
+                    data=bt_export_published.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"AFF定常予測_バックテスト_{bt_month_filename}.csv",
+                    mime="text/csv",
+                    key=f"download_backtest_media_{bt_month_filename}",
+                    type="primary",
+                )
+
+                # 営業向けの評価表は、掲載媒体かつ判断に必要な項目だけを表示する。
+                sales_cols = ["媒体", "予測CV", "実績CV", "差分", "誤差率"]
+                sales_cols = [c for c in sales_cols if c in bt_export_published.columns]
                 st.dataframe(
-                    bt_export,
+                    bt_export_published[sales_cols],
                     width="stretch",
                     hide_index=True,
                 )
-                st.download_button(
-                    "📥 全媒体の診断CSVを保存",
-                    data=bt_export.to_csv(index=False).encode("utf-8-sig"),
-                    file_name=f"AFF定常予測_バックテスト診断_全媒体_{bt_month_filename}.csv",
-                    mime="text/csv",
-                    key=f"download_backtest_all_media_{bt_month_filename}",
-                )
 
-            # 学習データそのものを監査する。予測値には影響しない診断表示。
-            with st.expander("学習データ診断（分析用）"):
-                audit = bt_result.get("learning_audit", pd.DataFrame()).copy()
-                summary = bt_result.get("learning_summary", {})
-                if summary:
-                    first_day = summary.get("最初の日")
-                    last_day = summary.get("最後の日")
-                    first_text = pd.Timestamp(first_day).strftime("%Y/%m/%d") if pd.notna(first_day) else "-"
-                    last_text = pd.Timestamp(last_day).strftime("%Y/%m/%d") if pd.notna(last_day) else "-"
-                    a1, a2, a3, a4 = st.columns(4)
-                    a1.metric("学習実績日数", f"{summary.get('実績存在日数', 0):,}日")
-                    a2.metric("学習CV合計", f"{summary.get('CV合計', 0):,.0f}")
-                    a3.metric("学習媒体数", f"{summary.get('媒体数', 0):,}")
-                    a4.metric("元データ行数", f"{summary.get('元データ行数', 0):,}")
-                    st.caption(
-                        f"実際に学習対象として抽出した期間: {first_text}〜{last_text} ／ "
-                        f"異常値・マジ得直後の除外媒体日: {summary.get('除外媒体日数', 0):,} ／ "
-                        f"休眠除外媒体: {summary.get('休眠除外媒体数', 0):,}"
+                # 掲載されなかった媒体への予測や全媒体ベースの評価は、分析用として普段は隠す。
+                with st.expander("全媒体・掲載判定の詳細（分析用）"):
+                    b1, b2, b3 = st.columns(3)
+                    b1.metric("全媒体の最終予測", f"{bt_result.get('total_forecast', 0):,.0f}")
+                    b2.metric("掲載媒体の予測", f"{bt_result.get('published_media_forecast', 0):,.0f}")
+                    b3.metric(
+                        "掲載なし媒体への予測",
+                        f"{bt_result.get('unpublished_media_forecast', 0):,.0f}",
+                        help="対象月度のローデータに登場しなかった媒体へ残っていた予測です。",
                     )
-                if not audit.empty:
-                    for c in ["CPN最初の日", "CPN最後の日"]:
-                        audit[c] = pd.to_datetime(audit[c], errors="coerce").dt.strftime("%Y/%m/%d").fillna("-")
-                    audit["CV合計"] = pd.to_numeric(audit["CV合計"], errors="coerce").fillna(0).round(0).astype(int)
-                    st.dataframe(audit, width="stretch", hide_index=True)
+                    st.dataframe(
+                        bt_export,
+                        width="stretch",
+                        hide_index=True,
+                    )
+                    st.download_button(
+                        "📥 全媒体の診断CSVを保存",
+                        data=bt_export.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"AFF定常予測_バックテスト診断_全媒体_{bt_month_filename}.csv",
+                        mime="text/csv",
+                        key=f"download_backtest_all_media_{bt_month_filename}",
+                    )
 
-            # ロジック検証用の詳細値は普段は隠し、必要なときだけ確認できるようにする。
-            with st.expander("予測ロジック詳細（分析用）"):
-                st.dataframe(
-                    bt_export,
-                    width="stretch",
-                    hide_index=True,
-                )
+                # 学習データそのものを監査する。予測値には影響しない診断表示。
+                with st.expander("学習データ診断（分析用）"):
+                    audit = bt_result.get("learning_audit", pd.DataFrame()).copy()
+                    summary = bt_result.get("learning_summary", {})
+                    if summary:
+                        first_day = summary.get("最初の日")
+                        last_day = summary.get("最後の日")
+                        first_text = pd.Timestamp(first_day).strftime("%Y/%m/%d") if pd.notna(first_day) else "-"
+                        last_text = pd.Timestamp(last_day).strftime("%Y/%m/%d") if pd.notna(last_day) else "-"
+                        a1, a2, a3, a4 = st.columns(4)
+                        a1.metric("学習実績日数", f"{summary.get('実績存在日数', 0):,}日")
+                        a2.metric("学習CV合計", f"{summary.get('CV合計', 0):,.0f}")
+                        a3.metric("学習媒体数", f"{summary.get('媒体数', 0):,}")
+                        a4.metric("元データ行数", f"{summary.get('元データ行数', 0):,}")
+                        st.caption(
+                            f"実際に学習対象として抽出した期間: {first_text}〜{last_text} ／ "
+                            f"異常値・マジ得直後の除外媒体日: {summary.get('除外媒体日数', 0):,} ／ "
+                            f"休眠除外媒体: {summary.get('休眠除外媒体数', 0):,}"
+                        )
+                    if not audit.empty:
+                        for c in ["CPN最初の日", "CPN最後の日"]:
+                            audit[c] = pd.to_datetime(audit[c], errors="coerce").dt.strftime("%Y/%m/%d").fillna("-")
+                        audit["CV合計"] = pd.to_numeric(audit["CV合計"], errors="coerce").fillna(0).round(0).astype(int)
+                        st.dataframe(audit, width="stretch", hide_index=True)
 
-            inactive_bt = bt_result.get("inactive_media", pd.DataFrame())
-            if not inactive_bt.empty:
-                st.caption(f"休眠判定で定常予測から除外: {len(inactive_bt):,}媒体")
+                # ロジック検証用の詳細値は普段は隠し、必要なときだけ確認できるようにする。
+                with st.expander("予測ロジック詳細（分析用）"):
+                    st.dataframe(
+                        bt_export,
+                        width="stretch",
+                        hide_index=True,
+                    )
 
-            with st.expander("バックテスト日別明細"):
-                bt_daily = bt_result["daily_compare"].copy()
-                bt_daily["date"] = pd.to_datetime(bt_daily["date"]).dt.strftime("%Y/%m/%d")
-                bt_daily = bt_daily.rename(
-                    columns={
-                        "date": "日付",
-                        "media": "媒体",
-                        "forecast_cv": "予測CV",
-                        "actual_cv": "実績CV",
-                    }
-                )
-                st.dataframe(
-                    bt_daily[["日付", "媒体", "予測CV", "実績CV", "差分"]].round(2),
-                    width="stretch",
-                    hide_index=True,
-                )
-                bt_daily_export = bt_daily[["日付", "媒体", "予測CV", "実績CV", "差分"]].round(2)
-                st.download_button(
-                    "📥 日別明細をCSVで保存",
-                    data=bt_daily_export.to_csv(index=False).encode("utf-8-sig"),
-                    file_name=f"AFF定常予測_バックテスト日別_{bt_month_filename}.csv",
-                    mime="text/csv",
-                    key=f"download_backtest_daily_{bt_month_filename}",
-                )
-        except Exception as bt_exc:
-            st.warning(f"バックテストを実行できませんでした: {bt_exc}")
+                inactive_bt = bt_result.get("inactive_media", pd.DataFrame())
+                if not inactive_bt.empty:
+                    st.caption(f"休眠判定で定常予測から除外: {len(inactive_bt):,}媒体")
+
+                with st.expander("バックテスト日別明細"):
+                    bt_daily = bt_result["daily_compare"].copy()
+                    bt_daily["date"] = pd.to_datetime(bt_daily["date"]).dt.strftime("%Y/%m/%d")
+                    bt_daily = bt_daily.rename(
+                        columns={
+                            "date": "日付",
+                            "media": "媒体",
+                            "forecast_cv": "予測CV",
+                            "actual_cv": "実績CV",
+                        }
+                    )
+                    st.dataframe(
+                        bt_daily[["日付", "媒体", "予測CV", "実績CV", "差分"]].round(2),
+                        width="stretch",
+                        hide_index=True,
+                    )
+                    bt_daily_export = bt_daily[["日付", "媒体", "予測CV", "実績CV", "差分"]].round(2)
+                    st.download_button(
+                        "📥 日別明細をCSVで保存",
+                        data=bt_daily_export.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"AFF定常予測_バックテスト日別_{bt_month_filename}.csv",
+                        mime="text/csv",
+                        key=f"download_backtest_daily_{bt_month_filename}",
+                    )
+            except Exception as bt_exc:
+                st.warning(f"バックテストを実行できませんでした: {bt_exc}")
+
 
     # ---------------------------------------------------------
     # 予測 → 松竹梅 → 最適化 は一度計算したら session_state に保持。
