@@ -2147,7 +2147,15 @@ def _run_normal_backtest(
         np.nan,
     )
     media_compare["掲載継続影響CV"] = media_compare["予測CV"] - media_compare["掲載判定前CV"]
-    media_compare["対象月掲載実績"] = np.where(media_compare["実績CV"].gt(0), "継続", "終了/未掲載")
+
+    # バックテスト対象月度にローデータ上の行が存在した媒体を「掲載あり」とする。
+    # CV=0でも行が存在すれば掲載ありとして扱い、CV発生有無と掲載有無を混同しない。
+    target_published_media = set(actual["media"].dropna().astype(str).unique()) if not actual.empty else set()
+    media_compare["対象月掲載実績"] = np.where(
+        media_compare["media"].astype(str).isin(target_published_media),
+        "掲載あり",
+        "掲載なし",
+    )
 
     # 予測の土台を監査できるよう、稼働率×稼働時CVの内訳を媒体別結果へ付与。
     diagnostics = calculate_normal_media_diagnostics(training, learning_months, calendar_dates=learning_calendar_dates)
@@ -2195,15 +2203,28 @@ def _run_normal_backtest(
     total_forecast_before_publication = float(daily_compare["掲載判定前CV"].sum())
     total_forecast = float(daily_compare["forecast_cv"].sum())
     total_actual = float(daily_compare["actual_cv"].sum())
-    actual_active_media = set(media_compare.loc[media_compare["実績CV"].gt(0), "media"].astype(str))
-    active_mask = media_compare["media"].astype(str).isin(actual_active_media)
-    # 素予測（掲載継続率を掛ける前）と最終予測（継続率補正後）を分けて監査する。
-    continued_media_raw_forecast = float(media_compare.loc[active_mask, "掲載判定前CV"].sum())
+
+    # 営業向けバックテストは「対象月度に実際に掲載があった媒体」だけを自動抽出して評価する。
+    published_mask = media_compare["media"].astype(str).isin(target_published_media)
+    published_media_forecast = float(media_compare.loc[published_mask, "予測CV"].sum())
+    published_media_actual = float(media_compare.loc[published_mask, "実績CV"].sum())
+    published_media_diff = published_media_forecast - published_media_actual
+    published_media_error_rate = (published_media_diff / published_media_actual) if published_media_actual else np.nan
+    unpublished_media_forecast = float(media_compare.loc[~published_mask, "予測CV"].sum())
+
+    published_daily = daily_compare.loc[daily_compare["media"].astype(str).isin(target_published_media)].copy()
+    published_wape = (
+        float(published_daily["絶対誤差"].sum() / published_media_actual)
+        if published_media_actual else np.nan
+    )
+
+    # 全媒体ベースの値は分析用として残す。
+    continued_media_raw_forecast = float(media_compare.loc[published_mask, "掲載判定前CV"].sum())
     publication_end_raw_forecast = total_forecast_before_publication - continued_media_raw_forecast
-    continued_media_raw_error_rate = (continued_media_raw_forecast - total_actual) / total_actual if total_actual else np.nan
-    continued_media_final_forecast = float(media_compare.loc[active_mask, "予測CV"].sum())
-    inactive_media_final_forecast = float(media_compare.loc[~active_mask, "予測CV"].sum())
-    continued_media_final_error_rate = (continued_media_final_forecast - total_actual) / total_actual if total_actual else np.nan
+    continued_media_raw_error_rate = (continued_media_raw_forecast - published_media_actual) / published_media_actual if published_media_actual else np.nan
+    continued_media_final_forecast = published_media_forecast
+    inactive_media_final_forecast = unpublished_media_forecast
+    continued_media_final_error_rate = published_media_error_rate
     total_diff = total_forecast - total_actual
     total_error_rate = total_diff / total_actual if total_actual else np.nan
     wape = float(daily_compare["絶対誤差"].sum() / total_actual) if total_actual else np.nan
@@ -2227,6 +2248,13 @@ def _run_normal_backtest(
         "continued_media_final_forecast": continued_media_final_forecast,
         "continued_media_final_error_rate": continued_media_final_error_rate,
         "inactive_media_final_forecast": inactive_media_final_forecast,
+        "published_media_count": int(len(target_published_media)),
+        "published_media_forecast": published_media_forecast,
+        "published_media_actual": published_media_actual,
+        "published_media_diff": published_media_diff,
+        "published_media_error_rate": published_media_error_rate,
+        "published_wape": published_wape,
+        "unpublished_media_forecast": unpublished_media_forecast,
         "total_actual": total_actual,
         "total_diff": total_diff,
         "total_error_rate": total_error_rate,
@@ -3332,41 +3360,26 @@ if uploaded_master and has_any_actual:
                 f"（直近60日・定常{bt_result['learning_calendar_day_count']}日）"
             )
 
+            st.caption(
+                f"対象月度に実際に掲載があった {bt_result.get('published_media_count', 0):,}媒体だけを自動抽出して評価しています。"
+            )
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("予測CV", f"{bt_result['total_forecast']:,.0f}")
-            m2.metric("実績CV", f"{bt_result['total_actual']:,.0f}")
+            m1.metric("予測CV", f"{bt_result.get('published_media_forecast', 0):,.0f}")
+            m2.metric("実績CV", f"{bt_result.get('published_media_actual', 0):,.0f}")
             m3.metric(
                 "差分",
-                f"{bt_result['total_diff']:+,.0f}",
+                f"{bt_result.get('published_media_diff', 0):+,.0f}",
                 delta=(
-                    f"{bt_result['total_error_rate']:+.1%}"
-                    if pd.notna(bt_result["total_error_rate"])
+                    f"{bt_result.get('published_media_error_rate'):+.1%}"
+                    if pd.notna(bt_result.get("published_media_error_rate"))
                     else None
                 ),
                 delta_color="off",
             )
             m4.metric(
                 "日次WAPE",
-                f"{bt_result['wape']:.1%}" if pd.notna(bt_result["wape"]) else "-",
-                help="媒体×日ごとの絶対誤差合計 ÷ 実績CV合計。小さいほど予測精度が高い指標です。",
-            )
-            st.caption("誤差の切り分け")
-            b1, b2, b3 = st.columns(3)
-            b1.metric("最終予測（全媒体）", f"{bt_result.get('total_forecast', 0):,.0f}")
-            b2.metric(
-                "実績あり媒体の予測",
-                f"{bt_result.get('continued_media_final_forecast', 0):,.0f}",
-                delta=(
-                    f"{bt_result.get('continued_media_final_error_rate'):+.1%}"
-                    if pd.notna(bt_result.get('continued_media_final_error_rate')) else None
-                ),
-                delta_color="off",
-                help="対象月度にCV実績があった媒体だけに絞った最終予測。CV量そのものの予測精度を見るための指標です。",
-            )
-            b3.metric(
-                "実績なし媒体への予測",
-                f"{bt_result.get('inactive_media_final_forecast', 0):,.0f}",
-                help="対象月度にCV実績がなかった媒体へ残っていた予測。掲載有無・稼働継続の読み違いによる余剰予測の目安です。",
+                f"{bt_result.get('published_wape'):.1%}" if pd.notna(bt_result.get("published_wape")) else "-",
+                help="対象月度に掲載があった媒体だけの、媒体×日ごとの絶対誤差合計 ÷ 実績CV合計。小さいほど予測精度が高い指標です。",
             )
 
             bt_display = bt_result["media_compare"].copy()
@@ -3393,24 +3406,52 @@ if uploaded_master and has_any_actual:
             for c in numeric_diag:
                 bt_export[c] = pd.to_numeric(bt_export[c], errors="coerce").round(2)
 
+            # 営業向けは、対象月度に実際に掲載があった媒体だけを自動抽出する。
+            bt_export_published = bt_export.loc[
+                bt_export["対象月掲載実績"].astype(str).eq("掲載あり")
+            ].copy() if "対象月掲載実績" in bt_export.columns else bt_export.copy()
+
             bt_month_filename = str(bt_target_month).replace("/", "-").replace(" ", "")
             st.download_button(
                 "📥 バックテストCSVを保存",
-                data=bt_export.to_csv(index=False).encode("utf-8-sig"),
+                data=bt_export_published.to_csv(index=False).encode("utf-8-sig"),
                 file_name=f"AFF定常予測_バックテスト_{bt_month_filename}.csv",
                 mime="text/csv",
                 key=f"download_backtest_media_{bt_month_filename}",
                 type="primary",
             )
 
-            # 営業向けの評価表は、判断に必要な項目だけを表示する。
-            sales_cols = ["媒体", "予測CV", "実績CV", "差分", "誤差率", "対象月掲載実績"]
-            sales_cols = [c for c in sales_cols if c in bt_export.columns]
+            # 営業向けの評価表は、掲載媒体かつ判断に必要な項目だけを表示する。
+            sales_cols = ["媒体", "予測CV", "実績CV", "差分", "誤差率"]
+            sales_cols = [c for c in sales_cols if c in bt_export_published.columns]
             st.dataframe(
-                bt_export[sales_cols],
+                bt_export_published[sales_cols],
                 width="stretch",
                 hide_index=True,
             )
+
+            # 掲載されなかった媒体への予測や全媒体ベースの評価は、分析用として普段は隠す。
+            with st.expander("全媒体・掲載判定の詳細（分析用）"):
+                b1, b2, b3 = st.columns(3)
+                b1.metric("全媒体の最終予測", f"{bt_result.get('total_forecast', 0):,.0f}")
+                b2.metric("掲載媒体の予測", f"{bt_result.get('published_media_forecast', 0):,.0f}")
+                b3.metric(
+                    "掲載なし媒体への予測",
+                    f"{bt_result.get('unpublished_media_forecast', 0):,.0f}",
+                    help="対象月度のローデータに登場しなかった媒体へ残っていた予測です。",
+                )
+                st.dataframe(
+                    bt_export,
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.download_button(
+                    "📥 全媒体の診断CSVを保存",
+                    data=bt_export.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"AFF定常予測_バックテスト診断_全媒体_{bt_month_filename}.csv",
+                    mime="text/csv",
+                    key=f"download_backtest_all_media_{bt_month_filename}",
+                )
 
             # 学習データそのものを監査する。予測値には影響しない診断表示。
             with st.expander("学習データ診断（分析用）"):
