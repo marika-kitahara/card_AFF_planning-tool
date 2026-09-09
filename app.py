@@ -1991,10 +1991,17 @@ def _run_normal_backtest(
     # CPN月度の日数・その中の定常日数が不均一でも、同じ時間幅で現在の媒体力を評価する。
     learning_score_table = pd.DataFrame()
     cutoff_date = target_start - pd.Timedelta(days=1)
-    learning_start = cutoff_date - pd.Timedelta(days=59)
+    requested_learning_start = cutoff_date - pd.Timedelta(days=59)
+    # 最大60日を使う。ただしローデータが60日未満しかない場合は、
+    # 実際に存在する最古日から学習し、存在しない過去日を0CV扱いしない。
+    available_before_cutoff = work.loc[work["date"].le(cutoff_date), "date"].dropna()
+    if available_before_cutoff.empty:
+        raise ValueError("予測基準日以前の実績データがありません。")
+    earliest_available_date = pd.Timestamp(available_before_cutoff.min()).normalize()
+    learning_start = max(requested_learning_start, earliest_available_date)
     training = work.loc[work["date"].between(learning_start, cutoff_date)].copy()
 
-    # 60日窓のうち、CPNマスタ上で「通常/定常」の日だけを0CV日の分母にも使う。
+    # 実際にデータが存在する学習期間内のCPN定常日だけを0CV日の分母に使う。
     learning_calendar_dates = (
         master.loc[
             master["日付"].between(learning_start, cutoff_date)
@@ -2004,7 +2011,7 @@ def _run_normal_backtest(
         .dropna().drop_duplicates().sort_values().tolist()
     )
     if not learning_calendar_dates:
-        raise ValueError("予測基準日前60日間にCPNマスタの定常日がありません。")
+        raise ValueError("予測基準日以前の利用可能データ内にCPNマスタの定常日がありません。")
 
     learning_months = (
         training.loc[training["CPN名"].isin(normal_labels), "月度"]
@@ -2016,7 +2023,7 @@ def _run_normal_backtest(
         training, learning_months, calendar_dates=learning_calendar_dates
     )
     if base_pair.empty:
-        raise ValueError("予測基準日前60日間に定常実績がありません。")
+        raise ValueError("予測基準日以前の利用可能期間に定常実績がありません。")
     factor_tables = calculate_dynamic_factor_tables(
         training, learning_months, calendar_dates=learning_calendar_dates
     )
@@ -3025,10 +3032,16 @@ if uploaded_master and has_any_actual:
             for seg in planning_segments if seg["cpn"] in normal_labels
         )
         normal_learning_cutoff = first_normal_start - pd.Timedelta(days=1)
-        normal_learning_start = normal_learning_cutoff - pd.Timedelta(days=59)
+        requested_normal_learning_start = normal_learning_cutoff - pd.Timedelta(days=59)
+        history_dates = pd.to_datetime(history_df["date"], errors="coerce").dt.normalize()
+        available_history_dates = history_dates.loc[history_dates.le(normal_learning_cutoff)].dropna()
+        if available_history_dates.empty:
+            st.error("予測開始日より前の実績データがありません。")
+            st.stop()
+        earliest_history_date = pd.Timestamp(available_history_dates.min()).normalize()
+        normal_learning_start = max(requested_normal_learning_start, earliest_history_date)
         normal_training_df = history_df.loc[
-            pd.to_datetime(history_df["date"], errors="coerce").dt.normalize()
-            .between(normal_learning_start, normal_learning_cutoff)
+            history_dates.between(normal_learning_start, normal_learning_cutoff)
         ].copy()
         normal_learning_calendar_dates = (
             cpn_master.loc[
@@ -3045,11 +3058,11 @@ if uploaded_master and has_any_actual:
             .dropna().astype(str).loc[lambda x: x.ne("未設定")].drop_duplicates().tolist()
         )
         if not normal_learning_calendar_dates:
-            st.error("予測開始日前60日間にCPNマスタの定常日がありません。")
+            st.error("予測開始日前の利用可能データ内にCPNマスタの定常日がありません。")
             st.stop()
         st.sidebar.caption(
             f"定常学習: {normal_learning_start.strftime('%Y/%m/%d')}〜"
-            f"{normal_learning_cutoff.strftime('%Y/%m/%d')}（直近60日）"
+            f"{normal_learning_cutoff.strftime('%Y/%m/%d')}（最大60日・利用可能実績を使用）"
         )
 
     segment_bases = []
@@ -3064,11 +3077,11 @@ if uploaded_master and has_any_actual:
                 calendar_dates=normal_learning_calendar_dates,
             )
             if base_pair_seg.empty:
-                st.error("予測開始日前60日間に定常実績がありません。")
+                st.error("予測開始日前の利用可能期間に定常実績がありません。")
                 st.stop()
             reference_key_seg = ("normal_60days", str(normal_learning_start), str(normal_learning_cutoff))
             reference_descriptions.append(
-                f"{seg['label']} {selected_cpn}: 定常学習 直近60日 "
+                f"{seg['label']} {selected_cpn}: 定常学習 最大60日 "
                 f"({normal_learning_start.strftime('%Y/%m/%d')}〜{normal_learning_cutoff.strftime('%Y/%m/%d')})"
             )
         else:
@@ -3436,7 +3449,7 @@ if uploaded_master and has_any_actual:
                     f"検証対象: CPNマスタ {bt_result['target_month']}（定常{bt_result['target_day_count']}日） ／ "
                     f"予測基準日: {bt_result['cutoff_date'].strftime('%Y/%m/%d')} ／ "
                     f"学習期間: {bt_result['learning_start'].strftime('%Y/%m/%d')}〜{bt_result['cutoff_date'].strftime('%Y/%m/%d')} "
-                    f"（直近60日・定常{bt_result['learning_calendar_day_count']}日）"
+                    f"（最大60日・定常{bt_result['learning_calendar_day_count']}日）"
                 )
 
                 st.caption(
@@ -3742,10 +3755,26 @@ if uploaded_master and has_any_actual:
             forecast_df
         )
 
+        # 営業ロジック列の後方互換・空データ対策。
+        # approved_cv が無い旧形式/一部条件でも集計でKeyErrorにしない。
+        sim_df = sim_df.copy()
+        if "approved_cv" not in sim_df.columns:
+            cv_s = pd.to_numeric(sim_df.get("cv", pd.Series(0.0, index=sim_df.index)), errors="coerce").fillna(0.0)
+            rate_s = pd.to_numeric(sim_df.get("approval_rate", pd.Series(0.0, index=sim_df.index)), errors="coerce").fillna(0.0).clip(0, 1)
+            sim_df["approved_cv"] = cv_s * rate_s
+        if "cpa" not in sim_df.columns and "gross_unit" in sim_df.columns:
+            sim_df["cpa"] = pd.to_numeric(sim_df["gross_unit"], errors="coerce").fillna(0.0)
+        if "cost" not in sim_df.columns:
+            unit_s = pd.to_numeric(sim_df.get("cpa", pd.Series(0.0, index=sim_df.index)), errors="coerce").fillna(0.0)
+            sim_df["cost"] = pd.to_numeric(sim_df["approved_cv"], errors="coerce").fillna(0.0) * unit_s
+
         sim_group_cols = ["date", "media", "plan"]
         if "CPN名" in sim_df.columns:
             sim_group_cols.append("CPN名")
         sim_df = sim_df.copy()
+        for _col in ["date", "media", "plan", "cv", "cost", "approved_cv", "cpa"]:
+            if _col not in sim_df.columns:
+                sim_df[_col] = pd.Series(dtype="object" if _col in {"date", "media", "plan"} else "float64")
         sim_df["_unit_weight"] = pd.to_numeric(sim_df["cpa"], errors="coerce").fillna(0) * pd.to_numeric(sim_df["cv"], errors="coerce").fillna(0)
         sim_summary = (
             sim_df.groupby(
@@ -3778,6 +3807,9 @@ if uploaded_master and has_any_actual:
         if "CPN名" in opt_df.columns:
             opt_group_cols.append("CPN名")
         opt_df = opt_df.copy()
+        for _col in ["date", "media", "plan", "cv", "cost", "approved_cv", "cpa"]:
+            if _col not in opt_df.columns:
+                opt_df[_col] = pd.Series(dtype="object" if _col in {"date", "media", "plan"} else "float64")
         opt_df["_unit_weight"] = pd.to_numeric(opt_df["cpa"], errors="coerce").fillna(0) * pd.to_numeric(opt_df["cv"], errors="coerce").fillna(0)
         opt_summary = (
             opt_df.groupby(
