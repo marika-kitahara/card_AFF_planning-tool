@@ -2045,8 +2045,7 @@ def _run_normal_backtest(
     stage_formulas = {
         "stage_base_cv": ("base_cv", "cpn_factor"),
         "stage_unit_price_cv": ("stage_base_cv", "unit_price_factor"),
-        "stage_global_trend_cv": ("stage_unit_price_cv", "global_trend_factor"),
-        "stage_weekday_cv": ("stage_global_trend_cv", "weekday_factor"),
+        "stage_weekday_cv": ("stage_unit_price_cv", "weekday_factor"),
         "stage_season_cv": ("stage_weekday_cv", "season_factor"),
         "stage_month_edge_cv": ("stage_season_cv", "month_edge_factor"),
         "stage_after_cv": ("stage_month_edge_cv", "after_factor"),
@@ -2091,7 +2090,6 @@ def _run_normal_backtest(
         .agg(
             基礎CV=("stage_base_cv", "sum"),
             単価補正後CV=("stage_unit_price_cv", "sum"),
-            全体トレンド補正後CV=("stage_global_trend_cv", "sum"),
             曜日補正後CV=("stage_weekday_cv", "sum"),
             需要期補正後CV=("stage_season_cv", "sum"),
             月初月末補正後CV=("stage_month_edge_cv", "sum"),
@@ -2123,7 +2121,6 @@ def _run_normal_backtest(
         .agg(
             基礎CV=("基礎CV", "sum"),
             単価補正後CV=("単価補正後CV", "sum"),
-            全体トレンド補正後CV=("全体トレンド補正後CV", "sum"),
             曜日補正後CV=("曜日補正後CV", "sum"),
             需要期補正後CV=("需要期補正後CV", "sum"),
             月初月末補正後CV=("月初月末補正後CV", "sum"),
@@ -2138,8 +2135,7 @@ def _run_normal_backtest(
     )
     # 各補正が予測総量を何CV動かしたか。暴走地点の特定に使う。
     media_compare["単価影響CV"] = media_compare["単価補正後CV"] - media_compare["基礎CV"]
-    media_compare["全体トレンド影響CV"] = media_compare["全体トレンド補正後CV"] - media_compare["単価補正後CV"]
-    media_compare["曜日影響CV"] = media_compare["曜日補正後CV"] - media_compare["全体トレンド補正後CV"]
+    media_compare["曜日影響CV"] = media_compare["曜日補正後CV"] - media_compare["単価補正後CV"]
     media_compare["需要期影響CV"] = media_compare["需要期補正後CV"] - media_compare["曜日補正後CV"]
     media_compare["月初月末影響CV"] = media_compare["月初月末補正後CV"] - media_compare["需要期補正後CV"]
     media_compare["マジ得後影響CV"] = media_compare["マジ得後補正後CV"] - media_compare["月初月末補正後CV"]
@@ -2619,12 +2615,16 @@ if uploaded_master and has_any_actual:
         from config.constants import RECENT_NORMAL_DAYS
 
         history_df = pd.DataFrame()
+        tg_raw_max_date = pd.NaT
         if uploaded_file is not None:
             history_df = load_data(uploaded_file, exclude_compensation=exclude_compensation)
             history_df["date"] = pd.to_datetime(
                 history_df["date"],
                 errors="coerce",
             ).dt.normalize()
+            # バックテスト可否は媒体/商品IDで絞り込む前のTGローデータ最終日で判定する。
+            # 特定媒体に行がない日を「データ未完了」と誤判定しないため。
+            tg_raw_max_date = history_df["date"].max()
 
         # 同一Excel内の「CPNマスタ」「媒体名マスタ」を1回だけ読み込み、
         # rerun時はキャッシュされた結果を再利用する。
@@ -3131,8 +3131,8 @@ if uploaded_master and has_any_actual:
 
     st.subheader("📐 実績から算出した変動係数")
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-        ["曜日", "月初・月末", "需要期", "LINE OA", "全体トレンド", "学習除外日", "休眠媒体"]
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["曜日", "月初・月末", "需要期", "LINE OA", "学習除外日", "休眠媒体"]
     )
 
     with tab1:
@@ -3171,24 +3171,6 @@ if uploaded_master and has_any_actual:
 
 
     with tab5:
-        trend_preview = factor_tables.get("global_trend", pd.DataFrame()).copy()
-        if trend_preview.empty:
-            st.info("全体トレンド補正は1.0です。")
-        else:
-            trend_view = trend_preview.rename(columns={
-                "factor": "採用係数",
-                "raw_factor": "生の比率",
-                "prior_daily_cv": "前半30日の日平均CV",
-                "recent_daily_cv": "後半30日の日平均CV",
-                "prior_days": "前半の定常日数",
-                "recent_days": "後半の定常日数",
-                "stable_media_count": "継続媒体数",
-                "method": "算出方法",
-            })
-            st.caption("前半30日と後半30日の両方で稼働した媒体を中心に、案件全体のCV水準変化を補正します。係数は0.70〜1.30に制限します。")
-            st.dataframe(trend_view.round(3), width="stretch", hide_index=True)
-
-    with tab6:
         excluded = factor_tables.get("excluded", pd.DataFrame())
         if excluded.empty:
             st.info("マジ得直後・異常値による学習除外日はありません。")
@@ -3203,7 +3185,7 @@ if uploaded_master and has_any_actual:
                 hide_index=True,
             )
 
-    with tab7:
+    with tab6:
         inactive_media = factor_tables.get("inactive_media", pd.DataFrame())
         if inactive_media.empty:
             st.info("直近30日CVなしで休眠判定された媒体はありません。")
@@ -3347,7 +3329,8 @@ if uploaded_master and has_any_actual:
         bt_master["月度"] = bt_master["月度"].astype("string").str.strip()
         bt_master["CPN名"] = bt_master["CPN名"].astype("string").str.strip()
         bt_month_labels = _get_cpn_normal_months(bt_master)
-        # 実績比較ができる月度だけ選択肢に出す。期間定義そのものはCPNマスタ準拠。
+        # 実績比較ができ、かつCPNマスタ上の対象最終日までTGローデータが到達している
+        # 「完了月度」だけをバックテスト候補にする。途中月度を完成実績として評価しない。
         history_months = set(
             history_df.loc[
                 history_df["CPN名"].isin(normal_labels)
@@ -3355,11 +3338,33 @@ if uploaded_master and has_any_actual:
                 "月度",
             ].astype(str)
         )
-        bt_options = [m for m in bt_month_labels[1:] if m in history_months]
+        bt_options = []
+        incomplete_bt_months = []
+        for m in bt_month_labels[1:]:
+            if m not in history_months:
+                continue
+            m_dates = bt_master.loc[
+                bt_master["月度"].astype(str).eq(str(m))
+                & bt_master["CPN名"].isin(normal_labels),
+                "日付",
+            ].dropna()
+            if m_dates.empty:
+                continue
+            m_end = pd.Timestamp(m_dates.max()).normalize()
+            if pd.notna(tg_raw_max_date) and pd.Timestamp(tg_raw_max_date).normalize() >= m_end:
+                bt_options.append(m)
+            else:
+                incomplete_bt_months.append((m, m_end))
 
         if not bt_options:
-            st.info("バックテストには2月度以上の定常実績が必要です。")
+            st.info("バックテストには、CPNマスタ上の対象最終日まで実績が揃った月度が必要です。")
         else:
+            if incomplete_bt_months:
+                latest_incomplete, latest_end = incomplete_bt_months[-1]
+                raw_last_text = pd.Timestamp(tg_raw_max_date).strftime("%Y/%m/%d") if pd.notna(tg_raw_max_date) else "-"
+                st.caption(
+                    f"未完了月度は候補から除外しています（ローデータ最終日: {raw_last_text}）。"
+                )
             bt_target_month = st.selectbox(
                 "検証する月度",
                 options=bt_options,
@@ -3413,9 +3418,7 @@ if uploaded_master and has_any_actual:
                 )
                 diagnostic_cols = [
                     "media", "学習稼働率", "稼働時日平均CV", "基礎期待CV/日", "学習対象日数", "稼働日数",
-                    "基礎CV", "単価補正後CV", "単価影響CV",
-                    "全体トレンド補正後CV", "全体トレンド影響CV",
-                    "曜日補正後CV", "曜日影響CV",
+                    "基礎CV", "曜日補正後CV", "曜日影響CV",
                     "需要期補正後CV", "需要期影響CV",
                     "月初月末補正後CV", "月初月末影響CV",
                     "マジ得後補正後CV", "マジ得後影響CV",
