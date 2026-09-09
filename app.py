@@ -1148,7 +1148,7 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
     # =========================================================
     # 1) メインシート：○月（既存移管合算）
     # =========================================================
-    new_main_name = f"{submission_month}月（既存移管合算）"
+    new_main_name = f"{pd.Timestamp(start_date).month}月（既存移管合算）"
     main_ws.title = new_main_name
 
     # 最小テンプレートは他シートから旧シート名を参照する数式を持たないため、
@@ -1384,7 +1384,7 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
         sws,
         1,
         1,
-        f"{submission_month}月度サマリ 件数・発行・コスト",
+        f"{pd.Timestamp(start_date).month}月度サマリ 件数・発行・コスト",
     )
 
     sum_forecast = 0
