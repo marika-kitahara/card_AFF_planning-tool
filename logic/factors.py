@@ -176,15 +176,12 @@ def _prepare_normal_learning_data(
         return normal, empty_daily, empty_excluded
 
     excluded_parts: list[pd.DataFrame] = []
-    # 後段の0補完で「除外日」が0CVとして復活しないよう、媒体×日キーを保持する。
-    after_keys = pd.MultiIndex.from_arrays([[], []], names=["date", "media"])
 
     # マジ得直後は需要先食い等の特殊期間として定常平均から完全除外。
     if "magitoku_after_flag" in normal.columns:
         after_mask = pd.to_numeric(normal["magitoku_after_flag"], errors="coerce").fillna(0).eq(1)
         after_daily = _daily_media(normal.loc[after_mask])
         if not after_daily.empty:
-            after_keys = pd.MultiIndex.from_frame(after_daily[["date", "media"]])
             after_daily["reason"] = "マジ得直後"
             after_daily["outlier_score"] = np.nan
             excluded_parts.append(after_daily[["date", "media", "cv", "reason", "outlier_score"]])
@@ -243,15 +240,10 @@ def _prepare_normal_learning_data(
         clean_daily["cv"] = pd.to_numeric(clean_daily["cv"], errors="coerce").fillna(0.0)
         clean_daily["cost"] = pd.to_numeric(clean_daily["cost"], errors="coerce").fillna(0.0)
 
-        # 除外対象の媒体×日は、0CVに置換せず学習母集団そのものから外す。
-        # 特にマジ得直後は上で元行を除外済みのため、ここで落とさないと
-        # cross join後に「欠損=0CV」として復活し、基礎CVを不当に押し下げる。
-        daily_keys = pd.MultiIndex.from_frame(clean_daily[["date", "media"]])
-        if len(after_keys) > 0:
-            clean_daily = clean_daily.loc[~daily_keys.isin(after_keys)].copy()
-            daily_keys = pd.MultiIndex.from_frame(clean_daily[["date", "media"]])
+        # 異常値として除外した媒体×日は、0CVに置換せず学習母集団そのものから外す。
         if not outliers.empty:
             bad_keys = pd.MultiIndex.from_frame(outliers[["date", "media"]])
+            daily_keys = pd.MultiIndex.from_frame(clean_daily[["date", "media"]])
             clean_daily = clean_daily.loc[~daily_keys.isin(bad_keys)].copy()
         clean_daily["month"] = clean_daily["date"].dt.month
     else:
@@ -611,10 +603,11 @@ def calculate_unit_price_response_table(
     return pd.DataFrame(rows, columns=columns)
 
 def calculate_global_trend_table(history_df: pd.DataFrame) -> pd.DataFrame:
-    """ローデータ最新日を基準に、直近30日の日平均CV / 直近60日の日平均CVを算出する。
+    """最新30日とその直前30日の日平均CVを比較し、直近の伸び/減速を予測へ反映する。
 
-    係数用に除外・0補完した daily ではなく、実績ローデータそのものの案件全体CVを使う。
-    これにより未来月プランでも「現在取得できている直近の実績水準」をそのまま反映する。
+    60日平均に最新30日が半分含まれる比較では変化が薄まるため、
+    「最新30日 ÷ 直前30日」をモメンタム係数として使用する。
+    ローデータ最新日を基準にするので、未来月プランニングでも参照期間はずれない。
     """
     columns = ["factor", "raw_factor", "recent_daily_cv", "baseline_daily_cv",
                "recent_days", "baseline_days", "stable_media"]
@@ -634,34 +627,31 @@ def calculate_global_trend_table(history_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame([empty_row], columns=columns)
 
     cutoff = pd.Timestamp(work["date"].max()).normalize()
-    baseline_start = cutoff - pd.Timedelta(days=59)
     recent_start = cutoff - pd.Timedelta(days=GLOBAL_TREND_WINDOW_DAYS - 1)
+    prior_end = recent_start - pd.Timedelta(days=1)
+    prior_start = prior_end - pd.Timedelta(days=GLOBAL_TREND_WINDOW_DAYS - 1)
 
-    # 日付行が存在しない日も0件として分母へ含め、暦日の日平均にする。
-    full_dates = pd.date_range(baseline_start, cutoff, freq="D")
-    total_by_date = (
-        work.loc[work["date"].between(baseline_start, cutoff)]
-        .groupby("date")["cv"].sum()
-        .reindex(full_dates, fill_value=0.0)
-    )
-    baseline = total_by_date
-    recent = total_by_date.loc[total_by_date.index >= recent_start]
+    # 実績行がない日も0件として暦日平均に含める。
+    recent_dates = pd.date_range(recent_start, cutoff, freq="D")
+    prior_dates = pd.date_range(prior_start, prior_end, freq="D")
+    by_date = work.groupby("date")["cv"].sum()
+    recent = by_date.reindex(recent_dates, fill_value=0.0)
+    prior = by_date.reindex(prior_dates, fill_value=0.0)
 
-    baseline_days = int(len(baseline))
     recent_days = int(len(recent))
+    prior_days = int(len(prior))
     recent_daily = float(recent.mean()) if recent_days else np.nan
-    baseline_daily = float(baseline.mean()) if baseline_days else np.nan
-    raw = (1.0 if not np.isfinite(baseline_daily) or baseline_daily <= 0
-           else float(recent_daily / baseline_daily))
+    prior_daily = float(prior.mean()) if prior_days else np.nan
 
-    # 直近30日が揃っている通常ケースでは比率を100%反映。暴れすぎだけ上下限で抑える。
+    raw = (1.0 if not np.isfinite(prior_daily) or prior_daily <= 0
+           else float(recent_daily / prior_daily))
     factor = float(np.clip(raw, GLOBAL_TREND_FACTOR_MIN, GLOBAL_TREND_FACTOR_MAX))
     stable_media = int(work["media"].nunique()) if "media" in work.columns else 0
 
     return pd.DataFrame([{
         "factor": factor, "raw_factor": raw,
-        "recent_daily_cv": recent_daily, "baseline_daily_cv": baseline_daily,
-        "recent_days": recent_days, "baseline_days": baseline_days,
+        "recent_daily_cv": recent_daily, "baseline_daily_cv": prior_daily,
+        "recent_days": recent_days, "baseline_days": prior_days,
         "stable_media": stable_media,
     }], columns=columns)
 
