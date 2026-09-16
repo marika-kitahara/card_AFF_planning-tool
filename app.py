@@ -2190,14 +2190,18 @@ def _run_normal_backtest(
     # 学習はCPN月度数ではなく、予測基準日以前の直近60暦日に固定する。
     # CPN月度の日数・その中の定常日数が不均一でも、同じ時間幅で現在の媒体力を評価する。
     learning_score_table = pd.DataFrame()
-    cutoff_date = target_start - pd.Timedelta(days=1)
+    # 本番予測の学習基準日は「予測対象日の前日」ではなく、
+    # アップロードされたローデータの最新実績日とする。
+    # 未来月を予測するとき、まだ存在しない日付を0CVとして分母に混ぜないため。
+    available_dates = work["date"].dropna()
+    if available_dates.empty:
+        raise ValueError("実績データに有効な日付がありません。")
+    cutoff_date = pd.Timestamp(available_dates.max()).normalize()
     requested_learning_start = cutoff_date - pd.Timedelta(days=59)
+
     # 最大60日を使う。ただしローデータが60日未満しかない場合は、
     # 実際に存在する最古日から学習し、存在しない過去日を0CV扱いしない。
-    available_before_cutoff = work.loc[work["date"].le(cutoff_date), "date"].dropna()
-    if available_before_cutoff.empty:
-        raise ValueError("予測基準日以前の実績データがありません。")
-    earliest_available_date = pd.Timestamp(available_before_cutoff.min()).normalize()
+    earliest_available_date = pd.Timestamp(available_dates.min()).normalize()
     learning_start = max(requested_learning_start, earliest_available_date)
     training = work.loc[work["date"].between(learning_start, cutoff_date)].copy()
 
@@ -3364,7 +3368,6 @@ if uploaded_master and has_any_actual:
     # Excel生成ボタン等によるStreamlit再実行でも再利用する。
     # ---------------------------------------------------------
     factor_cache_key = (
-        "global_trend_level_v3",
         tuple(selected_media),
         tuple(selected_product_ids),
         bool(exclude_compensation),
@@ -3912,7 +3915,6 @@ if uploaded_master and has_any_actual:
     )
 
     calc_key = (
-        "global_trend_level_v3",
         tuple(selected_media),
         tuple(selected_product_ids),
         bool(exclude_compensation),
