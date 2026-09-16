@@ -201,12 +201,13 @@ def _prepare_normal_learning_data(
 
     normal = _add_recency_weights(normal)
 
-    # 重要: ローデータに媒体行が存在しない日も、その媒体の0CV日として日次学習へ含める。
-    # 従来は「CVが出た/行が存在した日」だけが分母になり、断続掲載媒体の基礎CVを
-    # 過大評価していた。ここでは学習対象の定常日 × 媒体を展開し、欠損を0CVで補完する。
+    # 媒体の掲載期間内だけ欠損日を0CVとして補完する。
+    # 「CVが出た日だけ」を分母にすると過大評価する一方、全媒体×全日を0補完すると、
+    # 掲載開始前・終了後まで0扱いになり過小評価する。
+    # そこで各媒体について、定常ローデータ上の初回観測日〜最終観測日を掲載期間とみなし、
+    # その期間内の欠損日だけを0CVとして扱う。期間外は平均対象に含めない。
     observed_daily = _daily_media(normal)
     if not observed_daily.empty:
-        media_list = pd.DataFrame({"media": sorted(normal["media"].dropna().astype(str).unique())})
         if calendar_dates is None:
             eligible_dates = sorted(normal["date"].dropna().unique())
         else:
@@ -218,7 +219,6 @@ def _prepare_normal_learning_data(
         calendar = _add_recency_weights(calendar)
         calendar["weekday"] = calendar["date"].dt.day_name()
 
-        # 月初/月末・LINE OAは日付共通属性として、元データから復元する。
         date_attrs_spec = {}
         if "is_month_start" in normal.columns:
             date_attrs_spec["is_month_start"] = ("is_month_start", "max")
@@ -234,14 +234,29 @@ def _prepare_normal_learning_data(
                 calendar[col] = 0
             calendar[col] = pd.to_numeric(calendar[col], errors="coerce").fillna(0).astype(int)
 
-        clean_daily = media_list.merge(calendar, how="cross").merge(
-            observed_daily, on=["date", "media"], how="left"
+        # 媒体ごとの観測期間を掲載期間の近似として使う。
+        media_spans = (
+            observed_daily.groupby("media", as_index=False)["date"]
+            .agg(first_date="min", last_date="max")
         )
-        clean_daily["cv"] = pd.to_numeric(clean_daily["cv"], errors="coerce").fillna(0.0)
-        clean_daily["cost"] = pd.to_numeric(clean_daily["cost"], errors="coerce").fillna(0.0)
+        parts = []
+        for row in media_spans.itertuples(index=False):
+            cal = calendar[calendar["date"].between(row.first_date, row.last_date)].copy()
+            if cal.empty:
+                continue
+            cal["media"] = row.media
+            parts.append(cal)
 
-        # 異常値として除外した媒体×日は、0CVに置換せず学習母集団そのものから外す。
-        if not outliers.empty:
+        if parts:
+            active_calendar = pd.concat(parts, ignore_index=True)
+            clean_daily = active_calendar.merge(observed_daily, on=["date", "media"], how="left")
+            clean_daily["cv"] = pd.to_numeric(clean_daily["cv"], errors="coerce").fillna(0.0)
+            clean_daily["cost"] = pd.to_numeric(clean_daily["cost"], errors="coerce").fillna(0.0)
+        else:
+            clean_daily = observed_daily.copy()
+
+        # 異常値日は0に置換せず、学習母集団から除外する。
+        if not outliers.empty and not clean_daily.empty:
             bad_keys = pd.MultiIndex.from_frame(outliers[["date", "media"]])
             daily_keys = pd.MultiIndex.from_frame(clean_daily[["date", "media"]])
             clean_daily = clean_daily.loc[~daily_keys.isin(bad_keys)].copy()
