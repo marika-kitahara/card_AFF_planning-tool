@@ -917,16 +917,27 @@ def calculate_normal_month_base(
     if clean.empty:
         return pd.DataFrame(columns=columns)
 
-    # 基礎CVの分母は「その媒体の掲載実績行が存在した日」に限定する。
-    # CV>0の日だけに限定すると過大予測になり、全定常日を0埋めすると
-    # 非掲載日まで0CVとして扱って過小予測になるため、
-    # 「掲載していたがCV=0の日」は0として含め、「そもそも掲載していない日」は除外する。
-    observed_media_days = (
-        clean[["date", "media", "recency_weight"]]
-        .drop_duplicates(subset=["date", "media"])
-        .copy()
+    # 媒体ごとの「全定常日」を分母にする。行が無い日は0CV=非稼働日。
+    # base_cv = 稼働率 × 稼働時CV と同値だが、診断値も保持して説明可能にする。
+    _, full_daily, _ = _prepare_normal_learning_data(history_df, selected_months, calendar_dates)
+    if not inactive.empty and not full_daily.empty:
+        full_daily = full_daily.loc[~full_daily["media"].isin(inactive["media"])].copy()
+    # 媒体ごとの掲載期間だけを分母にする。
+    # 最初の実績行より前／最後の実績行より後は「非掲載」とみなし0日にはしない。
+    # 一方、掲載期間の途中で行が無い日は0CVとして残す。
+    # これにより「全60日を0補完」で過小評価する問題と、
+    # 「CV発生日だけ」で過大評価する問題の中間になる。
+    observed_span = (
+        clean.groupby("media", as_index=False)
+        .agg(first_observed_date=("date", "min"), last_observed_date=("date", "max"))
     )
-    media_day_weights = observed_media_days.groupby("media")["recency_weight"].sum()
+    full_daily = full_daily.merge(observed_span, on="media", how="left")
+    in_span = (
+        full_daily["date"].ge(full_daily["first_observed_date"])
+        & full_daily["date"].le(full_daily["last_observed_date"])
+    )
+    full_daily = full_daily.loc[in_span].copy()
+    media_day_weights = full_daily.groupby("media")["recency_weight"].sum()
 
     weighted = clean.copy()
     weighted["cv"] = pd.to_numeric(weighted["cv"], errors="coerce").fillna(0.0)
