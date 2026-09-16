@@ -2297,7 +2297,8 @@ def _run_normal_backtest(
     stage_formulas = {
         "stage_base_cv": ("base_cv", "cpn_factor"),
         "stage_unit_price_cv": ("stage_base_cv", "unit_price_factor"),
-        "stage_weekday_cv": ("stage_unit_price_cv", "weekday_factor"),
+        "stage_global_trend_cv": ("stage_unit_price_cv", "global_trend_factor"),
+        "stage_weekday_cv": ("stage_global_trend_cv", "weekday_factor"),
         "stage_season_cv": ("stage_weekday_cv", "season_factor"),
         "stage_month_edge_cv": ("stage_season_cv", "month_edge_factor"),
         "stage_after_cv": ("stage_month_edge_cv", "after_factor"),
