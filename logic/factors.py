@@ -602,11 +602,11 @@ def calculate_unit_price_response_table(
         })
     return pd.DataFrame(rows, columns=columns)
 
-def calculate_global_trend_table(daily: pd.DataFrame) -> pd.DataFrame:
-    """直近30日の案件全体CV水準を、学習期間全体（最大60日）と比較する。
+def calculate_global_trend_table(history_df: pd.DataFrame) -> pd.DataFrame:
+    """ローデータ最新日を基準に、直近30日の日平均CV / 直近60日の日平均CVを算出する。
 
-    未来月の予測で直近の実績水準が基礎値に反映されるよう、媒体数による
-    判定は行わず案件全体の日次CVで算出する。日数不足時のみ1.0側へ縮小する。
+    係数用に除外・0補完した daily ではなく、実績ローデータそのものの案件全体CVを使う。
+    これにより未来月プランでも「現在取得できている直近の実績水準」をそのまま反映する。
     """
     columns = ["factor", "raw_factor", "recent_daily_cv", "baseline_daily_cv",
                "recent_days", "baseline_days", "stable_media"]
@@ -615,42 +615,41 @@ def calculate_global_trend_table(daily: pd.DataFrame) -> pd.DataFrame:
         "baseline_daily_cv": np.nan, "recent_days": 0, "baseline_days": 0,
         "stable_media": 0,
     }
-    if daily is None or daily.empty:
+    if history_df is None or history_df.empty:
         return pd.DataFrame([empty_row], columns=columns)
 
-    work = daily.copy()
+    work = history_df.copy()
     work["date"] = pd.to_datetime(work["date"], errors="coerce").dt.normalize()
     work["cv"] = pd.to_numeric(work["cv"], errors="coerce").fillna(0.0)
     work = work.dropna(subset=["date"])
     if work.empty:
         return pd.DataFrame([empty_row], columns=columns)
 
-    # 同じ日付に複数媒体があるので、まず案件全体の日次CVへ集約する。
-    total_by_date = work.groupby("date", as_index=True)["cv"].sum().sort_index()
-    cutoff = pd.Timestamp(total_by_date.index.max()).normalize()
+    cutoff = pd.Timestamp(work["date"].max()).normalize()
+    baseline_start = cutoff - pd.Timedelta(days=59)
     recent_start = cutoff - pd.Timedelta(days=GLOBAL_TREND_WINDOW_DAYS - 1)
 
+    # 日付行が存在しない日も0件として分母へ含め、暦日の日平均にする。
+    full_dates = pd.date_range(baseline_start, cutoff, freq="D")
+    total_by_date = (
+        work.loc[work["date"].between(baseline_start, cutoff)]
+        .groupby("date")["cv"].sum()
+        .reindex(full_dates, fill_value=0.0)
+    )
+    baseline = total_by_date
     recent = total_by_date.loc[total_by_date.index >= recent_start]
-    baseline = total_by_date  # 呼び出し元で最新実績日から最大60日に切られている
 
-    recent_days = int(recent.index.nunique())
-    baseline_days = int(baseline.index.nunique())
-    if recent_days < GLOBAL_TREND_MIN_DAYS or baseline_days < GLOBAL_TREND_MIN_DAYS:
-        row = empty_row.copy()
-        row.update({"recent_days": recent_days, "baseline_days": baseline_days})
-        return pd.DataFrame([row], columns=columns)
-
-    recent_daily = float(recent.mean())
-    baseline_daily = float(baseline.mean())
+    baseline_days = int(len(baseline))
+    recent_days = int(len(recent))
+    recent_daily = float(recent.mean()) if recent_days else np.nan
+    baseline_daily = float(baseline.mean()) if baseline_days else np.nan
     raw = (1.0 if not np.isfinite(baseline_daily) or baseline_daily <= 0
            else float(recent_daily / baseline_daily))
 
-    # 30日未満しかない場合だけ補正を弱める。30日そろえば実績差をそのまま反映。
-    coverage = min(1.0, recent_days / float(GLOBAL_TREND_WINDOW_DAYS))
-    factor = 1.0 + coverage * (raw - 1.0)
-    factor = float(np.clip(factor, GLOBAL_TREND_FACTOR_MIN, GLOBAL_TREND_FACTOR_MAX))
-
+    # 直近30日が揃っている通常ケースでは比率を100%反映。暴れすぎだけ上下限で抑える。
+    factor = float(np.clip(raw, GLOBAL_TREND_FACTOR_MIN, GLOBAL_TREND_FACTOR_MAX))
     stable_media = int(work["media"].nunique()) if "media" in work.columns else 0
+
     return pd.DataFrame([{
         "factor": factor, "raw_factor": raw,
         "recent_daily_cv": recent_daily, "baseline_daily_cv": baseline_daily,
@@ -800,7 +799,7 @@ def calculate_dynamic_factor_tables(
 
     inactive_media = identify_inactive_media(history_df, selected_months)
     unit_price = calculate_unit_price_response_table(history_df, selected_months)
-    global_trend = calculate_global_trend_table(daily)
+    global_trend = calculate_global_trend_table(history_df)
 
     return {
         "weekday": weekday_avg,
