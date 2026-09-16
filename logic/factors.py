@@ -176,12 +176,15 @@ def _prepare_normal_learning_data(
         return normal, empty_daily, empty_excluded
 
     excluded_parts: list[pd.DataFrame] = []
+    # 後段の0補完で「除外日」が0CVとして復活しないよう、媒体×日キーを保持する。
+    after_keys = pd.MultiIndex.from_arrays([[], []], names=["date", "media"])
 
     # マジ得直後は需要先食い等の特殊期間として定常平均から完全除外。
     if "magitoku_after_flag" in normal.columns:
         after_mask = pd.to_numeric(normal["magitoku_after_flag"], errors="coerce").fillna(0).eq(1)
         after_daily = _daily_media(normal.loc[after_mask])
         if not after_daily.empty:
+            after_keys = pd.MultiIndex.from_frame(after_daily[["date", "media"]])
             after_daily["reason"] = "マジ得直後"
             after_daily["outlier_score"] = np.nan
             excluded_parts.append(after_daily[["date", "media", "cv", "reason", "outlier_score"]])
@@ -240,10 +243,15 @@ def _prepare_normal_learning_data(
         clean_daily["cv"] = pd.to_numeric(clean_daily["cv"], errors="coerce").fillna(0.0)
         clean_daily["cost"] = pd.to_numeric(clean_daily["cost"], errors="coerce").fillna(0.0)
 
-        # 異常値として除外した媒体×日は、0CVに置換せず学習母集団そのものから外す。
+        # 除外対象の媒体×日は、0CVに置換せず学習母集団そのものから外す。
+        # 特にマジ得直後は上で元行を除外済みのため、ここで落とさないと
+        # cross join後に「欠損=0CV」として復活し、基礎CVを不当に押し下げる。
+        daily_keys = pd.MultiIndex.from_frame(clean_daily[["date", "media"]])
+        if len(after_keys) > 0:
+            clean_daily = clean_daily.loc[~daily_keys.isin(after_keys)].copy()
+            daily_keys = pd.MultiIndex.from_frame(clean_daily[["date", "media"]])
         if not outliers.empty:
             bad_keys = pd.MultiIndex.from_frame(outliers[["date", "media"]])
-            daily_keys = pd.MultiIndex.from_frame(clean_daily[["date", "media"]])
             clean_daily = clean_daily.loc[~daily_keys.isin(bad_keys)].copy()
         clean_daily["month"] = clean_daily["date"].dt.month
     else:
