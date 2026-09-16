@@ -603,12 +603,10 @@ def calculate_unit_price_response_table(
     return pd.DataFrame(rows, columns=columns)
 
 def calculate_global_trend_table(daily: pd.DataFrame) -> pd.DataFrame:
-    """直近30日と、その直前30日の案件全体CV水準を比較する。
+    """直近30日の案件全体CV水準を、学習期間全体（最大60日）と比較する。
 
-    60日全体平均との差では直近30日自身が分母にも入るため、上昇・下降トレンドが
-    薄まってしまう。そこで「直近30日 ÷ 直前30日」を使い、未来月にも現在の
-    水準変化を反映する。媒体構成変化の影響を避けるため、両期間でCV実績がある
-    継続媒体だけを比較する。サンプル不足時は補正なし(1.0)。
+    未来月の予測で直近の実績水準が基礎値に反映されるよう、媒体数による
+    判定は行わず案件全体の日次CVで算出する。日数不足時のみ1.0側へ縮小する。
     """
     columns = ["factor", "raw_factor", "recent_daily_cv", "baseline_daily_cv",
                "recent_days", "baseline_days", "stable_media"]
@@ -623,53 +621,42 @@ def calculate_global_trend_table(daily: pd.DataFrame) -> pd.DataFrame:
     work = daily.copy()
     work["date"] = pd.to_datetime(work["date"], errors="coerce").dt.normalize()
     work["cv"] = pd.to_numeric(work["cv"], errors="coerce").fillna(0.0)
-    work = work.dropna(subset=["date", "media"])
+    work = work.dropna(subset=["date"])
     if work.empty:
         return pd.DataFrame([empty_row], columns=columns)
 
-    cutoff = pd.Timestamp(work["date"].max()).normalize()
+    # 同じ日付に複数媒体があるので、まず案件全体の日次CVへ集約する。
+    total_by_date = work.groupby("date", as_index=True)["cv"].sum().sort_index()
+    cutoff = pd.Timestamp(total_by_date.index.max()).normalize()
     recent_start = cutoff - pd.Timedelta(days=GLOBAL_TREND_WINDOW_DAYS - 1)
-    prior_end = recent_start - pd.Timedelta(days=1)
-    prior_start = prior_end - pd.Timedelta(days=GLOBAL_TREND_WINDOW_DAYS - 1)
 
-    recent = work.loc[work["date"].between(recent_start, cutoff)].copy()
-    prior = work.loc[work["date"].between(prior_start, prior_end)].copy()
+    recent = total_by_date.loc[total_by_date.index >= recent_start]
+    baseline = total_by_date  # 呼び出し元で最新実績日から最大60日に切られている
 
-    recent_positive = recent.groupby("media")["cv"].sum()
-    prior_positive = prior.groupby("media")["cv"].sum()
-    stable = recent_positive[recent_positive.gt(0)].index.intersection(
-        prior_positive[prior_positive.gt(0)].index
-    )
-
-    recent_days = int(recent["date"].nunique())
-    baseline_days = int(prior["date"].nunique())
-    if (recent_days < GLOBAL_TREND_MIN_DAYS
-            or baseline_days < GLOBAL_TREND_MIN_DAYS
-            or len(stable) < GLOBAL_TREND_MIN_STABLE_MEDIA):
+    recent_days = int(recent.index.nunique())
+    baseline_days = int(baseline.index.nunique())
+    if recent_days < GLOBAL_TREND_MIN_DAYS or baseline_days < GLOBAL_TREND_MIN_DAYS:
         row = empty_row.copy()
-        row.update({"recent_days": recent_days, "baseline_days": baseline_days,
-                    "stable_media": int(len(stable))})
+        row.update({"recent_days": recent_days, "baseline_days": baseline_days})
         return pd.DataFrame([row], columns=columns)
 
-    stable_recent = recent.loc[recent["media"].isin(stable)]
-    stable_prior = prior.loc[prior["media"].isin(stable)]
-    recent_daily = stable_recent.groupby("date")["cv"].sum().mean()
-    baseline_daily = stable_prior.groupby("date")["cv"].sum().mean()
+    recent_daily = float(recent.mean())
+    baseline_daily = float(baseline.mean())
     raw = (1.0 if not np.isfinite(baseline_daily) or baseline_daily <= 0
            else float(recent_daily / baseline_daily))
 
-    # 30日そろっている通常ケースではトレンドをそのまま反映する。
-    # 日数不足時だけ1.0側へ縮小し、最後に安全上限・下限を適用する。
-    coverage = min(1.0, recent_days / float(GLOBAL_TREND_WINDOW_DAYS),
-                   baseline_days / float(GLOBAL_TREND_WINDOW_DAYS))
+    # 30日未満しかない場合だけ補正を弱める。30日そろえば実績差をそのまま反映。
+    coverage = min(1.0, recent_days / float(GLOBAL_TREND_WINDOW_DAYS))
     factor = 1.0 + coverage * (raw - 1.0)
     factor = float(np.clip(factor, GLOBAL_TREND_FACTOR_MIN, GLOBAL_TREND_FACTOR_MAX))
-    return pd.DataFrame([{
-        "factor": factor, "raw_factor": raw, "recent_daily_cv": float(recent_daily),
-        "baseline_daily_cv": float(baseline_daily), "recent_days": recent_days,
-        "baseline_days": baseline_days, "stable_media": int(len(stable)),
-    }], columns=columns)
 
+    stable_media = int(work["media"].nunique()) if "media" in work.columns else 0
+    return pd.DataFrame([{
+        "factor": factor, "raw_factor": raw,
+        "recent_daily_cv": recent_daily, "baseline_daily_cv": baseline_daily,
+        "recent_days": recent_days, "baseline_days": baseline_days,
+        "stable_media": stable_media,
+    }], columns=columns)
 
 def calculate_dynamic_factor_tables(
     history_df: pd.DataFrame,
