@@ -2187,21 +2187,21 @@ def _run_normal_backtest(
     target_start = pd.Timestamp(target_dates.min()).normalize()
     target_end = pd.Timestamp(target_dates.max()).normalize()
 
-    # 学習はCPN月度数ではなく、予測基準日以前の直近60暦日に固定する。
+    # CPN月度厳密版: バックテスト対象期間はCPNマスタの日付集合を唯一の正とする。
+    # ローデータ側の「月度」列が暦月や旧マスタ由来でも、対象期間の判定には使用しない。
+    target_date_set = set(target_dates.tolist())
+
+    # 学習は対象CPN月度の開始日前日を基準に、そこから直近60暦日に固定する。
     # CPN月度の日数・その中の定常日数が不均一でも、同じ時間幅で現在の媒体力を評価する。
     learning_score_table = pd.DataFrame()
-    # 本番予測の学習基準日は「予測対象日の前日」ではなく、
-    # アップロードされたローデータの最新実績日とする。
-    # 未来月を予測するとき、まだ存在しない日付を0CVとして分母に混ぜないため。
-    available_dates = work["date"].dropna()
-    if available_dates.empty:
-        raise ValueError("実績データに有効な日付がありません。")
-    cutoff_date = pd.Timestamp(available_dates.max()).normalize()
+    cutoff_date = target_start - pd.Timedelta(days=1)
     requested_learning_start = cutoff_date - pd.Timedelta(days=59)
-
     # 最大60日を使う。ただしローデータが60日未満しかない場合は、
     # 実際に存在する最古日から学習し、存在しない過去日を0CV扱いしない。
-    earliest_available_date = pd.Timestamp(available_dates.min()).normalize()
+    available_before_cutoff = work.loc[work["date"].le(cutoff_date), "date"].dropna()
+    if available_before_cutoff.empty:
+        raise ValueError("予測基準日以前の実績データがありません。")
+    earliest_available_date = pd.Timestamp(available_before_cutoff.min()).normalize()
     learning_start = max(requested_learning_start, earliest_available_date)
     training = work.loc[work["date"].between(learning_start, cutoff_date)].copy()
 
@@ -2357,12 +2357,9 @@ def _run_normal_backtest(
         )
     )
 
-    target_date_set = set(pd.to_datetime(target_calendar["日付"], errors="coerce").dropna().dt.normalize())
-    actual = work.loc[
-        work["月度"].astype(str).eq(str(target_month))
-        & work["CPN名"].isin(normal_labels)
-        & work["date"].isin(target_date_set)
-    ].copy()
+    # 実績比較もCPNマスタの日付集合だけで切る。
+    # ローデータの月度ラベルには依存しない。
+    actual = work.loc[work["date"].isin(target_date_set)].copy()
     actual_daily = (
         actual.groupby(["date", "media"], as_index=False)
         .agg(actual_cv=("cv", "sum"))
@@ -3675,6 +3672,7 @@ if uploaded_master and has_any_actual:
             "対象月度の実績を予測計算から隠し、CPNマスタ上の対象月度開始日前までのデータだけで当時の定常予測を再現します。"
             "対象月の実績は比較表示にだけ使用します。"
         )
+        st.caption("CPN月度厳密版：検証期間・実績集計ともにCPNマスタの日付を基準にしています。")
 
         # 選択肢・月度順もローデータではなくCPNマスタを正とする。
         bt_master = cpn_master.copy()
@@ -3684,18 +3682,11 @@ if uploaded_master and has_any_actual:
         bt_month_labels = _get_cpn_normal_months(bt_master)
         # 実績比較ができ、かつCPNマスタ上の対象最終日までTGローデータが到達している
         # 「完了月度」だけをバックテスト候補にする。途中月度を完成実績として評価しない。
-        history_months = set(
-            history_df.loc[
-                history_df["CPN名"].isin(normal_labels)
-                & history_df["月度"].astype(str).ne("未設定"),
-                "月度",
-            ].astype(str)
-        )
+        # 候補判定もローデータの月度ラベルには依存しない。
+        # CPNマスタ上の月度終了日までローデータが到達していれば検証可能とする。
         bt_options = []
         incomplete_bt_months = []
         for m in bt_month_labels[1:]:
-            if m not in history_months:
-                continue
             m_dates = bt_master.loc[
                 bt_master["月度"].astype(str).eq(str(m))
                 & bt_master["CPN名"].isin(normal_labels),
