@@ -3364,6 +3364,7 @@ if uploaded_master and has_any_actual:
     # Excel生成ボタン等によるStreamlit再実行でも再利用する。
     # ---------------------------------------------------------
     factor_cache_key = (
+        "global_trend_level_v3",
         tuple(selected_media),
         tuple(selected_product_ids),
         bool(exclude_compensation),
@@ -3911,6 +3912,7 @@ if uploaded_master and has_any_actual:
     )
 
     calc_key = (
+        "global_trend_level_v3",
         tuple(selected_media),
         tuple(selected_product_ids),
         bool(exclude_compensation),
