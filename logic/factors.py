@@ -603,11 +603,10 @@ def calculate_unit_price_response_table(
     return pd.DataFrame(rows, columns=columns)
 
 def calculate_global_trend_table(history_df: pd.DataFrame) -> pd.DataFrame:
-    """最新30日とその直前30日の日平均CVを比較し、直近の伸び/減速を予測へ反映する。
+    """ローデータ最新日を基準に、直近30日の日平均CV / 直近60日の日平均CVを算出する。
 
-    60日平均に最新30日が半分含まれる比較では変化が薄まるため、
-    「最新30日 ÷ 直前30日」をモメンタム係数として使用する。
-    ローデータ最新日を基準にするので、未来月プランニングでも参照期間はずれない。
+    係数用に除外・0補完した daily ではなく、実績ローデータそのものの案件全体CVを使う。
+    これにより未来月プランでも「現在取得できている直近の実績水準」をそのまま反映する。
     """
     columns = ["factor", "raw_factor", "recent_daily_cv", "baseline_daily_cv",
                "recent_days", "baseline_days", "stable_media"]
@@ -627,31 +626,34 @@ def calculate_global_trend_table(history_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame([empty_row], columns=columns)
 
     cutoff = pd.Timestamp(work["date"].max()).normalize()
+    baseline_start = cutoff - pd.Timedelta(days=59)
     recent_start = cutoff - pd.Timedelta(days=GLOBAL_TREND_WINDOW_DAYS - 1)
-    prior_end = recent_start - pd.Timedelta(days=1)
-    prior_start = prior_end - pd.Timedelta(days=GLOBAL_TREND_WINDOW_DAYS - 1)
 
-    # 実績行がない日も0件として暦日平均に含める。
-    recent_dates = pd.date_range(recent_start, cutoff, freq="D")
-    prior_dates = pd.date_range(prior_start, prior_end, freq="D")
-    by_date = work.groupby("date")["cv"].sum()
-    recent = by_date.reindex(recent_dates, fill_value=0.0)
-    prior = by_date.reindex(prior_dates, fill_value=0.0)
+    # 日付行が存在しない日も0件として分母へ含め、暦日の日平均にする。
+    full_dates = pd.date_range(baseline_start, cutoff, freq="D")
+    total_by_date = (
+        work.loc[work["date"].between(baseline_start, cutoff)]
+        .groupby("date")["cv"].sum()
+        .reindex(full_dates, fill_value=0.0)
+    )
+    baseline = total_by_date
+    recent = total_by_date.loc[total_by_date.index >= recent_start]
 
+    baseline_days = int(len(baseline))
     recent_days = int(len(recent))
-    prior_days = int(len(prior))
     recent_daily = float(recent.mean()) if recent_days else np.nan
-    prior_daily = float(prior.mean()) if prior_days else np.nan
+    baseline_daily = float(baseline.mean()) if baseline_days else np.nan
+    raw = (1.0 if not np.isfinite(baseline_daily) or baseline_daily <= 0
+           else float(recent_daily / baseline_daily))
 
-    raw = (1.0 if not np.isfinite(prior_daily) or prior_daily <= 0
-           else float(recent_daily / prior_daily))
+    # 直近30日が揃っている通常ケースでは比率を100%反映。暴れすぎだけ上下限で抑える。
     factor = float(np.clip(raw, GLOBAL_TREND_FACTOR_MIN, GLOBAL_TREND_FACTOR_MAX))
     stable_media = int(work["media"].nunique()) if "media" in work.columns else 0
 
     return pd.DataFrame([{
         "factor": factor, "raw_factor": raw,
-        "recent_daily_cv": recent_daily, "baseline_daily_cv": prior_daily,
-        "recent_days": recent_days, "baseline_days": prior_days,
+        "recent_daily_cv": recent_daily, "baseline_daily_cv": baseline_daily,
+        "recent_days": recent_days, "baseline_days": baseline_days,
         "stable_media": stable_media,
     }], columns=columns)
 
@@ -915,12 +917,11 @@ def calculate_normal_month_base(
     if clean.empty:
         return pd.DataFrame(columns=columns)
 
-    # 媒体ごとの「全定常日」を分母にする。行が無い日は0CV=非稼働日。
-    # base_cv = 稼働率 × 稼働時CV と同値だが、診断値も保持して説明可能にする。
-    _, full_daily, _ = _prepare_normal_learning_data(history_df, selected_months, calendar_dates)
-    if not inactive.empty and not full_daily.empty:
-        full_daily = full_daily.loc[~full_daily["media"].isin(inactive["media"])].copy()
-    media_day_weights = full_daily.groupby("media")["recency_weight"].sum()
+    # 基礎CVは「その媒体×商品IDに実績行が存在した日」の加重日平均を使う。
+    # 以前は媒体ごとの全定常日を分母にし、行が無い日まで0CVとしていたため、
+    # 断続掲載だった媒体の過去の非掲載日が将来予測にも織り込まれていた。
+    # 将来の掲載/非掲載は掲載状態ロジックで別途反映するため、ここでは二重に
+    # 稼働率を掛けず、掲載時の実力（active-day CV）を基礎値とする。
 
     weighted = clean.copy()
     weighted["cv"] = pd.to_numeric(weighted["cv"], errors="coerce").fillna(0.0)
@@ -931,8 +932,17 @@ def calculate_normal_month_base(
         weighted_cv=("weighted_cv", "sum"),
         weighted_cost=("weighted_cost", "sum"),
     )
-    result["weight_days"] = result["media"].map(media_day_weights)
-    result["base_cv"] = result["weighted_cv"] / result["weight_days"]
+    # 同一日に複数行があっても日数ウェイトを重複カウントしない。
+    pair_day_weights = (
+        weighted[["media", "商品ID", "date", "recency_weight"]]
+        .drop_duplicates(["media", "商品ID", "date"])
+        .groupby(["media", "商品ID"])["recency_weight"]
+        .sum()
+    )
+    result_idx = pd.MultiIndex.from_frame(result[["media", "商品ID"]])
+    result["weight_days"] = pair_day_weights.reindex(result_idx).to_numpy()
+    result["base_cv"] = result["weighted_cv"] / result["weight_days"].replace(0, np.nan)
+    result["base_cv"] = pd.to_numeric(result["base_cv"], errors="coerce").fillna(0.0)
 
     # costは掲載日の水準を維持する（0CV日を混ぜて単価まで薄めない）。
     active_cost = weighted.loc[weighted["cv"].gt(0)].copy()
@@ -976,7 +986,8 @@ def calculate_normal_media_diagnostics(
             "media": media,
             "activity_rate": activity_rate,
             "active_daily_cv": float(active_daily_cv) if pd.notna(active_daily_cv) else 0.0,
-            "expected_daily_cv": activity_rate * (float(active_daily_cv) if pd.notna(active_daily_cv) else 0.0),
+            # 将来の掲載状態は別ロジックで反映するため、基礎期待CVは稼働時日平均を採用。
+            "expected_daily_cv": float(active_daily_cv) if pd.notna(active_daily_cv) else 0.0,
             "eligible_days": int(g["date"].nunique()),
             "active_days": int(g.loc[active, "date"].nunique()),
         })
