@@ -3212,8 +3212,10 @@ if uploaded_master and has_any_actual:
             st.error("施策①と施策②の期間が重複しています。期間が重ならないように設定してください。")
             st.stop()
 
-    # 定常学習はCPN月度数ではなく、予測開始日前の直近60暦日に固定する。
-    # 月度日数・定常日数が不均一でも、同じ時間幅で現在の媒体力を評価する。
+    # 定常学習は、プランニング指定日ではなくローデータの最新日を基準に直近60暦日を使う。
+    # これにより、実績更新前に10月・11月など未来月をプランニングしても、
+    # 存在しない未来側の期間で学習窓が欠けないようにする。
+    # ※バックテストは別ロジックで、検証対象日より前の実績だけを使う仕様を維持する。
     needs_normal_learning = any(seg["cpn"] in normal_labels for seg in planning_segments)
     selected_learning_months = []
     normal_training_df = history_df
@@ -3221,17 +3223,13 @@ if uploaded_master and has_any_actual:
     normal_learning_start = None
     normal_learning_cutoff = None
     if needs_normal_learning:
-        first_normal_start = min(
-            pd.Timestamp(seg["start"]).normalize()
-            for seg in planning_segments if seg["cpn"] in normal_labels
-        )
-        normal_learning_cutoff = first_normal_start - pd.Timedelta(days=1)
-        requested_normal_learning_start = normal_learning_cutoff - pd.Timedelta(days=59)
         history_dates = pd.to_datetime(history_df["date"], errors="coerce").dt.normalize()
-        available_history_dates = history_dates.loc[history_dates.le(normal_learning_cutoff)].dropna()
+        available_history_dates = history_dates.dropna()
         if available_history_dates.empty:
-            st.error("予測開始日より前の実績データがありません。")
+            st.error("利用可能な実績データがありません。")
             st.stop()
+        normal_learning_cutoff = pd.Timestamp(available_history_dates.max()).normalize()
+        requested_normal_learning_start = normal_learning_cutoff - pd.Timedelta(days=59)
         earliest_history_date = pd.Timestamp(available_history_dates.min()).normalize()
         normal_learning_start = max(requested_normal_learning_start, earliest_history_date)
         normal_training_df = history_df.loc[
@@ -3252,7 +3250,7 @@ if uploaded_master and has_any_actual:
             .dropna().astype(str).loc[lambda x: x.ne("未設定")].drop_duplicates().tolist()
         )
         if not normal_learning_calendar_dates:
-            st.error("予測開始日前の利用可能データ内にCPNマスタの定常日がありません。")
+            st.error("ローデータ最新日基準の利用可能期間内にCPNマスタの定常日がありません。")
             st.stop()
         st.sidebar.caption(
             f"定常学習: {normal_learning_start.strftime('%Y/%m/%d')}〜"
