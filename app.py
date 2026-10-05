@@ -2812,8 +2812,12 @@ st.caption(
     "ファイルはGitHubには保存されません。"
 )
 st.markdown(
-    "📎 過去の成果データは[こちら](https://rak.box.com/s/90f38ar5w8lzijpbe1h2090fubwa0etw)"
+    "過去の成果データは[こちら](https://rak.box.com/s/90f38ar5w8lzijpbe1h2090fubwa0etw)"
     "からDL、マージしてご使用ください。"
+)
+st.markdown(
+    "CPNマスタは[こちら](https://rak.box.com/s/m99qo68xzrvisf3xrgdfgwnj9jbwjkh2)"
+    "※現行版は2026/9/9更新"
 )
 
 col1, col2 = st.columns(2)
