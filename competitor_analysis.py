@@ -163,12 +163,11 @@ def show_competitor_analysis():
                         dtick=86400000,  # 1日 = 86,400,000ミリ秒
                         tickangle=-55,
                         tickfont=dict(size=9),
-                        showgrid=True,
-                        gridcolor="rgba(128,128,128,0.12)",
+                        showgrid=False,
                     ),
                     yaxis=dict(
                         title=None, range=[lower, upper], tick0=0, dtick=1000,
-                        tickformat=",d", ticksuffix="円",
+                        tickformat=",d", ticksuffix="円", showgrid=False,
                     ),
                 )
                 st.plotly_chart(fig, use_container_width=True, key=f"competitor_chart_{media.index(media_name)}")
