@@ -62,6 +62,7 @@ def parse_competitor_workbook(content: bytes):
 
 def show_competitor_analysis():
     with st.expander("📈 競合還元額分析（任意アップロード）", expanded=False):
+        st.info("競合還元額調査ファイルは [こちらのBox格納先](https://rak.box.com/s/uaf1thskosdl8eif8wb0cjiksd59ci81) からダウンロードできます。アップロードは任意です。")
         file = st.file_uploader("競合還元額調査Excel", type=["xlsx", "xlsm"], key="competitor_workbook", help="シート名がYYMMDDの日付シートを読み取ります。未アップロードでも既存機能はそのまま利用できます。")
         if file is None:
             st.info("調査Excelをアップロードすると、媒体別の最新還元額と推移を表示します。")
