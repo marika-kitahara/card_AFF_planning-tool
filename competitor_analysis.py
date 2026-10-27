@@ -4,10 +4,9 @@ import math
 import re
 from io import BytesIO
 
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 import pandas as pd
 import streamlit as st
-from matplotlib.ticker import FuncFormatter, MultipleLocator
 from openpyxl import load_workbook
 
 DATE_SHEET = re.compile(r"^\d{6}$")
@@ -142,21 +141,31 @@ def show_competitor_analysis():
             with label_col:
                 st.markdown(f"**{media_name}**")
             with graph_col:
-                fig, ax = plt.subplots(figsize=(10, 2.5))
+                fig = go.Figure()
                 for (product_name, segment_name), group in part.groupby(["商品", "セグメント"], sort=True):
                     series = group.sort_values("調査日").drop_duplicates("調査日", keep="last")
                     label = product_name if len(segments) == 1 else f"{product_name} / {segment_name}"
-                    ax.step(series["調査日"], series["還元額"], where="post",
-                            label=label, linewidth=1.7)
-                ax.set_ylim(lower, upper)
-                ax.set_xlim(selected["調査日"].min(), selected["調査日"].max() + pd.Timedelta(days=1))
-                ax.yaxis.set_major_locator(MultipleLocator(1000))
-                ax.yaxis.set_major_formatter(FuncFormatter(lambda x, pos: f"{x:,.0f}"))
-                ax.grid(axis="y", alpha=.25)
-                ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=7)
-                fig.autofmt_xdate()
-                st.pyplot(fig, use_container_width=True)
-                plt.close(fig)
+                    fig.add_trace(go.Scatter(
+                        x=series["調査日"], y=series["還元額"],
+                        mode="lines", line_shape="hv", name=label,
+                        hovertemplate="%{x|%Y/%m/%d}<br>%{y:,.0f}円<extra>%{fullData.name}</extra>",
+                        connectgaps=False,
+                    ))
+                fig.update_layout(
+                    height=260, margin=dict(l=10, r=10, t=15, b=20),
+                    legend=dict(orientation="h", y=-0.32, x=0),
+                    hovermode="x unified",
+                    xaxis=dict(
+                        title=None,
+                        range=[selected["調査日"].min(), selected["調査日"].max() + pd.Timedelta(days=1)],
+                        tickformat="%m/%d",
+                    ),
+                    yaxis=dict(
+                        title=None, range=[lower, upper], tick0=0, dtick=1000,
+                        tickformat=",d", ticksuffix="円",
+                    ),
+                )
+                st.plotly_chart(fig, use_container_width=True, key=f"competitor_chart_{media.index(media_name)}")
         st.caption("縦軸は1,000円刻み・全媒体共通の自動範囲。還元額は丸めず、調査日間を階段表示します。")
         st.subheader("最新調査日の還元額一覧")
         st.dataframe(
