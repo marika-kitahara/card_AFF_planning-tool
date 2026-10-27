@@ -2846,6 +2846,9 @@ with col2:
         help="A列=日付（YYYYMMDD）、B列以降の1行目=AFコード、各セル=件数のAF発行実績。",
     )
 
+from competitor_analysis import show_competitor_analysis
+show_competitor_analysis()
+
 has_af_data = uploaded_af_apply is not None or uploaded_af_issue is not None
 has_any_actual = uploaded_file is not None or has_af_data
 
