@@ -79,54 +79,89 @@ def show_competitor_analysis():
         if warnings:
             st.warning(f"読み取り対象外のシートが{len(warnings)}件あります。例: {', '.join(warnings[:3])}")
         st.caption(f"収録調査日: {df['調査日'].min():%Y/%m/%d} ～ {df['調査日'].max():%Y/%m/%d} / {df['調査日'].nunique():,}日")
-        c1, c2, c3 = st.columns(3)
+        # 主要5商品は仮設定。実際の業務上の定義に合わせてここを変更可能。
+        preferred = ["楽天カード", "Paypayカード", "三井住友カード（NL）",
+                     "エポスカード", "JCB CARD W", "イオンカード"]
+        product_options = sorted(df["商品"].unique())
+        defaults = [p for p in preferred if p in product_options]
+        c1, c2 = st.columns([2, 1])
         with c1:
-            product = st.selectbox("対象商品", sorted(df["商品"].unique()), index=next((i for i,p in enumerate(sorted(df['商品'].unique())) if '楽天カード' in p),0), key="competitor_product")
+            products = st.multiselect(
+                "対象商品（複数選択可）", product_options, default=defaults,
+                key="competitor_products",
+            )
         with c2:
-            segment_options = sorted(df["セグメント"].unique())
-            segments = st.multiselect("セグメント", segment_options, default=segment_options, key="competitor_segments")
-        with c3:
-            period = st.selectbox("表示期間", [30,90,180,365,"全期間"], index=1, format_func=lambda x: f"過去{x}日" if isinstance(x,int) else x, key="competitor_period")
-        base = df[(df["商品"] == product) & df["セグメント"].isin(segments)].copy()
+            period = st.selectbox(
+                "表示期間", [30, 90, 180, 365, "全期間"], index=1,
+                format_func=lambda x: f"過去{x}日" if isinstance(x, int) else x,
+                key="competitor_period",
+            )
+        segment_options = sorted(df["セグメント"].unique())
+        segments = st.multiselect(
+            "セグメント", segment_options, default=segment_options,
+            key="competitor_segments",
+        )
+        if not products or not segments:
+            st.info("商品とセグメントを選択してください。")
+            return
+        base = df[df["商品"].isin(products) & df["セグメント"].isin(segments)].copy()
         if base.empty:
             st.info("選択条件に該当するデータがありません。")
             return
         end = base["調査日"].max()
         if period != "全期間":
-            base = base[base["調査日"] >= end-pd.Timedelta(days=period-1)]
+            base = base[base["調査日"] >= end - pd.Timedelta(days=period - 1)]
         options = sorted(base["媒体"].unique())
-        media = st.multiselect("表示媒体", options, default=options[:min(8,len(options))], key="competitor_media")
-        selected = base[base["媒体"].isin(media)]
+        media = st.multiselect(
+            "表示媒体", options, default=options[:min(8, len(options))],
+            key="competitor_media",
+        )
+        selected = base[base["媒体"].isin(media)].copy()
         if selected.empty:
             st.info("表示する媒体を選択してください。")
             return
-        # 同一媒体に複数セグメントがある場合、混ぜずに別系列として表示する。
-        selected = selected.copy()
-        selected["系列"] = selected["媒体"] + " / " + selected["セグメント"]
         latest_date = selected["調査日"].max()
         latest = selected[selected["調査日"] == latest_date].sort_values("還元額", ascending=False)
-        k1,k2,k3 = st.columns(3)
+        k1, k2, k3 = st.columns(3)
         k1.metric("最新調査日", latest_date.strftime("%Y/%m/%d"))
         k2.metric("最新最高還元額", f"{latest['還元額'].max():,.0f}円")
         k3.metric("期間内最高還元額", f"{selected['還元額'].max():,.0f}円")
-        st.subheader("媒体別還元額推移")
-        fig, ax = plt.subplots(figsize=(11,4.5))
-        for label, group in selected.groupby("系列", sort=True):
-            series = group.sort_values("調査日").drop_duplicates("調査日", keep="last")
-            ax.step(series["調査日"], series["還元額"], where="post", label=label, linewidth=1.8)
+        st.subheader("媒体別・商品別還元額推移")
+        st.caption("横軸＝調査日、縦軸＝還元額。媒体名を左に、推移グラフを右に並べます。商品ごとに色分けし、セグメントは別線にします。")
         low, high = selected["還元額"].min(), selected["還元額"].max()
-        lower = max(0, math.floor((low-500)/1000)*1000)
-        upper = math.ceil((high+500)/1000)*1000
-        if upper <= lower: upper = lower+1000
-        ax.set_ylim(lower,upper)
-        ax.yaxis.set_major_locator(MultipleLocator(1000))
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda x,pos: f"{x:,.0f}円"))
-        ax.grid(axis="y", alpha=.25)
-        ax.legend(loc="upper left", bbox_to_anchor=(1.01,1), fontsize=8)
-        fig.autofmt_xdate()
-        st.pyplot(fig, use_container_width=True)
-        plt.close(fig)
-        st.caption("縦軸は1,000円刻み・範囲自動調整。調査日の値を次の調査日まで維持する階段表示です。未調査日の値を実測したものではありません。")
+        lower = max(0, math.floor((low - 500) / 1000) * 1000)
+        upper = math.ceil((high + 500) / 1000) * 1000
+        if upper <= lower:
+            upper = lower + 1000
+        # 各媒体で同一の縦軸範囲を使用し、媒体間の比較を可能にする。
+        for media_name in media:
+            part = selected[selected["媒体"] == media_name]
+            if part.empty:
+                continue
+            label_col, graph_col = st.columns([1, 5], vertical_alignment="center")
+            with label_col:
+                st.markdown(f"**{media_name}**")
+            with graph_col:
+                fig, ax = plt.subplots(figsize=(10, 2.5))
+                for (product_name, segment_name), group in part.groupby(["商品", "セグメント"], sort=True):
+                    series = group.sort_values("調査日").drop_duplicates("調査日", keep="last")
+                    label = product_name if len(segments) == 1 else f"{product_name} / {segment_name}"
+                    ax.step(series["調査日"], series["還元額"], where="post",
+                            label=label, linewidth=1.7)
+                ax.set_ylim(lower, upper)
+                ax.set_xlim(selected["調査日"].min(), selected["調査日"].max() + pd.Timedelta(days=1))
+                ax.yaxis.set_major_locator(MultipleLocator(1000))
+                ax.yaxis.set_major_formatter(FuncFormatter(lambda x, pos: f"{x:,.0f}"))
+                ax.grid(axis="y", alpha=.25)
+                ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=7)
+                fig.autofmt_xdate()
+                st.pyplot(fig, use_container_width=True)
+                plt.close(fig)
+        st.caption("縦軸は1,000円刻み・全媒体共通の自動範囲。還元額は丸めず、調査日間を階段表示します。")
         st.subheader("最新調査日の還元額一覧")
-        st.dataframe(latest[["媒体","セグメント","還元額"]], hide_index=True, width="stretch", column_config={"還元額":st.column_config.NumberColumn(format="%.1f 円")})
+        st.dataframe(
+            latest[["媒体", "商品", "セグメント", "還元額"]],
+            hide_index=True, width="stretch",
+            column_config={"還元額": st.column_config.NumberColumn(format="%.0f 円")},
+        )
         st.caption("0円は元ファイル記載値のまま表示します。掲載なしとの区別は元データ側の定義確認が必要です。")
