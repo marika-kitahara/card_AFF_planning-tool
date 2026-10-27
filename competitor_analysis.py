@@ -92,7 +92,7 @@ def show_competitor_analysis():
             )
         with c2:
             period = st.selectbox(
-                "表示期間", [30, 90, 180, 365, "全期間"], index=1,
+                "表示期間", [30, 90, 180, 365, "全期間"], index=0,
                 format_func=lambda x: f"過去{x}日" if isinstance(x, int) else x,
                 key="competitor_period",
             )
@@ -160,6 +160,11 @@ def show_competitor_analysis():
                         title=None,
                         range=[selected["調査日"].min(), selected["調査日"].max() + pd.Timedelta(days=1)],
                         tickformat="%m/%d",
+                        dtick=86400000,  # 1日 = 86,400,000ミリ秒
+                        tickangle=-55,
+                        tickfont=dict(size=9),
+                        showgrid=True,
+                        gridcolor="rgba(128,128,128,0.12)",
                     ),
                     yaxis=dict(
                         title=None, range=[lower, upper], tick0=0, dtick=1000,
