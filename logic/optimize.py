@@ -2,9 +2,6 @@ import pandas as pd
 
 def optimize_budget(df, mode="CV最大"):
 
-    # 最適プランではCPA<=0（マイナス/0円）の候補を採用しない。
-    # 返金・取消・調整等でcostが負になるローデータは残すが、
-    # 営業向けの「最適CPA」候補としては表示対象外にする。
     work = df.copy()
     if "cpa" in work.columns:
         cpa = pd.to_numeric(work["cpa"], errors="coerce")
