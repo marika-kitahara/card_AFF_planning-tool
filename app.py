@@ -1,7 +1,3 @@
-# -*- coding: utf-8 -*-
-# SUBMISSION_TEMPLATE_ALL_SHEETS_V5 = 2026-08-14
-# MergedCell-safe version
-
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
@@ -14,7 +10,6 @@ from io import BytesIO
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
 
-# Streamlit Cloudでもaptに依存せず日本語を描画できるようにする。
 try:
     import japanize_matplotlib  # noqa: F401
 except Exception:
@@ -33,10 +28,6 @@ from logic.simulation import simulate_plan
 from logic.optimize import optimize_budget
 from logic.analytics import prepare_monthly_performance, prepare_unit_price_band_matrix
 
-
-# -----------------------
-# ✅ 日付フォーマット
-# -----------------------
 def format_date(df, col="date"):
     return (
         pd.to_datetime(df[col])
@@ -44,10 +35,6 @@ def format_date(df, col="date"):
         .str.replace("/0", "/", regex=False)
     )
 
-
-# -----------------------
-# ✅ 帳票形式
-# -----------------------
 def create_report_table(df):
     """
     松竹梅・最適プラン表示用の高速版。
@@ -114,10 +101,6 @@ def create_report_table(df):
 
     return result
 
-
-# -----------------------
-# ✅ Excel
-# -----------------------
 def to_excel_multi(sim_df, opt_df):
 
     output = BytesIO()
@@ -128,10 +111,6 @@ def to_excel_multi(sim_df, opt_df):
 
     return output.getvalue()
 
-
-# -----------------------
-# ✅ 提出用Excel（最適プランのみ / 添付テンプレ全シート再現）
-# -----------------------
 def _template_path() -> Path:
     base = Path(__file__).resolve().parent
     candidates = [
@@ -186,7 +165,6 @@ def _set_value(ws, row, col, value):
         return
     cell.value = value
 
-
 def _set_percent(ws, row, col, value):
     """0.583 をExcel上で58.3%表示にする。"""
     cell = ws.cell(row, col)
@@ -194,9 +172,6 @@ def _set_percent(ws, row, col, value):
         return
     cell.value = value
     cell.number_format = "0.0%"
-
-
-
 
 def _calculate_media_approval_rates(history_df: pd.DataFrame) -> dict:
     """
@@ -289,7 +264,6 @@ def _calculate_media_approval_rates(history_df: pd.DataFrame) -> dict:
         )
     )
 
-    # どの媒体でも必ず率が取れるよう全体率を保持
     rate_map["__overall__"] = overall_rate
     return rate_map
 
@@ -358,8 +332,6 @@ def _calculate_period_media_metrics(history_df: pd.DataFrame):
             if total_base > 0 else 0.0
         )
 
-        # 媒体ごとの「最新の正のグロス単価」を採用。
-        # 同一最新日に複数行ある場合はCV加重平均。
         positive = sub[sub["gross_unit"].gt(0) & sub["date"].notna()].copy()
         unit_map = {}
         if not positive.empty:
@@ -376,7 +348,6 @@ def _calculate_period_media_metrics(history_df: pd.DataFrame):
             latest = daily_unit.groupby("media", as_index=False).tail(1)
             unit_map = dict(zip(latest["media"], latest["unit"].astype(float)))
 
-        # フォールバックは全該当実績のCV加重グロス単価。
         total_weight = float((positive["gross_unit"] * positive["cv"].clip(lower=0)).sum()) if not positive.empty else 0.0
         total_unit_cv = float(positive["cv"].clip(lower=0).sum()) if not positive.empty else 0.0
         overall_unit = total_weight / total_unit_cv if total_unit_cv > 0 else 0.0
@@ -459,8 +430,6 @@ def _build_manual_settings_defaults(
         / totals["plan_cv"].replace(0, pd.NA)
     ).fillna(0)
 
-    # 手動設定の初期「今回採用件数」は、最適化後の件数ではなく
-    # 掲載状態反映後のForecastをそのまま使う。
     forecast_count_map = {}
     if forecast_df is not None and not forecast_df.empty:
         f = forecast_df.copy()
@@ -473,7 +442,6 @@ def _build_manual_settings_defaults(
                 f.groupby("media")["forecast_cv"].sum().to_dict()
             )
 
-            # 最適化結果に出ていない媒体でもForecastが正なら手動設定へ残す。
             existing_media = set(totals["media"].astype(str))
             missing_rows = [
                 {
@@ -494,7 +462,6 @@ def _build_manual_settings_defaults(
 
     period = _calculate_period_media_metrics(history_df)
 
-    # SID
     sid_map = {}
     if "SID" in history_df.columns:
         sid_source = history_df[["media", "SID"]].copy()
@@ -517,7 +484,6 @@ def _build_manual_settings_defaults(
         media = str(r.media)
         opt_unit = float(r.opt_unit or 0)
 
-        # 複合施策時は、施策別予測CVを重みにして承認率・グロス単価をブレンドする。
         media_plan = plan[plan["media"].eq(media)].copy()
         if "CPN名" in media_plan.columns and not media_plan.empty:
             mix = media_plan.groupby("CPN名", as_index=False)["cv"].sum()
@@ -552,8 +518,6 @@ def _build_manual_settings_defaults(
             if gross_unit <= 0:
                 gross_unit = opt_unit
 
-        # Forecastが取得できる場合は掲載状態反映後Forecastを優先。
-        # Forecastが無い場合だけ従来の最適化後件数へフォールバック。
         adopted_count = float(forecast_count_map.get(media, r.plan_cv or 0))
         approved_count = adopted_count * float(rate or 0)
         cost = approved_count * float(gross_unit or 0)
@@ -620,8 +584,6 @@ def _normalize_manual_settings(df: pd.DataFrame) -> pd.DataFrame:
         out["今回採用件数"]
         * out["今回プラン採用承認率"]
     )
-    # 営業プランの定義に合わせ、費用は編集値ではなく自動計算する。
-    # 発行コスト = 発行見込み(承認件数) × 今回プラン採用グロス単価
     out["費用"] = (
         out["承認件数"]
         * out["今回プラン採用グロス単価"]
@@ -694,7 +656,6 @@ def render_manual_settings(
             forecast_df=forecast_df,
         )
 
-        # 計算条件が変わった時だけEditorのwidget stateもリセット
         old_widget_key = st.session_state.get("_manual_widget_key")
         if old_widget_key:
             st.session_state.pop(old_widget_key, None)
@@ -782,7 +743,6 @@ def render_manual_settings(
     normalized = _normalize_manual_settings(edited)
     st.session_state["_manual_settings"] = normalized
 
-    # 派生値はEditorの下に必ず最新値を表示。
     total_count = normalized["今回採用件数"].sum()
     total_issue = normalized["承認件数"].sum()
     total_cost = normalized["費用"].sum()
@@ -795,7 +755,6 @@ def render_manual_settings(
     c3.metric("全体承認率", f"{overall_rate:.1%}")
     c4.metric("全体発行CPA", f"¥{overall_cpa:,.0f}")
 
-    # 自動計算結果の確認用
     derived = normalized[
         [
             "媒体名",
@@ -846,12 +805,10 @@ def _resolve_submission_cpn_month(cpn_master, start_date, end_date=None):
     start = pd.Timestamp(start_date).normalize()
     end = pd.Timestamp(end_date).normalize() if end_date is not None else start
 
-    # まず予測開始日そのもののCPN月度を正とする。
     exact = master.loc[master["日付"].eq(start), "月度"]
     if not exact.empty:
         label = str(exact.iloc[0])
     else:
-        # 開始日に行がない場合だけ、予測対象期間内で最頻の月度を採用する。
         in_range = master.loc[master["日付"].between(start, end), "月度"]
         if in_range.empty:
             return fallback_label, fallback_ts.year, fallback_ts.month
@@ -862,7 +819,6 @@ def _resolve_submission_cpn_month(cpn_master, start_date, end_date=None):
     if m:
         return label, int(m.group(1)), int(m.group(2))
     return label, fallback_ts.year, fallback_ts.month
-
 
 def _copy_cell_style_and_format(src, dst):
     """セルの値以外の表示設定を複製する。"""
@@ -880,7 +836,6 @@ def _copy_cell_style_and_format(src, dst):
         dst.alignment = copy(src.alignment)
     if src.protection:
         dst.protection = copy(src.protection)
-
 
 def _extend_sheet_date_columns(ws, first_date_col, base_slots, required_slots, total_col):
     """33日テンプレートを必要日数まで右方向へ拡張し、Total列を後ろへ送る。"""
@@ -905,7 +860,6 @@ def _extend_sheet_date_columns(ws, first_date_col, base_slots, required_slots, t
 
     return total_col + extra
 
-
 def _extend_summary_date_rows(ws, base_slots, required_slots, first_data_row=3, total_row=36):
     """全体サマリの33日分行を必要日数まで下方向へ拡張する。"""
     required_slots = max(int(required_slots), int(base_slots))
@@ -925,7 +879,6 @@ def _extend_summary_date_rows(ws, base_slots, required_slots, first_data_row=3, 
             ws.cell(new_row, col).value = None
 
     return total_row + extra
-
 
 def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings, start_date, end_date, selected_cpn, opt_mode):
     """
@@ -954,7 +907,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
     plan["cv"] = pd.to_numeric(plan["cv"], errors="coerce").fillna(0)
     plan["cost"] = pd.to_numeric(plan["cost"], errors="coerce").fillna(0)
 
-    # 複合施策では「開始～終了の連続日」ではなく、実際に予測した対象日だけを出力する。
     dates = sorted(pd.Timestamp(x).normalize() for x in plan["date"].dropna().unique())
 
     daily = (
@@ -976,10 +928,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
     )
     base_media_totals["media"] = base_media_totals["media"].astype(str)
 
-    # ---------------------------------------------------------
-    # 手動設定を最終提出値として採用。
-    # 日次件数は、元の最適プラン日次構成比を維持して再配分する。
-    # ---------------------------------------------------------
     manual = _normalize_manual_settings(manual_settings)
     manual["媒体名"] = manual["媒体名"].astype(str)
 
@@ -1032,7 +980,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
         )
     )
 
-    # 元日次Forecastを今回採用件数へ比例配分。
     cv_map = {}
     for row in daily.itertuples():
         dt = pd.Timestamp(row.date).normalize()
@@ -1047,7 +994,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
         )
         cv_map[(dt, media)] = float(row.cv) * scale
 
-    # 端数差が出ても媒体Totalが手動入力値と一致するよう、最後の日へ差分を寄せる。
     dates_by_media = {}
     for dt, media in cv_map.keys():
         dates_by_media.setdefault(media, []).append(dt)
@@ -1067,7 +1013,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
             + diff
         )
 
-    # 過去実績の定常・マジ得指標は、提出用Excelの参考列用に残す。
     period_metrics = _calculate_period_media_metrics(history_df)
     normal_rate_map = period_metrics["normal_rate"]
     magi_rate_map = period_metrics["magi_rate"]
@@ -1076,7 +1021,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
     magi_unit_map = period_metrics["magi_unit"]
     magi_unit_all = period_metrics["magi_unit_all"]
 
-    # 未来日ごとのCPN区分。複合施策時はUI選択を保持したplan側を最優先。
     future_cpn_map = {}
     if "CPN名" in plan.columns:
         fm = plan[["date", "CPN名"]].dropna(subset=["date"]).drop_duplicates(subset=["date"], keep="last")
@@ -1087,13 +1031,11 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
         fm = fm.dropna(subset=["日付"])
         future_cpn_map = dict(zip(fm["日付"], fm["CPN名"]))
 
-    # 発行数 = 手動設定後Forecast × 手動承認率
     issue_map = {}
     for (dt, media), cv in cv_map.items():
         rate = manual_rate_map.get(media, 0.0)
         issue_map[(dt, media)] = cv * rate
 
-    # 費用はユーザー入力総額を正として、日次承認件数の構成比で配分。
     expected_cost_map = {}
     for media in media_list:
         media_dates = sorted(dates_by_media.get(media, []))
@@ -1120,7 +1062,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
                 )
                 expected_cost_map[(dt, media)] = total_cost * share
 
-        # 費用Totalの丸め差は最後の日へ寄せる。
         if media_dates:
             assigned = sum(
                 expected_cost_map.get((dt, media), 0.0)
@@ -1133,7 +1074,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
                 + diff
             )
 
-    # Promotion Detail等は今回採用グロス単価を表示。
     period_unit_map = {
         (dt, media): manual_gross_unit_map.get(media, 0.0)
         for (dt, media) in cv_map.keys()
@@ -1154,7 +1094,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
             + expected_cost_map.get((dt, media), 0.0)
         )
 
-    # 参考列用：今回採用件数を未来CPN区分に応じて分割。
     normal_forecast_by_media = {m: 0.0 for m in media_list}
     magi_forecast_by_media = {m: 0.0 for m in media_list}
 
@@ -1184,7 +1123,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
         for m in media_list
     }
 
-    # 後段互換用。
     opt_unit_map = manual_gross_unit_map
     cpa_map = {
         key: (
@@ -1196,7 +1134,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
         for key in cv_map.keys()
     }
 
-    # SIDは実績CSVのF列を正とする。
     sid_map = {}
     if "SID" in history_df.columns:
         sid_source = history_df[["media", "SID"]].copy()
@@ -1212,13 +1149,9 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
     template = _template_path()
     wb_out = load_workbook(template)
 
-    # 今回は短縮承認系2シートを成果物から除外。
     for remove_name in ["短縮承認除外", "短縮承認日程"]:
         if remove_name in wb_out.sheetnames:
             del wb_out[remove_name]
-
-    # 高速テンプレートは数式依存を最小化しているため、
-    # 保存時の強制フル再計算指定は行わない。
 
     main_old_name = "10月（既存移管合算）"
     main_ws = (
@@ -1227,8 +1160,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
         else wb_out.worksheets[2]
     )
 
-    # テンプレにあるSID→媒体区分の対応を先に取得してから、
-    # 明細の既存値をクリアする。
     template_type_by_sid = {}
     template_type_by_media = {}
     for r in range(1, main_ws.max_row + 1):
@@ -1249,15 +1180,8 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
             or "ポイントサイト"
         )
 
-    # =========================================================
-    # 1) メインシート：○月（既存移管合算）
-    # =========================================================
     new_main_name = f"{pd.Timestamp(start_date).month}月（既存移管合算）"
     main_ws.title = new_main_name
-
-    # 最小テンプレートは他シートから旧シート名を参照する数式を持たないため、
-    # 全ワークシート・全セルの走査は行わない。
-    # これにより提出用Excel生成時の処理時間を大幅に削減する。
 
     first_date_col = 25  # Y
     base_date_slots = 33
@@ -1271,7 +1195,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
         total_col=total_col,
     )
 
-    # 上部サマリの日付・Target/Actual/GAP
     _set_date_slots(main_ws, 2, first_date_col, date_slots, dates, total_col)
     _set_date_slots(main_ws, 7, first_date_col, date_slots, dates, total_col)
 
@@ -1292,7 +1215,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
     _set_value(main_ws, 4, total_col, 0)
     _set_value(main_ws, 5, total_col, -round(sum(total_cv_by_date.values())))
 
-    # 媒体区分ごとの上部4ブロックを最適プランから再集計。
     group_rows = {}
     for r in range(8, 21):
         label = main_ws.cell(r, 4).value
@@ -1334,9 +1256,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
         _set_value(main_ws, start_row + 1, total_col, 0)
         _set_value(main_ws, start_row + 2, total_col, -total_val)
 
-    # 明細エリア
-    # 高速テンプレート側に150媒体×4行の空枠・書式を事前作成済み。
-    # ここでは行追加・全セルクリア・スタイルコピーを一切行わず、値だけ書く。
     detail_start = 21
 
     for idx, media in enumerate(media_list, start=0):
@@ -1352,7 +1271,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
         )
         overall_cpa = round(total_cost / total_cv) if total_cv else 0
 
-        # 左側情報
         _set_value(main_ws, r0, 2, idx + 1)
         _set_value(main_ws, r0, 3, sid)
         _set_value(main_ws, r0, 4, media)
@@ -1395,14 +1313,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
         _set_value(main_ws, r0 + 2, total_col, overall_cpa)
         _set_value(main_ws, r0 + 3, total_col, -total_cv)
 
-    # =========================================================
-    # 2) 件数 / 3) 発行 / 4) コスト計算
-    # 3シートとも同じ列構造:
-    # A SID / B 媒体名 / C 単価①最適 / D 単価②マジ得 /
-    # E 定常承認率 / F 定常発行数 /
-    # G マジ得承認率 / H マジ得発行数 /
-    # I:AO 日次 / AP Total
-    # =========================================================
     metric_specs = [
         ("件数(合算）", "count"),
         ("発行(合算）", "issue"),
@@ -1424,7 +1334,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
             required_slots=date_slots,
             total_col=metric_total_col,
         )
-        # 1行目のタイトル結合範囲も拡張後のTotal列まで広げる。
         try:
             for rng in list(ws.merged_cells.ranges):
                 if rng.min_row == 1 and rng.max_row == 1 and rng.min_col == 1:
@@ -1442,7 +1351,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
             metric_total_col,
         )
 
-        # 固定列ヘッダーを毎回明示。
         headers = [
             "SID",
             "媒体名",
@@ -1470,11 +1378,9 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
             _set_value(ws, r, 1, sid_map.get(media, ""))
             _set_value(ws, r, 2, media)
 
-            # Cは今回の手動採用グロス単価。
             _set_value(ws, r, 3, round(opt_unit))
             _set_value(ws, r, 4, round(magi_unit))
 
-            # Eは過去定常の参考値、Gは今回採用承認率を反映。
             _set_percent(ws, r, 5, normal_rate)
             _set_value(ws, r, 6, round(normal_issue_by_media.get(media, 0)))
             _set_percent(ws, r, 7, manual_rate)
@@ -1504,9 +1410,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
 
             _set_value(ws, r, metric_total_col, round(row_total))
 
-    # =========================================================
-    # 5) 全体サマリ
-    # =========================================================
     sws = wb_out["全体サマリ（定常期間サマリ）"]
     summary_total_row = _extend_summary_date_rows(
         sws,
@@ -1542,7 +1445,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
             if not isinstance(sws.cell(r, 1), MergedCell):
                 sws.cell(r, 1).number_format = "m/d"
 
-            # A日付 B目標 CForecast DGAP E発行 F発行GAP G承認率 H発行コスト I発行CPA
             _set_value(sws, r, 2, forecast)
             _set_value(sws, r, 3, forecast)
             _set_value(sws, r, 4, 0)
@@ -1572,11 +1474,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
     _set_value(sws, summary_total_row, 8, sum_cost)
     _set_value(sws, summary_total_row, 9, total_cpa)
 
-    # =========================================================
-    # 既存移管合算シート：不要列 E:W を最終出力時に削除
-    # =========================================================
-    # すべての値を書き込み終えた後に削除するため、
-    # 既存の列番号ベースの出力処理には影響しない。
     main_ws.delete_cols(5, 19)  # E:W（19列）
 
     output = BytesIO()
@@ -1584,10 +1481,6 @@ def create_submission_excel(opt_summary, history_df, cpn_master, manual_settings
     output.seek(0)
     return output.getvalue()
 
-
-# -----------------------
-# ✅ 提出用Excelダウンロード専用Fragment
-# -----------------------
 def _submission_download_body(
     opt_summary,
     history_df,
@@ -1629,26 +1522,17 @@ def _submission_download_body(
         width="stretch",
     )
 
-
-# st.fragment が使えるStreamlitでは、
-# このボタン操作だけを独立再実行する。
 if hasattr(st, "fragment"):
     render_submission_download = st.fragment(
         _submission_download_body
     )
 else:
-    # 古いStreamlitでも起動自体は可能。
     render_submission_download = _submission_download_body
 
-
-# -----------------------
-# ✅ 補助関数
-# -----------------------
 def _truthy(series: pd.Series) -> pd.Series:
     return series.astype(str).str.strip().str.lower().isin(
         {"1", "true", "yes", "y", "○", "〇", "あり", "有", "実施"}
     )
-
 
 def _normalize_sid(value) -> str:
     if pd.isna(value):
@@ -1660,13 +1544,11 @@ def _normalize_sid(value) -> str:
         return text[:-2]
     return text
 
-
 def _figure_png_bytes(fig, dpi: int = 180) -> bytes:
     buffer = BytesIO()
     fig.savefig(buffer, format="png", dpi=dpi, bbox_inches="tight")
     buffer.seek(0)
     return buffer.getvalue()
-
 
 def _get_japanese_font_properties():
     """日本語フォントを安全に取得する。
@@ -1689,7 +1571,6 @@ def _get_japanese_font_properties():
                     plt.rcParams["font.family"] = family
                     plt.rcParams["axes.unicode_minus"] = False
                     return prop
-            # 同梱フォントのパス構成が変わっても探索できるようにする。
             for path in pkg_dir.rglob("*.ttf"):
                 try:
                     font_manager.fontManager.addfont(str(path))
@@ -1730,7 +1611,6 @@ def _get_japanese_font_properties():
         except Exception:
             continue
     return None
-
 
 def _render_png_actions(png_bytes: bytes, file_name: str, download_key: str, copy_key: str):
     """PNG保存とクリップボードへの画像コピーを横並びで表示する。"""
@@ -1775,7 +1655,6 @@ def _render_png_actions(png_bytes: bytes, file_name: str, download_key: str, cop
         """
         components.html(html, height=62)
 
-
 def _chart_month_label(value) -> str:
     """日本語フォントが無い場合にも文字化けしない月度ラベルへ変換する。"""
     text = str(value).strip()
@@ -1784,7 +1663,6 @@ def _chart_month_label(value) -> str:
     if match:
         return f"{match.group(1)}/{int(match.group(2)):02d}"
     return text
-
 
 def render_history_analytics(
     history_df: pd.DataFrame,
@@ -1903,8 +1781,6 @@ def render_history_analytics(
                 index=0,
             )
 
-        # 1,000円刻み等で単価帯が大量発生してもクラッシュしないよう、
-        # 表示系列数は最大40帯に制御。超過分は高単価側を「○円以上」に集約する。
         band_matrix = prepare_unit_price_band_matrix(
             analytics_df,
             band_step=int(band_step),
@@ -1912,7 +1788,6 @@ def render_history_analytics(
             max_bands=40,
         )
 
-        # 今回プラン（手動設定後）を同じ単価帯グラフへ追加。
         if current_chart_plan is not None and not current_chart_plan.empty:
             cp = _normalize_manual_settings(current_chart_plan)
             cp["unit_price"] = pd.to_numeric(
@@ -1935,7 +1810,6 @@ def render_history_analytics(
                     upper = lower + int(band_step) - 1
                     current_labels[lower] = f"¥{lower:,}–¥{upper:,}"
 
-                # 既存履歴側の帯と今回帯を和集合にする。
                 if band_matrix.empty:
                     band_matrix = pd.DataFrame(index=["今回"])
                     band_matrix.index.name = "月度"
@@ -1948,7 +1822,6 @@ def render_history_analytics(
                 for _, r in current.iterrows():
                     band_matrix.loc["今回", current_labels[int(r["band_lower"])]] = float(r[metric_col])
 
-        # 今回分を足した結果も最大40帯に制御し、細かい刻みでのメモリ急増を防ぐ。
         if not band_matrix.empty and len(band_matrix.columns) > 40:
             import re
             def _band_lower_from_label(label):
@@ -1984,7 +1857,6 @@ def render_history_analytics(
             if jp_font:
                 for tick in ax_band.get_xticklabels():
                     tick.set_fontproperties(jp_font)
-            # 凡例の縦長化でPNGが巨大化しないよう、系列数に応じて複数列化。
             legend_cols = max(1, min(4, (len(plot_matrix.columns) + 14) // 15))
             legend_prop = jp_font.copy() if jp_font is not None else None
             if legend_prop is not None:
@@ -2002,7 +1874,6 @@ def render_history_analytics(
             ax_band.grid(axis="y", alpha=0.25)
             fig_band.tight_layout()
             st.pyplot(fig_band, width="stretch")
-            # 積み上げグラフは系列数が多いため、PNG生成時のメモリ使用量も抑える。
             band_png = _figure_png_bytes(fig_band, dpi=140)
             _render_png_actions(
                 band_png,
@@ -2037,10 +1908,6 @@ def _calculate_normal_month_base(
 
     return calculate_normal_month_base(history_df, selected_months, calendar_dates=calendar_dates)
 
-
-
-
-
 def _cpn_month_sort_key(label: str):
     """CPNマスタの月度ラベルを日付範囲ではなくラベル自体で時系列化する。"""
     import re
@@ -2052,7 +1919,6 @@ def _cpn_month_sort_key(label: str):
     if m:
         return (int(m.group(1)), int(m.group(2)), text)
     return (9999, 99, text)
-
 
 def _get_cpn_normal_months(cpn_master: pd.DataFrame) -> list[str]:
     """CPNマスタ上の定常月度を、CPN月度ラベル順で返す。"""
@@ -2073,7 +1939,6 @@ def _get_cpn_normal_months(cpn_master: pd.DataFrame) -> list[str]:
     )
     return sorted(labels, key=_cpn_month_sort_key)
 
-
 def _candidate_learning_counts(available_prior: int) -> list[int]:
     """ユーザー操作ではなく、内部バックテストで比較する候補。"""
     base = [2, 3, 4, 6, 9, 12]
@@ -2081,7 +1946,6 @@ def _candidate_learning_counts(available_prior: int) -> list[int]:
     if not candidates and available_prior >= 1:
         candidates = [available_prior]
     return candidates
-
 
 def _select_learning_month_count(
     history_df: pd.DataFrame,
@@ -2097,7 +1961,6 @@ def _select_learning_month_count(
     if not candidates:
         raise ValueError("バックテスト対象月より前の学習月度がありません。")
 
-    # 対象月の直前から最大3月度を検証。各検証月度の実績はその予測には使わない。
     validation_months = month_labels[max(0, target_idx - 3):target_idx]
     rows = []
     for n in candidates:
@@ -2146,7 +2009,6 @@ def _select_learning_month_count(
     ).reset_index(drop=True)
     return int(score_df.iloc[0]["学習月度数"]), score_df
 
-
 def _run_normal_backtest(
     history_df: pd.DataFrame,
     cpn_master: pd.DataFrame,
@@ -2163,12 +2025,10 @@ def _run_normal_backtest(
     work["月度"] = work["月度"].astype("string").str.strip()
     work["CPN名"] = work["CPN名"].astype("string").str.strip()
 
-    # バックテストの「月度」は暦月ではなくCPNマスタの月度を唯一の基準にする。
     master = cpn_master.copy()
     master["日付"] = pd.to_datetime(master["日付"], errors="coerce").dt.normalize()
     master["月度"] = master["月度"].astype("string").str.strip()
     master["CPN名"] = master["CPN名"].astype("string").str.strip()
-    # 月度の順番は対象日のmin/maxではなく、CPNマスタの月度ラベルを正とする。
     month_labels = _get_cpn_normal_months(master)
     if str(target_month) not in month_labels:
         raise ValueError(f"CPNマスタに {target_month} の定常月度がありません。")
@@ -2186,18 +2046,10 @@ def _run_normal_backtest(
     target_dates = pd.to_datetime(target_calendar["日付"], errors="coerce").dropna().dt.normalize()
     target_start = pd.Timestamp(target_dates.min()).normalize()
     target_end = pd.Timestamp(target_dates.max()).normalize()
-
-    # CPN月度厳密版: バックテスト対象期間はCPNマスタの日付集合を唯一の正とする。
-    # ローデータ側の「月度」列が暦月や旧マスタ由来でも、対象期間の判定には使用しない。
     target_date_set = set(target_dates.tolist())
-
-    # 学習は対象CPN月度の開始日前日を基準に、そこから直近60暦日に固定する。
-    # CPN月度の日数・その中の定常日数が不均一でも、同じ時間幅で現在の媒体力を評価する。
     learning_score_table = pd.DataFrame()
     cutoff_date = target_start - pd.Timedelta(days=1)
     requested_learning_start = cutoff_date - pd.Timedelta(days=59)
-    # 最大60日を使う。ただしローデータが60日未満しかない場合は、
-    # 実際に存在する最古日から学習し、存在しない過去日を0CV扱いしない。
     available_before_cutoff = work.loc[work["date"].le(cutoff_date), "date"].dropna()
     if available_before_cutoff.empty:
         raise ValueError("予測基準日以前の実績データがありません。")
@@ -2205,7 +2057,6 @@ def _run_normal_backtest(
     learning_start = max(requested_learning_start, earliest_available_date)
     training = work.loc[work["date"].between(learning_start, cutoff_date)].copy()
 
-    # 実際にデータが存在する学習期間内のCPN定常日だけを0CV日の分母に使う。
     learning_calendar_dates = (
         master.loc[
             master["日付"].between(learning_start, cutoff_date)
@@ -2232,8 +2083,6 @@ def _run_normal_backtest(
         training, learning_months, calendar_dates=learning_calendar_dates
     )
 
-    # 学習データ監査: 予測ロジックは変えず、「実際に何を学習対象にしたか」だけ可視化する。
-    # CPNマスタ上の対象日数と、ローデータ上の実績量を月度別に並べる。
     learning_audit_rows = []
     for lm in learning_months:
         lm_master_dates = (
@@ -2278,7 +2127,6 @@ def _run_normal_backtest(
         "休眠除外媒体数": int(len(inactive_audit)),
     }
 
-    # 対象月のカレンダー条件は上でCPNマスタから確定済み。
     future = pd.DataFrame({"date": sorted(target_calendar["日付"].dropna().unique())}).merge(base_pair, how="cross")
     future["date"] = pd.to_datetime(future["date"]).dt.normalize()
     future["weekday"] = future["date"].dt.day_name()
@@ -2295,9 +2143,6 @@ def _run_normal_backtest(
 
     forecast = forecast_cv(future, factor_tables)
 
-    # 診断列は forecast.py 側でも生成するが、旧ファイルとの混在や
-    # デプロイ差し替え漏れがあってもバックテスト自体が落ちないよう、
-    # ここでも不足列を再構築する。最終予測式は従来と同一。
     stage_formulas = {
         "stage_base_cv": ("base_cv", "cpn_factor"),
         "stage_unit_price_cv": ("stage_base_cv", "unit_price_factor"),
@@ -2321,9 +2166,6 @@ def _run_normal_backtest(
     if "forecast_cv" not in forecast.columns:
         forecast["forecast_cv"] = forecast["stage_line_cv"]
 
-    # 掲載有無は過去CVだけでは完全には予知できないため、
-    # バックテストでは「未定」として過去の月度間掲載継続率を期待値に反映する。
-    # 対象月の実績は一切使わず、予測基準日までの履歴だけで算出する。
     continuation_bt = calculate_media_continuation_table(
         work.loc[work["date"].le(cutoff_date)].copy(),
         cpn_master=master,
@@ -2357,8 +2199,6 @@ def _run_normal_backtest(
         )
     )
 
-    # 実績比較もCPNマスタの日付集合だけで切る。
-    # ローデータの月度ラベルには依存しない。
     actual = work.loc[work["date"].isin(target_date_set)].copy()
     actual_daily = (
         actual.groupby(["date", "media"], as_index=False)
@@ -2386,7 +2226,6 @@ def _run_normal_backtest(
             絶対誤差=("絶対誤差", "sum"),
         )
     )
-    # 各補正が予測総量を何CV動かしたか。暴走地点の特定に使う。
     media_compare["単価影響CV"] = media_compare["単価補正後CV"] - media_compare["基礎CV"]
     media_compare["曜日影響CV"] = media_compare["曜日補正後CV"] - media_compare["単価補正後CV"]
     media_compare["需要期影響CV"] = media_compare["需要期補正後CV"] - media_compare["曜日補正後CV"]
@@ -2401,8 +2240,6 @@ def _run_normal_backtest(
     )
     media_compare["掲載継続影響CV"] = media_compare["予測CV"] - media_compare["掲載判定前CV"]
 
-    # バックテスト対象月度にローデータ上の行が存在した媒体を「掲載あり」とする。
-    # CV=0でも行が存在すれば掲載ありとして扱い、CV発生有無と掲載有無を混同しない。
     target_published_media = set(actual["media"].dropna().astype(str).unique()) if not actual.empty else set()
     media_compare["対象月掲載実績"] = np.where(
         media_compare["media"].astype(str).isin(target_published_media),
@@ -2410,7 +2247,6 @@ def _run_normal_backtest(
         "掲載なし",
     )
 
-    # 予測の土台を監査できるよう、稼働率×稼働時CVの内訳を媒体別結果へ付与。
     diagnostics = calculate_normal_media_diagnostics(training, learning_months, calendar_dates=learning_calendar_dates)
     if not diagnostics.empty:
         diagnostics = diagnostics.rename(columns={
@@ -2422,7 +2258,6 @@ def _run_normal_backtest(
         })
         media_compare = media_compare.merge(diagnostics, on="media", how="left")
 
-    # 単価感応度の監査情報。予測にはtarget月実績を使わず、trainingだけから推定する。
     price_diag = calculate_unit_price_response_table(training, learning_months)
     if not price_diag.empty:
         price_diag = price_diag.rename(columns={
@@ -2441,7 +2276,6 @@ def _run_normal_backtest(
             1.0,
         )
 
-    # 対象月の実績単価は「説明用」だけに付ける。予測計算には一切利用しない。
     if not actual.empty:
         actual_price = actual.groupby("media", as_index=False).agg(
             _actual_cv=("cv", "sum"), _actual_cost=("cost", "sum")
@@ -2457,7 +2291,6 @@ def _run_normal_backtest(
     total_forecast = float(daily_compare["forecast_cv"].sum())
     total_actual = float(daily_compare["actual_cv"].sum())
 
-    # 営業向けバックテストは「対象月度に実際に掲載があった媒体」だけを自動抽出して評価する。
     published_mask = media_compare["media"].astype(str).isin(target_published_media)
     published_media_forecast = float(media_compare.loc[published_mask, "予測CV"].sum())
     published_media_actual = float(media_compare.loc[published_mask, "実績CV"].sum())
@@ -2471,7 +2304,6 @@ def _run_normal_backtest(
         if published_media_actual else np.nan
     )
 
-    # 全媒体ベースの値は分析用として残す。
     continued_media_raw_forecast = float(media_compare.loc[published_mask, "掲載判定前CV"].sum())
     publication_end_raw_forecast = total_forecast_before_publication - continued_media_raw_forecast
     continued_media_raw_error_rate = (continued_media_raw_forecast - published_media_actual) / published_media_actual if published_media_actual else np.nan
@@ -2521,7 +2353,6 @@ def _run_normal_backtest(
         "learning_summary": learning_summary,
     }
 
-
 def _prepare_af_history(uploaded_af_apply, uploaded_af_issue, af_code_master, cpn_master):
     """AF申込/発行を日次で結合し、CPN名・月度をTGと同じ日付基準で付与する。"""
     frames = []
@@ -2552,7 +2383,6 @@ def _prepare_af_history(uploaded_af_apply, uploaded_af_issue, af_code_master, cp
         .astype("string").str.strip().replace("", pd.NA).fillna("未設定")
     )
     return af.drop(columns=["日付"], errors="ignore").sort_values("date").reset_index(drop=True)
-
 
 def _prepare_af_code_history(uploaded_af_apply, uploaded_af_issue, af_code_master, cpn_master):
     """AF申込/発行を日付×AFコード単位で結合し、月度を付与する。"""
@@ -2586,7 +2416,6 @@ def _prepare_af_code_history(uploaded_af_apply, uploaded_af_issue, af_code_maste
         af["月度"] = af["月度"].astype("string").str.strip().replace("", pd.NA).fillna("未設定")
     return af.sort_values(["date", "AFコード"]).reset_index(drop=True)
 
-
 def _tg_daily_measurement(history_df):
     if history_df is None or history_df.empty:
         return pd.DataFrame(columns=["date", "TG申込", "TG発行", "CPN名", "月度"])
@@ -2600,7 +2429,6 @@ def _tg_daily_measurement(history_df):
         meta = work[meta_cols].drop_duplicates(subset=["date"], keep="last")
         agg = agg.merge(meta, on="date", how="left")
     return agg
-
 
 def _render_measurement_tabs(tg_df=None, af_df=None, af_code_df=None, key_prefix="measurement"):
     """TG/AF単独表示と差分を、共通の期間・月度フィルタで表示する。"""
@@ -2754,8 +2582,6 @@ def _render_measurement_tabs(tg_df=None, af_df=None, af_code_df=None, key_prefix
                         fill_value=0,
                     )
 
-                    # 月度はCPNマスタに付与された値をそのまま表示し、
-                    # AFコード列はマスタ/実績側の並びに依存せず見やすく固定する。
                     pivot = pivot.reindex(sorted(pivot.columns.astype(str)), axis=1)
                     pivot = pivot.reset_index()
                     pivot.columns.name = None
@@ -2801,9 +2627,6 @@ def _render_measurement_tabs(tg_df=None, af_df=None, af_code_df=None, key_prefix
             st.dataframe(display, width="stretch", hide_index=True)
             st.caption("差分は TG − AF。プラスならTG計測の方が多く、マイナスならAF計測の方が多い値です。")
 
-# -----------------------
-# ✅ UI
-# -----------------------
 st.set_page_config(page_title="AFプランニングツール", layout="wide")
 st.title("📊 件数予測＆プランニングツール")
 st.caption(
@@ -2882,12 +2705,8 @@ if uploaded_master and has_any_actual:
                 history_df["date"],
                 errors="coerce",
             ).dt.normalize()
-            # バックテスト可否は媒体/商品IDで絞り込む前のTGローデータ最終日で判定する。
-            # 特定媒体に行がない日を「データ未完了」と誤判定しないため。
             tg_raw_max_date = history_df["date"].max()
 
-        # 同一Excel内の「CPNマスタ」「媒体名マスタ」を1回だけ読み込み、
-        # rerun時はキャッシュされた結果を再利用する。
         cpn_master, media_master, af_code_master = load_master_workbook_with_af(uploaded_master)
 
         required_master_columns = {"日付", "CPN名", "月度"}
@@ -2932,7 +2751,6 @@ if uploaded_master and has_any_actual:
                 "CPNマスタに有効な日付・CPN名がありません。"
             )
 
-        # 任意列。未登録なら補正なし。
         cpn_master["line_oa_flag"] = (
             _truthy(cpn_master["LINE OA配信"])
             if "LINE OA配信" in cpn_master
@@ -3029,7 +2847,6 @@ if uploaded_master and has_any_actual:
     all_product_ids = sorted(
         [x for x in history_df["商品ID"].dropna().astype(str).unique() if str(x).strip() != ""]
     )
-    # 商品IDは存在するものをすべてデフォルト選択（Select All状態）。
     default_product_ids = list(all_product_ids)
     selected_product_ids = st.sidebar.multiselect(
         "商品ID",
@@ -3076,12 +2893,7 @@ if uploaded_master and has_any_actual:
         history_df["media"].isin(selected_media)
     ].copy()
 
-    # 月度別過去実績分析はUI上部へ表示する。
-    # 今回プランは後段で確定するため、ここでは表示位置だけ確保し、
-    # 手動設定取得後にこのプレースホルダーへ描画する。
     history_analytics_placeholder = st.empty()
-
-    # 定常 / マジ得の承認率を画面でも確認。
     try:
         _period_preview = _calculate_period_media_metrics(history_df)
         approval_preview = pd.DataFrame(
@@ -3220,10 +3032,6 @@ if uploaded_master and has_any_actual:
             st.error("施策①と施策②の期間が重複しています。期間が重ならないように設定してください。")
             st.stop()
 
-    # 定常学習は、プランニング指定日ではなくローデータの最新日を基準に直近60暦日を使う。
-    # これにより、実績更新前に10月・11月など未来月をプランニングしても、
-    # 存在しない未来側の期間で学習窓が欠けないようにする。
-    # ※バックテストは別ロジックで、検証対象日より前の実績だけを使う仕様を維持する。
     needs_normal_learning = any(seg["cpn"] in normal_labels for seg in planning_segments)
     selected_learning_months = []
     normal_training_df = history_df
@@ -3352,8 +3160,6 @@ if uploaded_master and has_any_actual:
         hide_index=True,
     )
 
-    # 既存関数との互換用。提出用の代表施策は施策①とするが、
-    # 日別施策はfuture_df側へ保持して複合期間を正しく予測する。
     selected_cpn = selected_cpn_1
     start_date = min(seg["start"] for seg in planning_segments)
     end_date = max(seg["end"] for seg in planning_segments)
@@ -3367,10 +3173,6 @@ if uploaded_master and has_any_actual:
         index=1,
     )
 
-    # ---------------------------------------------------------
-    # 変動係数は同じ入力条件なら再計算しない。
-    # Excel生成ボタン等によるStreamlit再実行でも再利用する。
-    # ---------------------------------------------------------
     factor_cache_key = (
         tuple(selected_media),
         tuple(selected_product_ids),
@@ -3475,10 +3277,6 @@ if uploaded_master and has_any_actual:
                 hide_index=True,
             )
 
-    # ---------------------------------------------------------
-    # 定常媒体の掲載予定。過去データだけでは翌月度の掲載終了を完全には予知できないため、
-    # 営業が知っている情報を優先し、未定だけ過去の掲載継続率で期待値化する。
-    # ---------------------------------------------------------
     publication_factor_map = {m: 1.0 for m in selected_media}
     publication_status_map = {m: "掲載予定" for m in selected_media}
     continuation_table_main = pd.DataFrame()
@@ -3505,7 +3303,6 @@ if uploaded_master and has_any_actual:
             "営業側で把握している掲載予定を優先します。掲載予定は100%、掲載なしは0件、未定だけ過去の掲載継続率で期待値化します。"
         )
 
-        # 掲載状態はsession_stateへ保持し、表の再描画や一括変更でも選択を維持する。
         status_store = st.session_state.setdefault("_publication_status_values", {})
         for media in selected_media:
             status_store.setdefault(str(media), "未定")
@@ -3517,8 +3314,6 @@ if uploaded_master and has_any_actual:
         st.session_state["_publication_status_values"] = status_store
         st.session_state.setdefault("_publication_editor_version", 0)
 
-        # ExcelなどのA列SID / B列媒体名をそのまま貼り付けて、掲載媒体を一括反映できる。
-        # SIDを最優先で照合し、SIDが空欄・不一致の場合のみ媒体名で補完する。
         with st.expander("📋 掲載媒体をコピペで一括設定", expanded=False):
             st.caption(
                 "ExcelのA列=SID、B列=媒体名をそのままコピーして貼り付けてください。"
@@ -3537,7 +3332,6 @@ if uploaded_master and has_any_actual:
                 key="publication_apply_pasted_list",
                 type="primary",
             ):
-                # 現在選択中の媒体についてSIDマスタを作る。
                 media_sid_map = {}
                 if "SID" in history_df.columns:
                     sid_src = history_df[["media", "SID"]].copy()
@@ -3546,7 +3340,6 @@ if uploaded_master and has_any_actual:
                     sid_src = sid_src[sid_src["media"].isin([str(m) for m in selected_media])]
                     sid_src = sid_src[sid_src["SID"] != ""]
                     for media, grp in sid_src.groupby("media", sort=False):
-                        # 同一媒体に複数SIDがある場合も、どれか1つが一致すれば掲載予定にする。
                         media_sid_map[str(media)] = set(grp["SID"].astype(str))
 
                 sid_to_media = {}
@@ -3562,11 +3355,9 @@ if uploaded_master and has_any_actual:
                     line = raw_line.strip()
                     if not line:
                         continue
-                    # Excel貼り付けはタブ区切り。念のためカンマ区切りにも対応。
                     parts = [x.strip() for x in (line.split("\t") if "\t" in line else line.split(","))]
                     sid = _normalize_sid(parts[0]) if parts else ""
                     media_name = parts[1].strip() if len(parts) >= 2 else ""
-                    # ヘッダー行は読み飛ばす。
                     if sid.upper() == "SID" or media_name in {"媒体", "媒体名"}:
                         continue
                     input_rows += 1
@@ -3644,7 +3435,6 @@ if uploaded_master and has_any_actual:
             key=editor_key,
         )
 
-        # 編集結果を保存し、その場で予測係数へ反映する。
         updated_store = dict(status_store)
         for _, r in edited_publication.iterrows():
             media = str(r["媒体"])
@@ -3681,16 +3471,11 @@ if uploaded_master and has_any_actual:
         )
         st.caption("CPN月度厳密版：検証期間・実績集計ともにCPNマスタの日付を基準にしています。")
 
-        # 選択肢・月度順もローデータではなくCPNマスタを正とする。
         bt_master = cpn_master.copy()
         bt_master["日付"] = pd.to_datetime(bt_master["日付"], errors="coerce").dt.normalize()
         bt_master["月度"] = bt_master["月度"].astype("string").str.strip()
         bt_master["CPN名"] = bt_master["CPN名"].astype("string").str.strip()
         bt_month_labels = _get_cpn_normal_months(bt_master)
-        # 実績比較ができ、かつCPNマスタ上の対象最終日までTGローデータが到達している
-        # 「完了月度」だけをバックテスト候補にする。途中月度を完成実績として評価しない。
-        # 候補判定もローデータの月度ラベルには依存しない。
-        # CPNマスタ上の月度終了日までローデータが到達していれば検証可能とする。
         bt_options = []
         incomplete_bt_months = []
         for m in bt_month_labels[1:]:
@@ -3779,12 +3564,10 @@ if uploaded_master and has_any_actual:
                 ]
                 diagnostic_cols = [c for c in diagnostic_cols if c in bt_display.columns]
                 bt_export = bt_display[diagnostic_cols].rename(columns={"media": "媒体"})
-                # 文字列の判定列を数値変換すると空欄になるため、明示的に除外する。
                 numeric_diag = [c for c in bt_export.columns if c not in {"媒体", "誤差率", "対象月掲載実績"}]
                 for c in numeric_diag:
                     bt_export[c] = pd.to_numeric(bt_export[c], errors="coerce").round(2)
 
-                # 営業向けは、対象月度に実際に掲載があった媒体だけを自動抽出する。
                 bt_export_published = bt_export.loc[
                     bt_export["対象月掲載実績"].astype(str).eq("掲載あり")
                 ].copy() if "対象月掲載実績" in bt_export.columns else bt_export.copy()
@@ -3799,7 +3582,6 @@ if uploaded_master and has_any_actual:
                     type="primary",
                 )
 
-                # 営業向けの評価表は、掲載媒体かつ判断に必要な項目だけを表示する。
                 sales_cols = ["媒体", "予測CV", "実績CV", "差分", "誤差率"]
                 sales_cols = [c for c in sales_cols if c in bt_export_published.columns]
                 st.dataframe(
@@ -3808,7 +3590,6 @@ if uploaded_master and has_any_actual:
                     hide_index=True,
                 )
 
-                # 掲載されなかった媒体への予測や全媒体ベースの評価は、分析用として普段は隠す。
                 with st.expander("全媒体・掲載判定の詳細（分析用）"):
                     b1, b2, b3 = st.columns(3)
                     b1.metric("全媒体の最終予測", f"{bt_result.get('total_forecast', 0):,.0f}")
@@ -3831,7 +3612,6 @@ if uploaded_master and has_any_actual:
                         key=f"download_backtest_all_media_{bt_month_filename}",
                     )
 
-                # 学習データそのものを監査する。予測値には影響しない診断表示。
                 with st.expander("学習データ診断（分析用）"):
                     audit = bt_result.get("learning_audit", pd.DataFrame()).copy()
                     summary = bt_result.get("learning_summary", {})
@@ -3856,7 +3636,6 @@ if uploaded_master and has_any_actual:
                         audit["CV合計"] = pd.to_numeric(audit["CV合計"], errors="coerce").fillna(0).round(0).astype(int)
                         st.dataframe(audit, width="stretch", hide_index=True)
 
-                # ロジック検証用の詳細値は普段は隠し、必要なときだけ確認できるようにする。
                 with st.expander("予測ロジック詳細（分析用）"):
                     st.dataframe(
                         bt_export,
@@ -3895,12 +3674,6 @@ if uploaded_master and has_any_actual:
             except Exception as bt_exc:
                 st.warning(f"バックテストを実行できませんでした: {bt_exc}")
 
-
-    # ---------------------------------------------------------
-    # 予測 → 松竹梅 → 最適化 は一度計算したら session_state に保持。
-    # Streamlitのボタン押下ではスクリプト全体が再実行されるが、
-    # 入力条件が同じならここでは再計算しない。
-    # ---------------------------------------------------------
     reference_key = tuple(
         (
             seg["label"],
@@ -3994,8 +3767,6 @@ if uploaded_master and has_any_actual:
             forecast_df
         )
 
-        # 定常施策だけ掲載状態を反映。
-        # 「未定」は過去継続率で期待値化し、掲載なしはCV/COSTとも0にする。
         forecast_df["掲載状態"] = forecast_df["media"].map(publication_status_map).fillna("掲載予定")
         forecast_df["掲載係数"] = forecast_df["media"].map(publication_factor_map).fillna(1.0)
         normal_pub_mask = forecast_df["CPN名"].astype(str).str.strip().isin(normal_labels)
@@ -4009,9 +3780,6 @@ if uploaded_master and has_any_actual:
             * pd.to_numeric(forecast_df.loc[normal_pub_mask, "掲載係数"], errors="coerce").fillna(1.0)
         )
 
-        # 営業プランの計算定義へ合わせる。
-        # Forecast(発生件数) × 承認率 = 発行見込み
-        # 発行見込み × W列グロス単価 = 発行コスト
         _plan_period_metrics = _calculate_period_media_metrics(history_df)
         is_magi_plan = forecast_df["CPN名"].astype(str).str.strip().eq("マジ得")
         normal_rate_map = _plan_period_metrics["normal_rate"]
@@ -4031,7 +3799,6 @@ if uploaded_master and has_any_actual:
         forecast_df["approval_rate"] = pd.to_numeric(forecast_df["approval_rate"], errors="coerce").fillna(0.0).clip(0, 1)
         forecast_df["gross_unit"] = pd.to_numeric(forecast_df["gross_unit"], errors="coerce").fillna(0.0)
 
-        # simulate_plan用に日付表示形式を変換
         forecast_df = forecast_df.copy()
         forecast_df["date"] = format_date(
             forecast_df
@@ -4041,8 +3808,6 @@ if uploaded_master and has_any_actual:
             forecast_df
         )
 
-        # 営業ロジック列の後方互換・空データ対策。
-        # approved_cv が無い旧形式/一部条件でも集計でKeyErrorにしない。
         sim_df = sim_df.copy()
         if "approved_cv" not in sim_df.columns:
             cv_s = pd.to_numeric(sim_df.get("cv", pd.Series(0.0, index=sim_df.index)), errors="coerce").fillna(0.0)
@@ -4120,8 +3885,6 @@ if uploaded_master and has_any_actual:
         )
 
         st.session_state["_planning_calc_key"] = calc_key
-        # 表示用テーブルもここで1回だけ作って保存する。
-        # Excelボタン操作や他ウィジェット操作で同じ表を作り直さない。
         sim_report_table = create_report_table(sim_summary)
         opt_report_table = create_report_table(opt_summary)
 
@@ -4135,11 +3898,8 @@ if uploaded_master and has_any_actual:
             "opt_report_table": opt_report_table,
         }
 
-        # 条件が変わって再計算した場合、古い提出Excelは破棄
         st.session_state.pop("submission_excel", None)
 
-    # 掲載状態を反映した定常予測の即時サマリー。
-    # 掲載状態を変更するとcalc_keyが変わるため、Streamlitの再実行でここも即座に更新される。
     if needs_normal_learning and not forecast_df.empty:
         normal_pub_summary_mask = forecast_df["CPN名"].astype(str).str.strip().isin(normal_labels)
         normal_pub_rows = forecast_df.loc[normal_pub_summary_mask].copy()
@@ -4185,7 +3945,6 @@ if uploaded_master and has_any_actual:
                     hide_index=True,
                 )
 
-    # 係数確認用の明細
     with st.expander("予測係数の確認"):
         factor_cols = [
             "date",
@@ -4244,7 +4003,6 @@ if uploaded_master and has_any_actual:
         forecast_df=forecast_df,
     )
 
-    # 過去実績分析には、手動設定後の今回プランを「今回」として単価帯グラフへ追加する。
     current_manual_for_chart = _normalize_manual_settings(
         st.session_state.get(
             "_manual_settings",
@@ -4257,9 +4015,6 @@ if uploaded_master and has_any_actual:
         )
     )
 
-    # 「マジ得期間のみ」では、今回プランもマジ得指定期間分だけを表示する。
-    # 手動設定値は最終版として維持し、媒体ごとの採用件数だけ
-    # 今回予測に占めるマジ得CV比率で按分する。
     current_manual_magitoku_for_chart = pd.DataFrame()
     if (
         not current_manual_for_chart.empty
@@ -4314,11 +4069,6 @@ if uploaded_master and has_any_actual:
         f"プランニング.xlsx"
     )
 
-    # ---------------------------------------------------------
-    # 提出用Excel操作は独立Fragment。
-    # ボタンを押しても予測・松竹梅・最適化は再実行しない。
-    # Excel自体もクリックされるまで生成しない。
-    # ---------------------------------------------------------
     manual_settings_for_export = _normalize_manual_settings(
         st.session_state.get(
             "_manual_settings",
