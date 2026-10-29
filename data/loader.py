@@ -17,8 +17,6 @@ REQUIRED_HISTORY_COLUMNS = {
     "商品ID",
 }
 
-# load_data() で位置指定して使う列。
-# A=0 / C=2 / F=5 / P=15 / W=22
 REQUIRED_HISTORY_POSITIONS = {0, 2, 5, 15, 22}
 
 
@@ -181,8 +179,6 @@ def _load_data_cached(raw_bytes: bytes, exclude_compensation: bool = True) -> pd
     """巨大CSVの読込～日次集計をキャッシュし、rerun時の再読込を防ぐ。"""
     df = _read_csv_with_fallback(raw_bytes)
 
-    # usecolsで列数が減っているため、位置指定は元CSVの列名から取得する。
-    # ヘッダーを再度軽量に読み、A/F/P/Wの元列名を確定する。
     header = None
     for encoding in ("utf-8-sig", "cp932", "utf-8"):
         try:
@@ -223,7 +219,6 @@ def _load_data_cached(raw_bytes: bytes, exclude_compensation: bool = True) -> pd
     raw_cost = raw_cost.loc[df.index]
     gross_raw = gross_raw.loc[df.index]
     df["gross_unit"] = gross_raw
-    # 同一日・媒体に複数単価が混在しても扱えるよう、発生件数で加重平均する。
     df["gross_amount_for_weight"] = df["gross_unit"] * pd.to_numeric(df["cv"], errors="coerce").fillna(0.0)
 
     y_mask = result_flag.eq("Y")
@@ -327,8 +322,6 @@ def _load_af_data_cached(raw_bytes: bytes, filename: str, metric_name: str, vali
     date_col = df.columns[0]
     valid_code_set = set(valid_codes)
 
-    # B列以降のヘッダーがAFコード。AFコードマスタA列と一致する列だけ集計対象にする。
-    # pandasが重複ヘッダーへ付ける '.1' 等は、元コード判定時だけ除去する。
     matched_columns = []
     for col in df.columns[1:]:
         normalized_col = _normalize_af_code(col)
@@ -337,8 +330,6 @@ def _load_af_data_cached(raw_bytes: bytes, filename: str, metric_name: str, vali
             matched_columns.append(col)
 
     if not matched_columns:
-        # 対象AFコード列がゼロの場合もエラーにはせず、日付だけ保持して0件として返す。
-        # AFコードの追加・削除で列構成が変動してもアプリ全体を止めないため。
         raw_date = df[date_col].astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
         parsed_yyyymmdd = pd.to_datetime(raw_date, format="%Y%m%d", errors="coerce")
         parsed_fallback = pd.to_datetime(df[date_col], errors="coerce")
@@ -349,13 +340,11 @@ def _load_af_data_cached(raw_bytes: bytes, filename: str, metric_name: str, vali
 
     work = df[[date_col] + matched_columns].copy()
 
-    # A列の日付は 20260101 のような8桁数値/文字列を想定。
     raw_date = work[date_col].astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
     parsed_yyyymmdd = pd.to_datetime(raw_date, format="%Y%m%d", errors="coerce")
     parsed_fallback = pd.to_datetime(work[date_col], errors="coerce")
     work["date"] = parsed_yyyymmdd.fillna(parsed_fallback).dt.normalize()
 
-    # 各AFコード列のセル値が件数。文字列や空欄は0として扱い、行方向に合計する。
     numeric_counts = work[matched_columns].apply(pd.to_numeric, errors="coerce").fillna(0)
     work[metric_name] = numeric_counts.sum(axis=1)
     work = work.dropna(subset=["date"])
@@ -364,7 +353,6 @@ def _load_af_data_cached(raw_bytes: bytes, filename: str, metric_name: str, vali
         return pd.DataFrame(columns=["date", metric_name])
 
     result = work.groupby("date", as_index=False)[metric_name].sum()
-    # 件数は整数想定だが、元データに小数が混ざっても情報を落とさない。
     if (result[metric_name] % 1 == 0).all():
         result[metric_name] = result[metric_name].astype(int)
     return result
