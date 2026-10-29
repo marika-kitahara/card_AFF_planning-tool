@@ -2,13 +2,6 @@
 
 Streamlitで実績CSVとCPNマスタを読み込み、媒体別の件数予測、松竹梅プラン、最適プランを作成します。
 
-## 起動方法
-
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
 ## 入力ファイル
 
 ### 実績CSV（必須列）
