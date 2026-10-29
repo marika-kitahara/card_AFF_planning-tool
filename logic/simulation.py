@@ -21,7 +21,6 @@ def simulate_plan(df):
         base_cv = float(pd.to_numeric(row.get("forecast_cv", 0), errors="coerce") or 0)
         base_cost = float(pd.to_numeric(row.get("cost", 0), errors="coerce") or 0)
 
-        # CVがない場合は意味のある単価を作れないため候補外。
         if base_cv <= 0:
             continue
 
@@ -34,7 +33,6 @@ def simulate_plan(df):
         }.items():
             unit_price = base_unit_price + unit_delta
 
-            # マイナス/0円単価は最適プラン候補にしない。
             if unit_price <= 0:
                 continue
 
