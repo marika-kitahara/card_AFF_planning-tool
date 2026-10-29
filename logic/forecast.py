@@ -9,8 +9,6 @@ def forecast_cv(
 ) -> pd.DataFrame:
     """ベース値へ、実績から都度算出した各係数を一度だけ掛ける。"""
     df = apply_dynamic_factors(future_df, factor_tables)
-    # 診断用に、補正を1段ずつ適用した途中値を保持する。
-    # 最終 forecast_cv の式自体は従来と同じ。
     df["stage_base_cv"] = df["base_cv"] * df["cpn_factor"]
     df["stage_unit_price_cv"] = df["stage_base_cv"] * df.get("unit_price_factor", 1.0)
     df["stage_global_trend_cv"] = df["stage_unit_price_cv"] * df.get("global_trend_factor", 1.0)
