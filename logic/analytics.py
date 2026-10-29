@@ -113,9 +113,6 @@ def prepare_unit_price_band_matrix(
         np.floor(work["unit_price"] / band_step).astype(int) * band_step
     )
 
-    # 刻み幅を細かくした時に単価帯が数百～数千系列へ増えて
-    # Matplotlib/Streamlit Cloudのメモリを圧迫しないよう上限を設ける。
-    # 上限を超えた高単価側は「○円以上」にまとめるが、件数は全て保持する。
     max_bands = max(int(max_bands), 2)
     unique_lowers = np.sort(work["band_lower"].dropna().unique())
     overflow_lower = None
