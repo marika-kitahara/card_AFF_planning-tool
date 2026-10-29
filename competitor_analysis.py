@@ -79,7 +79,6 @@ def show_competitor_analysis():
         if warnings:
             st.warning(f"読み取り対象外のシートが{len(warnings)}件あります。例: {', '.join(warnings[:3])}")
         st.caption(f"収録調査日: {df['調査日'].min():%Y/%m/%d} ～ {df['調査日'].max():%Y/%m/%d} / {df['調査日'].nunique():,}日")
-        # 主要5商品は仮設定。実際の業務上の定義に合わせてここを変更可能。
         preferred = ["楽天カード", "Paypayカード", "三井住友カード（NL）",
                      "エポスカード", "JCB CARD W", "イオンカード"]
         product_options = sorted(df["商品"].unique())
@@ -133,8 +132,7 @@ def show_competitor_analysis():
         upper = math.ceil((high + 500) / 1000) * 1000
         if upper <= lower:
             upper = lower + 1000
-        # 各媒体で同一の縦軸範囲を使用し、媒体間の比較を可能にする。
-        for media_name in media:
+         for media_name in media:
             part = selected[selected["媒体"] == media_name]
             if part.empty:
                 continue
