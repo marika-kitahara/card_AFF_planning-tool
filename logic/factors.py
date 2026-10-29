@@ -177,7 +177,6 @@ def _prepare_normal_learning_data(
 
     excluded_parts: list[pd.DataFrame] = []
 
-    # マジ得直後は需要先食い等の特殊期間として定常平均から完全除外。
     if "magitoku_after_flag" in normal.columns:
         after_mask = pd.to_numeric(normal["magitoku_after_flag"], errors="coerce").fillna(0).eq(1)
         after_daily = _daily_media(normal.loc[after_mask])
@@ -201,9 +200,6 @@ def _prepare_normal_learning_data(
 
     normal = _add_recency_weights(normal)
 
-    # 重要: ローデータに媒体行が存在しない日も、その媒体の0CV日として日次学習へ含める。
-    # 従来は「CVが出た/行が存在した日」だけが分母になり、断続掲載媒体の基礎CVを
-    # 過大評価していた。ここでは学習対象の定常日 × 媒体を展開し、欠損を0CVで補完する。
     observed_daily = _daily_media(normal)
     if not observed_daily.empty:
         media_list = pd.DataFrame({"media": sorted(normal["media"].dropna().astype(str).unique())})
@@ -218,7 +214,6 @@ def _prepare_normal_learning_data(
         calendar = _add_recency_weights(calendar)
         calendar["weekday"] = calendar["date"].dt.day_name()
 
-        # 月初/月末・LINE OAは日付共通属性として、元データから復元する。
         date_attrs_spec = {}
         if "is_month_start" in normal.columns:
             date_attrs_spec["is_month_start"] = ("is_month_start", "max")
@@ -240,7 +235,6 @@ def _prepare_normal_learning_data(
         clean_daily["cv"] = pd.to_numeric(clean_daily["cv"], errors="coerce").fillna(0.0)
         clean_daily["cost"] = pd.to_numeric(clean_daily["cost"], errors="coerce").fillna(0.0)
 
-        # 異常値として除外した媒体×日は、0CVに置換せず学習母集団そのものから外す。
         if not outliers.empty:
             bad_keys = pd.MultiIndex.from_frame(outliers[["date", "media"]])
             daily_keys = pd.MultiIndex.from_frame(clean_daily[["date", "media"]])
@@ -361,7 +355,6 @@ def calculate_media_continuation_table(
     if normal.empty:
         return pd.DataFrame(columns=cols)
 
-    # 月度順はCPNマスタを優先。マスタが無ければ実績の最初の日で並べる。
     month_order = []
     if cpn_master is not None and not cpn_master.empty:
         master = cpn_master.copy()
@@ -386,7 +379,6 @@ def calculate_media_continuation_table(
             .sort_values("date", kind="stable")["月度"].astype(str).tolist()
         )
 
-    # 実績が全く存在しない月度は遷移評価から外す。
     observed_months = set(normal["月度"].astype(str).unique())
     month_order = [m for m in month_order if m in observed_months]
     if not month_order:
@@ -428,7 +420,6 @@ def calculate_media_continuation_table(
         c = int(media_continue.get(media, 0))
         rate = (c + global_rate * prior) / float(n + prior)
         latest_active = media in latest_set
-        # 最新月度ですでに非稼働なら「未定」の期待値はかなり低く見る。
         if not latest_active:
             rate *= 0.25
         rows.append({
@@ -519,7 +510,6 @@ def calculate_unit_price_response_table(
     if clean.empty or daily.empty:
         return pd.DataFrame(columns=columns)
 
-    # 媒体×月度のCV/COSTを元粒度から集計。日平均CVの分母は媒体行がない日も含む全定常日。
     work = clean.copy()
     work["cv"] = pd.to_numeric(work["cv"], errors="coerce").fillna(0.0)
     work["cost"] = pd.to_numeric(work["cost"], errors="coerce").fillna(0.0)
@@ -553,7 +543,6 @@ def calculate_unit_price_response_table(
     if monthly.empty:
         return pd.DataFrame(columns=columns)
 
-    # 選択月度の新しい月ほど重くするため、last_dateから月順位を作る。
     max_period = monthly["last_date"].dt.to_period("M").max()
     month_period = monthly["last_date"].dt.to_period("M")
     monthly["month_age"] = month_period.map(lambda x: int(max_period.ordinal - x.ordinal) if pd.notna(x) else 0)
@@ -629,7 +618,6 @@ def calculate_global_trend_table(history_df: pd.DataFrame) -> pd.DataFrame:
     baseline_start = cutoff - pd.Timedelta(days=59)
     recent_start = cutoff - pd.Timedelta(days=GLOBAL_TREND_WINDOW_DAYS - 1)
 
-    # 日付行が存在しない日も0件として分母へ含め、暦日の日平均にする。
     full_dates = pd.date_range(baseline_start, cutoff, freq="D")
     total_by_date = (
         work.loc[work["date"].between(baseline_start, cutoff)]
@@ -646,7 +634,6 @@ def calculate_global_trend_table(history_df: pd.DataFrame) -> pd.DataFrame:
     raw = (1.0 if not np.isfinite(baseline_daily) or baseline_daily <= 0
            else float(recent_daily / baseline_daily))
 
-    # 直近30日が揃っている通常ケースでは比率を100%反映。暴れすぎだけ上下限で抑える。
     factor = float(np.clip(raw, GLOBAL_TREND_FACTOR_MIN, GLOBAL_TREND_FACTOR_MAX))
     stable_media = int(work["media"].nunique()) if "media" in work.columns else 0
 
@@ -674,7 +661,6 @@ def calculate_dynamic_factor_tables(
         empty = pd.DataFrame()
         return {"weekday": empty, "month_edge": empty, "season": empty, "line_oa": empty, "unit_price": empty, "global_trend": empty, "excluded": excluded}
 
-    # 媒体ごとの全体基準CV。基礎値と同じく全定常日を直近加重で評価する。
     base_by_media = daily.groupby("media")[["cv", "recency_weight"]].apply(
         lambda g: _weighted_mean(g["cv"], g["recency_weight"])
     )
@@ -682,7 +668,6 @@ def calculate_dynamic_factor_tables(
     all_media = pd.Index(sorted(daily["media"].unique()), name="media")
     base_by_media = base_by_media.reindex(all_media).fillna(global_base).replace(0, np.nan)
 
-    # 月ごとの媒体水準を先に除去し、曜日と需要期の同じ変動を二重計上しにくくする。
     media_month_base = daily.groupby(["media", "month"])[["cv", "recency_weight"]].apply(
         lambda g: _weighted_mean(g["cv"], g["recency_weight"])
     )
@@ -705,7 +690,6 @@ def calculate_dynamic_factor_tables(
         })
     weekday_avg = pd.DataFrame(weekday_rows)
 
-    # 月初・月末は曜日影響を除去した残差から算出。
     weekday_map = weekday_avg.set_index(["media", "weekday"])["factor"] if not weekday_avg.empty else pd.Series(dtype=float)
     daily["weekday_factor_hist"] = [weekday_map.get((m, w), 1.0) for m, w in zip(daily["media"], daily["weekday"])]
     daily["edge_residual"] = _safe_ratio(daily["cv"], daily["media_month_base"] * daily["weekday_factor_hist"])
@@ -728,8 +712,6 @@ def calculate_dynamic_factor_tables(
             })
     month_edge = pd.DataFrame(edge_rows)
 
-    # 需要期係数は、曜日・月初月末を除去したCVから算出する。
-    # これにより「9月の土日が弱い」を曜日と9月の両方へ重複計上しにくくする。
     edge_map_hist = month_edge.set_index(["media", "区分"])["factor"] if not month_edge.empty else pd.Series(dtype=float)
     daily["edge_factor_hist"] = 1.0
     start_mask_hist = daily["is_month_start"].eq(1)
@@ -766,7 +748,6 @@ def calculate_dynamic_factor_tables(
         })
     season_avg = pd.DataFrame(season_rows)
 
-    # LINE OAは曜日・月初月末・需要期を除去した残差で算出する。
     season_map_hist = season_avg.set_index(["media", "month"])["factor"] if not season_avg.empty else pd.Series(dtype=float)
     daily["season_factor_hist"] = [
         season_map_hist.get((m, mon), 1.0) for m, mon in zip(daily["media"], daily["month"])
@@ -851,8 +832,6 @@ def apply_dynamic_factors(
     out["after_factor"] = 1.0
     out.loc[out["magitoku_after_flag"].eq(1), "after_factor"] = MAGITOKU_AFTER_FACTOR
 
-    # 単価補正: 指定単価があればそれを、なければ学習期間の直近単価を使用。
-    # 基準単価は学習期間の直近加重平均。データ不足ではelasticity=0なので必ず1.0。
     out["unit_price_reference"] = out["media"].map(unit_ref_map)
     out["unit_price_latest"] = out["media"].map(unit_latest_map)
     out["unit_price_elasticity"] = out["media"].map(unit_elasticity_map).fillna(0.0)
@@ -910,23 +889,15 @@ def calculate_normal_month_base(
     if clean.empty:
         return pd.DataFrame(columns=columns)
 
-    # 過去実績だけ残っている休眠媒体を予測対象から外す。
     inactive = identify_inactive_media(history_df, selected_months)
     if not inactive.empty:
         clean = clean.loc[~clean["media"].isin(inactive["media"])].copy()
     if clean.empty:
         return pd.DataFrame(columns=columns)
 
-    # 媒体ごとの「全定常日」を分母にする。行が無い日は0CV=非稼働日。
-    # base_cv = 稼働率 × 稼働時CV と同値だが、診断値も保持して説明可能にする。
     _, full_daily, _ = _prepare_normal_learning_data(history_df, selected_months, calendar_dates)
     if not inactive.empty and not full_daily.empty:
         full_daily = full_daily.loc[~full_daily["media"].isin(inactive["media"])].copy()
-    # 媒体ごとの掲載期間だけを分母にする。
-    # 最初の実績行より前／最後の実績行より後は「非掲載」とみなし0日にはしない。
-    # 一方、掲載期間の途中で行が無い日は0CVとして残す。
-    # これにより「全60日を0補完」で過小評価する問題と、
-    # 「CV発生日だけ」で過大評価する問題の中間になる。
     observed_span = (
         clean.groupby("media", as_index=False)
         .agg(first_observed_date=("date", "min"), last_observed_date=("date", "max"))
@@ -951,7 +922,6 @@ def calculate_normal_month_base(
     result["weight_days"] = result["media"].map(media_day_weights)
     result["base_cv"] = result["weighted_cv"] / result["weight_days"]
 
-    # costは掲載日の水準を維持する（0CV日を混ぜて単価まで薄めない）。
     active_cost = weighted.loc[weighted["cv"].gt(0)].copy()
     if active_cost.empty:
         result["cost"] = 0.0
