@@ -132,7 +132,7 @@ def show_competitor_analysis():
         upper = math.ceil((high + 500) / 1000) * 1000
         if upper <= lower:
             upper = lower + 1000
-         for media_name in media:
+        for media_name in media:
             part = selected[selected["媒体"] == media_name]
             if part.empty:
                 continue
